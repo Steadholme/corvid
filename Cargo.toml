@@ -1,0 +1,56 @@
+[package]
+name = "corvid"
+version = "0.1.0"
+edition = "2021"
+description = "Corvid — sovereign mail server (inbound SMTP MTA + outbound relay + DKIM + webmail) for the HOLDFAST stack."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "corvid"
+path = "src/lib.rs"
+
+[[bin]]
+name = "corvid"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP framework for the webmail surface (shared with agora/keystone/…): State/Path/Form
+# extractors, typed responses.
+axum = "0.8"
+# Async runtime: the SMTP listeners, the relay worker and the axum server all run on it.
+# `net`/`io-util`/`time` drive the raw SMTP sockets + UDP DNS; the Store trait is async so a
+# DB round-trip never blocks a worker thread (no block_in_place, no sync-over-async bridge).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "io-util", "time"] }
+# Erase the async Store trait methods so `Arc<dyn Store>` stays object-safe.
+async-trait = "0.1"
+# (De)serialize webmail form bodies + JSON envelopes used in tests.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Ergonomic error enums -> response.
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Epoch -> UTC components for absolute timestamps + DKIM `t=` (std only, no C deps).
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# Portable PostgreSQL data layer. Runtime queries only (no compile-time macros, so the build
+# needs NO database). rustls TLS (no openssl). Standard SQL only -> later runs unchanged on
+# FusionDB over pgwire.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# CSPRNG for ids/CSRF/boundaries + Message-ID entropy.
+rand = "0.8"
+hex = "0.4"
+# TLS for STARTTLS (SMTP server + submission) and opportunistic TLS to destination MX. `ring`
+# crypto provider matches the rest of the estate (no aws-lc-rs C toolchain, no openssl).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+# DKIM signing/verification. Pure-Rust RSA (no openssl); `pem` decodes the existing PKCS#8
+# private key at /etc/opendkim/keys/w33d.xyz/default.private.
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = { version = "0.10", features = ["oid"] }
+base64 = "0.22"
+
+[dev-dependencies]
+# ServiceExt::oneshot drives the webmail Router in-process for the render tests (no port bind).
+tower = { version = "0.5", features = ["util"] }
