@@ -1,0 +1,79 @@
+/* HOLDFAST Corvid — embedded enterprise design system (inlined into every page). */
+:root{
+  --bg:#f5f6fb; --surface:#ffffff; --ink:#1e2230; --muted:#5b6276; --line:#e6e8f0;
+  --accent:#4f46e5; --accent-2:#818cf8; --accent-ink:#ffffff;
+  --ok:#16a34a; --warn:#b45309; --danger:#dc2626;
+  --radius:12px; --shadow:0 1px 2px rgba(20,23,40,.06),0 8px 24px rgba(20,23,40,.05);
+  --grad:linear-gradient(120deg,#4f46e5,#7c83f4);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body.page{background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+.topbar{background:var(--grad);color:#fff;box-shadow:var(--shadow)}
+.topbar__inner{max-width:980px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 20px}
+.topbar__lead{display:flex;align-items:center;gap:14px}
+.brand{display:flex;align-items:center;gap:9px;color:#fff}
+.brand:hover{text-decoration:none}
+.brand__glyph{width:26px;height:26px;display:inline-flex}
+.brand__word{font-weight:700;letter-spacing:.04em}
+.topbar__sep{width:1px;height:22px;background:rgba(255,255,255,.4)}
+.topbar__title{font-weight:600;opacity:.95}
+.topbar__nav{display:flex;gap:14px;margin-left:10px}
+.topbar__nav a{color:#fff;opacity:.9;font-size:14px}
+.topbar__right{display:flex;align-items:center;gap:12px}
+.user-email{font-size:13px;opacity:.92;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.btn{display:inline-flex;align-items:center;gap:6px;border-radius:8px;border:1px solid transparent;padding:8px 14px;font-weight:600;font-size:14px;cursor:pointer}
+.btn-sm{padding:5px 10px;font-size:13px}
+.btn-primary{background:var(--accent);color:var(--accent-ink)}
+.btn-primary:hover{background:#4338ca;text-decoration:none}
+.btn-ghost{background:rgba(255,255,255,.14);color:#fff;border-color:rgba(255,255,255,.3)}
+.btn-ghost:hover{background:rgba(255,255,255,.24);text-decoration:none}
+
+.wrap{max-width:980px;margin:24px auto;padding:0 20px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+.pad{padding:18px 20px}
+.muted{color:var(--muted)}
+.crumbs{margin:0 0 14px;font-size:13px;color:var(--muted)}
+.crumbs a{color:var(--muted)}
+
+.page-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 16px}
+.page-head h1{font-size:20px;margin:0}
+
+.maillist{list-style:none;margin:0;padding:0}
+.maillist li{border-bottom:1px solid var(--line)}
+.maillist li:last-child{border-bottom:0}
+.mailrow{display:flex;align-items:center;gap:14px;padding:12px 18px}
+.mailrow:hover{background:#fafbff;text-decoration:none}
+.mailrow .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);flex:none}
+.mailrow .dot.seen{background:transparent;border:1px solid var(--line)}
+.mailrow .from{width:200px;flex:none;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mailrow.unseen .subject{font-weight:600}
+.mailrow .subject{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+.mailrow .date{flex:none;color:var(--muted);font-size:13px}
+
+.msg-head{margin:0 0 14px}
+.msg-subject{font-size:20px;margin:0 0 8px}
+.msg-meta{font-size:13px;color:var(--muted);display:grid;grid-template-columns:auto 1fr;gap:2px 12px}
+.msg-meta b{color:var(--ink);font-weight:600}
+.msg-body{margin-top:16px;padding-top:16px;border-top:1px solid var(--line);word-wrap:break-word;overflow-wrap:anywhere}
+.msg-body pre{white-space:pre-wrap;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0}
+.msg-body img{max-width:100%}
+
+.pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:999px;background:#eef0fb;color:var(--accent);font-weight:600}
+
+.field{display:block;margin:0 0 14px}
+.field label{display:block;font-size:13px;font-weight:600;margin:0 0 6px}
+.field input,.field textarea{width:100%;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font:inherit;background:#fff;color:var(--ink)}
+.field textarea{min-height:240px;resize:vertical}
+.form-actions{display:flex;gap:10px;align-items:center}
+
+.empty-card{text-align:center;padding:48px 20px}
+.empty-title{font-size:18px;margin:0 0 8px}
+.banner{border-radius:8px;padding:10px 14px;margin:0 0 16px;font-size:14px}
+.banner-ok{background:#ecfdf3;color:#166534;border:1px solid #bbf7d0}
+
+.site-foot{max-width:980px;margin:28px auto;padding:0 20px;color:var(--muted);font-size:12px;text-align:center}
