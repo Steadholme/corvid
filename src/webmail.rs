@@ -321,10 +321,43 @@ fn render_page(title: &str, email_display: &str, content: &str) -> String {
     SHELL
         .replace("{{STYLE}}", APP_CSS)
         .replace("{{SHIELD}}", SHIELD_SVG)
-        .replace("{{LOGOUT}}", LOGOUT_URL)
         .replace("{{TITLE}}", &esc(title))
-        .replace("{{EMAIL}}", email_display)
+        .replace("{{USERBOX}}", &userbox(email_display))
         .replace("{{CONTENT}}", content)
+}
+
+/// The right side of the app-bar: an "All apps" pill back to the apex portal, a user chip
+/// (avatar initial + signed-in email) when a gateway identity is known, and the cross-subdomain
+/// logout. `email_display` is the already-escaped display string from [`email_display`]; the
+/// `—` sentinel (no gateway session) renders the chrome without a user chip.
+fn userbox(email_display: &str) -> String {
+    let has_email = !email_display.is_empty() && !email_display.starts_with('—');
+    let chip = if has_email {
+        let initial = email_display
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "H".to_string());
+        format!(
+            "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\" title=\"Signed in as\">{}</span></span>",
+            esc(&initial),
+            email_display,
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        concat!(
+            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
+            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
+            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
+            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
+            "{chip}",
+            "<a class=\"btn btn-ghost btn-sm\" href=\"{logout}\">Log out</a>",
+        ),
+        chip = chip,
+        logout = LOGOUT_URL,
+    )
 }
 
 fn email_display(headers: &HeaderMap) -> String {
