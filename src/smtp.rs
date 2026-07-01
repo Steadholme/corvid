@@ -45,6 +45,18 @@ pub enum SmtpRole {
     Submission,
 }
 
+/// In-progress SASL exchange (submission AUTH). The socket driver is line-oriented, so a
+/// multi-step mechanism parks its state here and resumes on the next input line.
+#[derive(Debug)]
+enum AuthPhase {
+    /// `AUTH PLAIN` with no initial response: awaiting the base64 `authzid\0authcid\0passwd`.
+    Plain,
+    /// `AUTH LOGIN`: prompted `Username:`, awaiting the base64 username.
+    LoginUser,
+    /// `AUTH LOGIN`: have the username, prompted `Password:`, awaiting the base64 password.
+    LoginPass { user: String },
+}
+
 /// Shared dependencies for SMTP sessions.
 pub struct SmtpContext {
     pub config: Arc<Config>,
@@ -86,6 +98,10 @@ pub struct Session {
     role: SmtpRole,
     tls_active: bool,
     client_ip: Option<IpAddr>,
+    /// Submission only: whether a SASL AUTH has succeeded this connection.
+    authenticated: bool,
+    /// In-flight SASL continuation, if any.
+    auth_state: Option<AuthPhase>,
     helo: Option<String>,
     mail_from: Option<String>,
     spf: SpfResult,
@@ -111,6 +127,8 @@ impl Session {
             role,
             tls_active,
             client_ip,
+            authenticated: false,
+            auth_state: None,
             helo: None,
             mail_from: None,
             spf: SpfResult::None,
@@ -144,6 +162,10 @@ impl Session {
         if self.in_data {
             return self.handle_data_line(line).await;
         }
+        // A SASL exchange in progress consumes the next line(s) as base64 payloads, not commands.
+        if self.auth_state.is_some() {
+            return self.handle_auth_continuation(line);
+        }
 
         let (cmd, arg) = match line.split_once(' ') {
             Some((c, a)) => (c.to_ascii_uppercase(), a.trim()),
@@ -154,6 +176,7 @@ impl Session {
             "EHLO" => self.cmd_ehlo(arg, true),
             "HELO" => self.cmd_ehlo(arg, false),
             "STARTTLS" => self.cmd_starttls(),
+            "AUTH" => self.cmd_auth(arg),
             "MAIL" => self.cmd_mail(arg).await,
             "RCPT" => self.cmd_rcpt(arg).await,
             "DATA" => self.cmd_data(),
@@ -191,6 +214,15 @@ impl Session {
         if self.ctx.tls_acceptor.is_some() && !self.tls_active {
             lines.push("250-STARTTLS".to_string());
         }
+        // Offer AUTH only on the submission listener, only over TLS, and only when a credential
+        // is configured — so credentials never cross a plaintext channel and an unconfigured
+        // deployment advertises nothing to authenticate against.
+        if self.role == SmtpRole::Submission
+            && self.tls_active
+            && self.ctx.config.submission_enabled()
+        {
+            lines.push("250-AUTH PLAIN LOGIN".to_string());
+        }
         lines.push("250 SMTPUTF8".to_string());
         Reply::say(lines.join("\r\n") + "\r\n")
     }
@@ -208,9 +240,107 @@ impl Session {
         }
     }
 
+    /// `AUTH <mechanism> [initial-response]` — submission only, TLS only.
+    fn cmd_auth(&mut self, arg: &str) -> Reply {
+        if self.role != SmtpRole::Submission {
+            return Reply::say("503 5.5.1 AUTH not available on this listener\r\n");
+        }
+        if self.authenticated {
+            return Reply::say("503 5.5.1 Already authenticated\r\n");
+        }
+        // Never accept credentials in the clear.
+        if !self.tls_active {
+            return Reply::say("538 5.7.11 Encryption required — issue STARTTLS first\r\n");
+        }
+        // No credential configured => nothing can authenticate => relay stays closed.
+        if !self.ctx.config.submission_enabled() {
+            return Reply::say("535 5.7.8 Authentication credentials invalid\r\n");
+        }
+        let (mech, rest) = match arg.split_once(' ') {
+            Some((m, r)) => (m.to_ascii_uppercase(), r.trim()),
+            None => (arg.trim().to_ascii_uppercase(), ""),
+        };
+        match mech.as_str() {
+            "PLAIN" => {
+                if rest.is_empty() {
+                    self.auth_state = Some(AuthPhase::Plain);
+                    Reply::say("334 \r\n")
+                } else {
+                    self.finish_plain(rest)
+                }
+            }
+            "LOGIN" => {
+                self.auth_state = Some(AuthPhase::LoginUser);
+                // base64("Username:")
+                Reply::say("334 VXNlcm5hbWU6\r\n")
+            }
+            _ => Reply::say("504 5.5.4 Unsupported authentication mechanism\r\n"),
+        }
+    }
+
+    /// Consume a base64 continuation line for the in-flight SASL exchange.
+    fn handle_auth_continuation(&mut self, line: &str) -> Reply {
+        if line == "*" {
+            self.auth_state = None;
+            return Reply::say("501 5.7.0 Authentication aborted\r\n");
+        }
+        match self.auth_state.take().expect("auth_state present") {
+            AuthPhase::Plain => self.finish_plain(line),
+            AuthPhase::LoginUser => match b64_decode_str(line) {
+                Some(user) => {
+                    self.auth_state = Some(AuthPhase::LoginPass { user });
+                    // base64("Password:")
+                    Reply::say("334 UGFzc3dvcmQ6\r\n")
+                }
+                None => Reply::say("535 5.7.8 Authentication credentials invalid\r\n"),
+            },
+            AuthPhase::LoginPass { user } => match b64_decode_str(line) {
+                Some(pass) => self.verify_auth(&user, &pass),
+                None => Reply::say("535 5.7.8 Authentication credentials invalid\r\n"),
+            },
+        }
+    }
+
+    /// Decode + verify an `AUTH PLAIN` blob (`authzid \0 authcid \0 passwd`).
+    fn finish_plain(&mut self, blob: &str) -> Reply {
+        let Some(decoded) = b64_decode_bytes(blob) else {
+            return Reply::say("535 5.7.8 Authentication credentials invalid\r\n");
+        };
+        let mut parts = decoded.split(|&b| b == 0);
+        let _authzid = parts.next();
+        match (parts.next(), parts.next()) {
+            (Some(u), Some(p)) => {
+                let user = String::from_utf8_lossy(u).to_string();
+                let pass = String::from_utf8_lossy(p).to_string();
+                self.verify_auth(&user, &pass)
+            }
+            _ => Reply::say("535 5.7.8 Authentication credentials invalid\r\n"),
+        }
+    }
+
+    /// Constant-time-ish credential check against the configured submission login.
+    fn verify_auth(&mut self, user: &str, pass: &str) -> Reply {
+        let expect_pass = &self.ctx.config.submission_password;
+        // Non-short-circuiting `&`: the password compare runs regardless of the username result,
+        // so a wrong username does not leak (via timing) that the password check was skipped.
+        let user_ok = user.eq_ignore_ascii_case(&self.ctx.config.submission_login());
+        let pass_ok = !expect_pass.is_empty() && ct_eq(pass.as_bytes(), expect_pass.as_bytes());
+        if user_ok & pass_ok {
+            self.authenticated = true;
+            Reply::say("235 2.7.0 Authentication successful\r\n")
+        } else {
+            Reply::say("535 5.7.8 Authentication credentials invalid\r\n")
+        }
+    }
+
     async fn cmd_mail(&mut self, arg: &str) -> Reply {
         if self.helo.is_none() {
             return Reply::say("503 5.5.1 Error: send HELO/EHLO first\r\n");
+        }
+        // Submission is authenticated relay only: no valid AUTH, no mail. This is what closes
+        // the open-relay hole — an unauthenticated (or unconfigured) :587 accepts nothing.
+        if self.role == SmtpRole::Submission && !self.authenticated {
+            return Reply::say("530 5.7.0 Authentication required\r\n");
         }
         if self.mail_from.is_some() {
             return Reply::say("503 5.5.1 Error: nested MAIL command\r\n");
@@ -393,6 +523,31 @@ fn extract_path(arg: &str, keyword: &str) -> Option<String> {
     }
     // No angle brackets: take the first whitespace-delimited token.
     Some(rest.split_whitespace().next().unwrap_or("").to_string())
+}
+
+/// Base64-decode a SASL continuation line to raw bytes (whitespace-trimmed).
+fn b64_decode_bytes(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim().as_bytes())
+        .ok()
+}
+
+/// Base64-decode a SASL line and require valid UTF-8 (for username/password fields).
+fn b64_decode_str(s: &str) -> Option<String> {
+    b64_decode_bytes(s).and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Length-checked constant-time byte comparison (guards the password compare).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// If `name` is absent from the header block, inject `name: value` at the top.

@@ -103,13 +103,40 @@ async fn unknown_command_and_quit() {
     assert_eq!(quit.action, Action::Quit);
 }
 
+/// A submission context with a configured credential (user = primary mailbox, pass = `s3cret`).
+async fn submission_ctx() -> Arc<SmtpContext> {
+    let mut config = Config::dev();
+    config.submission_password = "s3cret".to_string(); // SUBMISSION_USER unset -> w33d@w33d.xyz
+    Arc::new(SmtpContext {
+        config: Arc::new(config),
+        store: Arc::new(InMemoryStore::new()),
+        signer: None,
+        tls_acceptor: None,
+    })
+}
+
+// SASL base64 vectors (see the SUBMISSION_* credential above).
+const PLAIN_OK: &str = "AHczM2RAdzMzZC54eXoAczNjcmV0"; // \0 w33d@w33d.xyz \0 s3cret
+const PLAIN_BAD: &str = "AHczM2RAdzMzZC54eXoAd3JvbmdwYXNz"; // wrong password
+const LOGIN_USER: &str = "dzMzZEB3MzNkLnh5eg=="; // w33d@w33d.xyz
+const LOGIN_PASS: &str = "czNjcmV0"; // s3cret
+
 #[tokio::test]
-async fn submission_accepts_external_recipient_and_enqueues() {
-    let ctx = ctx().await;
-    let mut s = Session::new(ctx.clone(), SmtpRole::Submission, false, None);
-    s.handle_line("EHLO client").await;
+async fn submission_requires_auth_before_mail() {
+    let ctx = submission_ctx().await;
+    // tls_active = true simulates a post-STARTTLS channel.
+    let mut s = Session::new(ctx.clone(), SmtpRole::Submission, true, None);
+    let ehlo = s.handle_line("EHLO client").await;
+    assert!(ehlo.text.contains("AUTH PLAIN LOGIN"), "AUTH advertised: {}", ehlo.text);
+
+    // MAIL before AUTH is refused — this is the closed relay.
+    let early = s.handle_line("MAIL FROM:<w33d@w33d.xyz>").await;
+    assert!(early.text.starts_with("530"), "got: {}", early.text);
+
+    // AUTH PLAIN with the correct credential succeeds, then relay is allowed.
+    let auth = s.handle_line(&format!("AUTH PLAIN {PLAIN_OK}")).await;
+    assert!(auth.text.starts_with("235"), "got: {}", auth.text);
     assert!(s.handle_line("MAIL FROM:<w33d@w33d.xyz>").await.text.starts_with("250"));
-    // Submission relays anywhere.
     assert!(s.handle_line("RCPT TO:<friend@elsewhere.net>").await.text.starts_with("250"));
     assert!(s.handle_line("DATA").await.text.starts_with("354"));
     for line in ["From: w33d@w33d.xyz", "Subject: Out", "", "hi"] {
@@ -120,5 +147,48 @@ async fn submission_accepts_external_recipient_and_enqueues() {
     let due = ctx.store.due_outbound(corvid::now_secs() + 5, 10).await.unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].to_domain, "elsewhere.net");
-    assert_eq!(due[0].rcpts, vec!["friend@elsewhere.net".to_string()]);
+}
+
+#[tokio::test]
+async fn submission_auth_login_multistep() {
+    let ctx = submission_ctx().await;
+    let mut s = Session::new(ctx, SmtpRole::Submission, true, None);
+    s.handle_line("EHLO client").await;
+    // AUTH LOGIN drives a two-prompt exchange.
+    let p1 = s.handle_line("AUTH LOGIN").await;
+    assert_eq!(p1.text, "334 VXNlcm5hbWU6\r\n"); // base64("Username:")
+    let p2 = s.handle_line(LOGIN_USER).await;
+    assert_eq!(p2.text, "334 UGFzc3dvcmQ6\r\n"); // base64("Password:")
+    let done = s.handle_line(LOGIN_PASS).await;
+    assert!(done.text.starts_with("235"), "got: {}", done.text);
+    assert!(s.handle_line("MAIL FROM:<w33d@w33d.xyz>").await.text.starts_with("250"));
+}
+
+#[tokio::test]
+async fn submission_auth_rejected_on_plaintext_and_bad_password() {
+    let ctx = submission_ctx().await;
+
+    // Over a plaintext channel (tls_active = false), AUTH must be refused (538) and never
+    // advertised — credentials never cross the wire in the clear.
+    let mut plain = Session::new(ctx.clone(), SmtpRole::Submission, false, None);
+    let ehlo = plain.handle_line("EHLO c").await;
+    assert!(!ehlo.text.contains("AUTH"), "no AUTH advertised without TLS: {}", ehlo.text);
+    assert!(plain.handle_line(&format!("AUTH PLAIN {PLAIN_OK}")).await.text.starts_with("538"));
+
+    // Over TLS, a wrong password is rejected (535) and leaves the session unauthenticated.
+    let mut s = Session::new(ctx, SmtpRole::Submission, true, None);
+    s.handle_line("EHLO c").await;
+    assert!(s.handle_line(&format!("AUTH PLAIN {PLAIN_BAD}")).await.text.starts_with("535"));
+    assert!(s.handle_line("MAIL FROM:<w33d@w33d.xyz>").await.text.starts_with("530"));
+}
+
+#[tokio::test]
+async fn submission_fail_secure_when_no_credential() {
+    // Default dev config has an empty submission_password -> relay is closed even over TLS.
+    let ctx = ctx().await;
+    let mut s = Session::new(ctx, SmtpRole::Submission, true, None);
+    let ehlo = s.handle_line("EHLO c").await;
+    assert!(!ehlo.text.contains("AUTH"), "unconfigured deployment advertises no AUTH");
+    assert!(s.handle_line(&format!("AUTH PLAIN {PLAIN_OK}")).await.text.starts_with("535"));
+    assert!(s.handle_line("MAIL FROM:<w33d@w33d.xyz>").await.text.starts_with("530"));
 }

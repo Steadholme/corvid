@@ -52,6 +52,13 @@ pub struct Config {
     pub max_rcpts: usize,
     /// Bearer token guarding the internal send API (`MAIL_SEND_TOKEN`). Empty disables the API.
     pub mail_send_token: String,
+    /// SMTP submission (:587) AUTH username (`SUBMISSION_USER`). Empty falls back to the
+    /// primary mailbox address.
+    pub submission_user: String,
+    /// SMTP submission AUTH password (`SUBMISSION_PASSWORD`). **Empty = fail-secure: the
+    /// submission relay refuses every transaction** (no AUTH can succeed), so :587 is never
+    /// an open relay even before an operator sets a credential.
+    pub submission_password: String,
 }
 
 impl Config {
@@ -77,6 +84,8 @@ impl Config {
             max_msg_size: 10 * 1024 * 1024,
             max_rcpts: 100,
             mail_send_token: String::new(),
+            submission_user: String::new(),
+            submission_password: String::new(),
         }
     }
 
@@ -131,7 +140,29 @@ impl Config {
         if let Some(v) = env_nonempty("MAIL_SEND_TOKEN") {
             c.mail_send_token = v;
         }
+        if let Some(v) = env_nonempty("SUBMISSION_USER") {
+            c.submission_user = v;
+        }
+        if let Some(v) = env_nonempty("SUBMISSION_PASSWORD") {
+            c.submission_password = v;
+        }
         c
+    }
+
+    /// Effective submission AUTH username: the configured `SUBMISSION_USER`, or the primary
+    /// mailbox address when unset.
+    pub fn submission_login(&self) -> String {
+        if self.submission_user.is_empty() {
+            self.primary_mailbox()
+        } else {
+            self.submission_user.clone()
+        }
+    }
+
+    /// True when a submission credential is configured (so :587 can accept authenticated relay).
+    /// When false the submission listener is fail-secure (rejects all relay).
+    pub fn submission_enabled(&self) -> bool {
+        !self.submission_password.is_empty()
     }
 
     /// The primary mailbox address (`w33d@<mail_domain>`) all local-parts deliver into.
