@@ -80,6 +80,7 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
     let config = Config::from_env();
 
     let store_kind = std::env::var("CORVID_STORE").unwrap_or_else(|_| "memory".to_string());
+    let require_persistence = require_persistence();
     let store: Arc<dyn Store> = match store_kind.as_str() {
         "postgres" => {
             let url = std::env::var("DATABASE_URL")
@@ -90,9 +91,23 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
             tracing::info!("postgres store ready (migrated)");
             Arc::new(pg)
         }
-        "memory" => Arc::new(InMemoryStore::new()),
+        "memory" => {
+            // Refuse to ride the volatile in-memory store when durability is required
+            // (HOLDFAST_PROFILE=prod or REQUIRE_PERSISTENCE): every accepted message would be
+            // lost on restart. Startup-only hard failure — never mid-request.
+            if require_persistence {
+                return Err(
+                    "durability required (HOLDFAST_PROFILE=prod or REQUIRE_PERSISTENCE) but \
+                     CORVID_STORE resolves to the volatile in-memory store: set CORVID_STORE=postgres \
+                     and DATABASE_URL to persist mail"
+                        .to_string(),
+                );
+            }
+            Arc::new(InMemoryStore::new())
+        }
         other => return Err(format!("unknown CORVID_STORE={other} (use memory|postgres)")),
     };
+    tracing::info!(store = %store_kind, "durability posture");
 
     store
         .upsert_mailbox(&primary_mailbox(&config))
@@ -115,6 +130,24 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         store,
         signer,
     })
+}
+
+/// True when this deployment must run on a durable store: `HOLDFAST_PROFILE=prod`
+/// (case-insensitive) OR a truthy `REQUIRE_PERSISTENCE`. When false (the default, e.g. dev with
+/// `HOLDFAST_PROFILE` unset) the in-memory store stays permitted.
+fn require_persistence() -> bool {
+    let profile_prod = std::env::var("HOLDFAST_PROFILE")
+        .map(|v| v.trim().eq_ignore_ascii_case("prod"))
+        .unwrap_or(false);
+    profile_prod || env_truthy("REQUIRE_PERSISTENCE")
+}
+
+/// A truthy env flag (`1`/`true`/`yes`/`on`, case-insensitive). Mirrors `config::env_flag`.
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref().map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 /// Build a STARTTLS acceptor from the configured cert/key, or `None` when TLS is not configured.
