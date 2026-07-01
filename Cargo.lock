@@ -170,6 +170,7 @@ dependencies = [
  "axum",
  "base64",
  "hex",
+ "hmac",
  "rand",
  "rsa",
  "rustls",

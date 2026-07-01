@@ -49,6 +49,9 @@ rustls-pemfile = "2"
 # private key at /etc/opendkim/keys/w33d.xyz/default.private.
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = { version = "0.10", features = ["oid"] }
+# HMAC-SHA256 verification of the gateway-injected identity signature (X-Auth-Sig). The canonical
+# message matches Sluice's Go signer (subject\n groups\n minute).
+hmac = "0.12"
 base64 = "0.22"
 
 [dev-dependencies]
