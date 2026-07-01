@@ -43,8 +43,10 @@ pub struct Message {
     pub received_at: i64,
     /// Read flag.
     pub seen: bool,
-    /// Folder (only `INBOX` in v1).
+    /// Folder (`INBOX` | `Sent` | `Drafts` | `Archive` | `Trash`).
     pub folder: String,
+    /// Star/flag: surfaced in the cross-folder `Starred` view.
+    pub starred: bool,
 }
 
 /// A summary row for the inbox list (no body, lighter to fetch/render).
@@ -55,6 +57,7 @@ pub struct MessageSummary {
     pub subject: String,
     pub received_at: i64,
     pub seen: bool,
+    pub starred: bool,
 }
 
 /// A queued outbound message awaiting relay to a destination domain.

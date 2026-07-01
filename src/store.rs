@@ -68,6 +68,22 @@ pub trait Store: Send + Sync {
         folder: &str,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
+    /// Cross-folder listing of the starred/flagged messages in a mailbox, newest first, capped.
+    async fn list_starred(
+        &self,
+        mailbox: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError>;
+    /// Search a mailbox over `From`/`Subject`/body (case-insensitive substring), newest first,
+    /// keyset-paginated: `before` is the `(received_at, id)` of the last row of the previous page
+    /// (`None` for the first page). `query` is matched lowercased.
+    async fn search_messages(
+        &self,
+        mailbox: &str,
+        query: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError>;
     /// A single message by id, if it exists.
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError>;
     /// Mark a message read.
@@ -76,6 +92,8 @@ pub trait Store: Send + Sync {
     async fn mark_unseen(&self, id: &str) -> Result<(), StoreError>;
     /// Move a message into `folder`.
     async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError>;
+    /// Set/clear a message's star (flag).
+    async fn set_starred(&self, id: &str, starred: bool) -> Result<(), StoreError>;
     /// Unread count for the app-bar badge.
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError>;
 
@@ -121,6 +139,7 @@ fn summary(m: &Message) -> MessageSummary {
         subject: m.subject.clone(),
         received_at: m.received_at,
         seen: m.seen,
+        starred: m.starred,
     }
 }
 
@@ -239,6 +258,54 @@ impl Store for InMemoryStore {
         Ok(v.iter().map(summary).collect())
     }
 
+    async fn list_starred(
+        &self,
+        mailbox: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let mut v: Vec<Message> = self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.mailbox == mailbox && m.starred)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.truncate(limit.max(0) as usize);
+        Ok(v.iter().map(summary).collect())
+    }
+
+    async fn search_messages(
+        &self,
+        mailbox: &str,
+        query: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let needle = query.to_lowercase();
+        let mut v: Vec<Message> = self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| {
+                m.mailbox == mailbox
+                    && (m.msg_from.to_lowercase().contains(&needle)
+                        || m.subject.to_lowercase().contains(&needle)
+                        || m.body_text.to_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        // Keyset: keep only rows strictly older than the cursor (by (received_at, id) desc).
+        if let Some((ts, id)) = before {
+            v.retain(|m| m.received_at < ts || (m.received_at == ts && m.id < id));
+        }
+        v.truncate(limit.max(0) as usize);
+        Ok(v.iter().map(summary).collect())
+    }
+
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
         Ok(self
             .messages
@@ -269,6 +336,14 @@ impl Store for InMemoryStore {
         let mut v = self.messages.lock().expect("messages lock poisoned");
         if let Some(m) = v.iter_mut().find(|m| m.id == id) {
             m.folder = folder.to_string();
+        }
+        Ok(())
+    }
+
+    async fn set_starred(&self, id: &str, starred: bool) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+            m.starred = starred;
         }
         Ok(())
     }
@@ -391,7 +466,15 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Star/flag: added out-of-band (idempotent) so an already-provisioned `messages` table
+        // gains the column without a destructive rebuild. Nullable (existing rows read as unset).
+        sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS starred BOOLEAN DEFAULT FALSE")
+            .execute(&self.pool)
+            .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages (mailbox, received_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_starred ON messages (mailbox, starred, received_at)")
             .execute(&self.pool)
             .await?;
         sqlx::query(
@@ -449,6 +532,8 @@ impl PgStore {
             received_at: row.try_get("received_at")?,
             seen: row.try_get("seen")?,
             folder: row.try_get("folder")?,
+            // Nullable column (pre-migration rows are NULL) — read as Option, default unset.
+            starred: row.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
         })
     }
 
@@ -550,8 +635,8 @@ impl Store for PgStore {
         sqlx::query(
             "INSERT INTO messages \
                  (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                  received_at, seen, folder) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  received_at, seen, folder, starred) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&msg.id)
         .bind(&msg.mailbox)
@@ -564,6 +649,7 @@ impl Store for PgStore {
         .bind(msg.received_at)
         .bind(msg.seen)
         .bind(&msg.folder)
+        .bind(msg.starred)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -576,7 +662,7 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
              WHERE mailbox = $1 ORDER BY received_at DESC, id DESC LIMIT $2",
         )
         .bind(mailbox)
@@ -585,15 +671,7 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         rows.iter()
-            .map(|r| {
-                Ok(MessageSummary {
-                    id: r.try_get("id")?,
-                    msg_from: r.try_get("msg_from")?,
-                    subject: r.try_get("subject")?,
-                    received_at: r.try_get("received_at")?,
-                    seen: r.try_get("seen")?,
-                })
-            })
+            .map(summary_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(backend)
     }
@@ -605,7 +683,7 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
              WHERE mailbox = $1 AND folder = $2 ORDER BY received_at DESC, id DESC LIMIT $3",
         )
         .bind(mailbox)
@@ -615,15 +693,63 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         rows.iter()
-            .map(|r| {
-                Ok(MessageSummary {
-                    id: r.try_get("id")?,
-                    msg_from: r.try_get("msg_from")?,
-                    subject: r.try_get("subject")?,
-                    received_at: r.try_get("received_at")?,
-                    seen: r.try_get("seen")?,
-                })
-            })
+            .map(summary_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn list_starred(
+        &self,
+        mailbox: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
+             WHERE mailbox = $1 AND starred = TRUE ORDER BY received_at DESC, id DESC LIMIT $2",
+        )
+        .bind(mailbox)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(summary_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn search_messages(
+        &self,
+        mailbox: &str,
+        query: &str,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        // `%needle%` with LIKE special chars escaped; matched case-insensitively via LOWER().
+        let pattern = format!("%{}%", like_escape(&query.to_lowercase()));
+        // Keyset cursor: default to "newer than any real row" so the first page is unbounded.
+        // The id tie-break only fires when received_at == cursor ts, so an empty id never matches
+        // a real (non-empty) id when ts == i64::MAX.
+        let (cur_ts, cur_id) = before.unwrap_or((i64::MAX, String::new()));
+        let rows = sqlx::query(
+            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
+             WHERE mailbox = $1 \
+               AND (LOWER(msg_from) LIKE $2 ESCAPE '\\' \
+                    OR LOWER(subject) LIKE $2 ESCAPE '\\' \
+                    OR LOWER(body_text) LIKE $2 ESCAPE '\\') \
+               AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
+             ORDER BY received_at DESC, id DESC LIMIT $5",
+        )
+        .bind(mailbox)
+        .bind(&pattern)
+        .bind(cur_ts)
+        .bind(&cur_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(summary_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(backend)
     }
@@ -661,6 +787,16 @@ impl Store for PgStore {
     async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE messages SET folder = $1 WHERE id = $2")
             .bind(folder)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_starred(&self, id: &str, starred: bool) -> Result<(), StoreError> {
+        sqlx::query("UPDATE messages SET starred = $1 WHERE id = $2")
+            .bind(starred)
             .bind(id)
             .execute(&self.pool)
             .await
@@ -747,6 +883,31 @@ impl Store for PgStore {
             .map_err(backend)?;
         Ok(())
     }
+}
+
+/// Map a summary row (id, msg_from, subject, received_at, seen, starred) into a [`MessageSummary`].
+fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::Error> {
+    Ok(MessageSummary {
+        id: r.try_get("id")?,
+        msg_from: r.try_get("msg_from")?,
+        subject: r.try_get("subject")?,
+        received_at: r.try_get("received_at")?,
+        seen: r.try_get("seen")?,
+        starred: r.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
+    })
+}
+
+/// Escape the LIKE metacharacters (`\`, `%`, `_`) in a search needle so it matches literally under
+/// `LIKE ... ESCAPE '\'`.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Map an sqlx error into a [`StoreError`].

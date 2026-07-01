@@ -30,8 +30,17 @@ use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
 
-/// The folders the webmail surfaces (INBOX for received mail, plus the two locally-authored ones).
-const FOLDERS: [&str; 3] = ["INBOX", "Sent", "Drafts"];
+/// The real (column-backed) folders the webmail surfaces: INBOX for received mail, the two
+/// locally-authored ones, plus Archive/Trash that message actions move mail into. These are the
+/// legal targets for a move and the values stored in `Message.folder`.
+const FOLDERS: [&str; 5] = ["INBOX", "Sent", "Drafts", "Archive", "Trash"];
+
+/// A virtual, cross-folder view of the starred/flagged messages. Selected via `?folder=Starred`
+/// but never stored in `Message.folder`.
+const STARRED_VIEW: &str = "Starred";
+
+/// How many search hits a result page holds before offering a keyset "next page" link.
+const SEARCH_PAGE: i64 = 50;
 
 const APP_CSS: &str = include_str!("../static/app.css");
 const SHELL: &str = include_str!("../templates/shell.html");
@@ -55,6 +64,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(inbox))
         .route("/m/{id}", get(read_message))
+        .route("/m/{id}/action", post(message_action))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
@@ -103,11 +113,17 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Query string for the inbox: an optional `?folder=` selecting which folder to list.
+/// Query string for the inbox: an optional `?folder=` selecting which folder/view to list, an
+/// optional `?q=` full-text search, and a `?before=` keyset cursor (`<received_at>_<id>`) that
+/// pages the search results.
 #[derive(Deserialize, Default)]
 struct InboxQuery {
     #[serde(default)]
     folder: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
 }
 
 async fn inbox(
@@ -119,60 +135,173 @@ async fn inbox(
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
     };
-    let folder = canonical_folder(q.folder.as_deref());
+    // Row action forms POST back a double-submit CSRF token; the inbox mints it (like compose).
+    let (token, set_cookie) = ensure_csrf(&headers);
 
-    let msgs = match state.store.list_folder(&mb.addr, folder, 200).await {
-        Ok(m) => m,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // Fetch the rows for the active view, plus the return path row actions redirect back to and a
+    // `next` keyset link for a full search page.
+    let (folder, heading, msgs, next_link) = if let Some(query) = search {
+        let cursor = parse_cursor(q.before.as_deref());
+        let msgs = match state.store.search_messages(&mb.addr, query, cursor, SEARCH_PAGE).await {
+            Ok(m) => m,
+            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        };
+        let next_link = if msgs.len() as i64 == SEARCH_PAGE {
+            msgs.last().map(|m| {
+                format!(
+                    r#"<div class="page-more"><a class="btn btn-ghost btn-sm" href="/?q={q}&before={cursor}">Load older results</a></div>"#,
+                    q = url_encode(query),
+                    cursor = url_encode(&format!("{}_{}", m.received_at, m.id)),
+                )
+            })
+        } else {
+            None
+        };
+        let heading = format!(r#"Search results for &ldquo;{}&rdquo;"#, esc(query));
+        // A search hit's return path can't carry the query cheaply — send actions back to the inbox.
+        ("", heading, msgs, next_link.unwrap_or_default())
+    } else {
+        let folder = canonical_folder(q.folder.as_deref());
+        let listed = if folder == STARRED_VIEW {
+            state.store.list_starred(&mb.addr, 200).await
+        } else {
+            state.store.list_folder(&mb.addr, folder, 200).await
+        };
+        let msgs = match listed {
+            Ok(m) => m,
+            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        };
+        let heading = if folder == "INBOX" {
+            let unseen = state.store.unseen_count(&mb.addr).await.unwrap_or(0);
+            format!("Inbox <span class=\"pill\">{unseen} unread</span>")
+        } else {
+            esc(folder)
+        };
+        (folder, heading, msgs, String::new())
     };
-    let unseen = state.store.unseen_count(&mb.addr).await.unwrap_or(0);
 
-    // For locally-authored folders the interesting party is the recipient, not our own address;
-    // the row still renders a single principal, so label the column accordingly below.
-    let is_outgoing = folder != "INBOX";
+    // Row actions redirect back to the folder/view they were invoked from (search → inbox).
+    let return_to = if folder.is_empty() { "/".to_string() } else { format!("/?folder={folder}") };
 
     let mut rows = String::new();
     if msgs.is_empty() {
         rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages here.</span></div></li>"#);
     }
     for m in &msgs {
-        let cls = if m.seen { "mailrow" } else { "mailrow unseen" };
-        let dot = if m.seen { "dot seen" } else { "dot" };
-        let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
-        rows.push_str(&format!(
-            r#"<li><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{subject}</span><span class="date">{date}</span></a></li>"#,
-            id = esc(&m.id),
-            from = esc(&display_from(&m.msg_from)),
-            date = fmt_date(m.received_at),
-        ));
+        rows.push_str(&render_row(m, &token, &return_to));
     }
 
-    let heading = if is_outgoing { esc(folder) } else { format!("Inbox <span class=\"pill\">{unseen} unread</span>") };
     let content = format!(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>"#,
-        tabs = folder_tabs(folder),
+<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+        tabs = folder_tabs(folder, search.unwrap_or("")),
     );
-    Html(render_page(folder, &email, &content)).into_response()
+    let title = if folder.is_empty() { "Search" } else { folder };
+    let html = render_page(title, &email, &content);
+    match set_cookie {
+        Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+        None => Html(html).into_response(),
+    }
 }
 
-/// Clamp an arbitrary `?folder=` to one of the known [`FOLDERS`] (defaults to `INBOX`).
+/// Render one inbox/search row: the message link plus a per-row action form (star, mark-unread,
+/// archive, delete, move-to-folder). `token` is the CSRF token; `return_to` is where each action
+/// redirects back to.
+fn render_row(m: &crate::model::MessageSummary, token: &str, return_to: &str) -> String {
+    let cls = if m.seen { "mailrow" } else { "mailrow unseen" };
+    let dot = if m.seen { "dot seen" } else { "dot" };
+    let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
+    let star = star_mark(m.starred);
+    format!(
+        r#"<li class="mailrow-wrap"><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        id = esc(&m.id),
+        from = esc(&display_from(&m.msg_from)),
+        date = fmt_date(m.received_at),
+        actions = row_actions(&m.id, m.starred, token, return_to),
+    )
+}
+
+/// A leading star glyph for a row's subject (filled when starred, nothing otherwise).
+fn star_mark(starred: bool) -> &'static str {
+    if starred { r#"<span class="star on" aria-label="starred">★</span> "# } else { "" }
+}
+
+/// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
+/// button submits the same form with a distinct `op`.
+fn row_actions(id: &str, starred: bool, token: &str, return_to: &str) -> String {
+    let (star_op, star_label, star_glyph) = if starred {
+        ("unstar", "Unstar", "★")
+    } else {
+        ("star", "Star", "☆")
+    };
+    let mut opts = String::new();
+    for f in FOLDERS {
+        opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
+    }
+    format!(
+        r#"<form class="row-actions" method="post" action="/m/{id}/action">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="return" value="{ret}">
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{star_op}" title="{star_label}">{star_glyph}</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="unread" title="Mark unread">Unread</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="archive" title="Archive">Archive</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
+  <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Move…</option>{opts}</select>
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="move">Move</button>
+</form>"#,
+        id = esc(id),
+        token = esc(token),
+        ret = esc(return_to),
+    )
+}
+
+/// Parse a `?before=<received_at>_<id>` keyset cursor into `(received_at, id)`. Returns `None`
+/// (first page) for a missing or malformed cursor.
+fn parse_cursor(raw: Option<&str>) -> Option<(i64, String)> {
+    let raw = raw?.trim();
+    let (ts, id) = raw.split_once('_')?;
+    let ts: i64 = ts.parse().ok()?;
+    Some((ts, id.to_string()))
+}
+
+/// Minimal percent-encoding for a query-string value (keeps unreserved chars, encodes the rest).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Clamp an arbitrary `?folder=` to a known [`FOLDERS`] value or the [`STARRED_VIEW`] (defaults to
+/// `INBOX`).
 fn canonical_folder(requested: Option<&str>) -> &'static str {
     match requested.map(str::trim) {
+        Some(f) if f.eq_ignore_ascii_case(STARRED_VIEW) => STARRED_VIEW,
         Some(f) => FOLDERS.into_iter().find(|c| c.eq_ignore_ascii_case(f)).unwrap_or("INBOX"),
         None => "INBOX",
     }
 }
 
-/// Render the folder switcher as a row of pill links, highlighting the active folder.
-fn folder_tabs(active: &str) -> String {
+/// Render the folder switcher as a row of pill links (INBOX/Sent/Drafts/Archive/Trash/Starred),
+/// highlighting the active folder, followed by the `?q=` search box.
+fn folder_tabs(active: &str, search_q: &str) -> String {
     let mut out = String::from(r#"<nav class="folder-tabs">"#);
-    for f in FOLDERS {
+    for f in FOLDERS.iter().copied().chain(std::iter::once(STARRED_VIEW)) {
         let cls = if f == active { "btn btn-primary btn-sm" } else { "btn btn-ghost btn-sm" };
         let label = if f == "INBOX" { "Inbox" } else { f };
         out.push_str(&format!(r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#));
     }
+    out.push_str(&format!(
+        r#"<form class="search-box" method="get" action="/"><input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button></form>"#,
+        q = esc(search_q),
+    ));
     out.push_str("</nav>");
     out
 }
@@ -197,6 +326,8 @@ async fn read_message(
         return error_page(StatusCode::NOT_FOUND, "Not found", "No such message.");
     }
     let _ = state.store.mark_seen(&id).await;
+    // Mint/reuse a CSRF token for the read-view action buttons (star/archive/delete/move/unread).
+    let (token, set_cookie) = ensure_csrf(&headers);
 
     let body = if !msg.body_html.is_empty() {
         // Already sanitised at store time; re-sanitise defensively on render.
@@ -224,6 +355,7 @@ async fn read_message(
       <a class="btn btn-ghost btn-sm" href="/compose?replyall={id}">Reply all</a>
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
     </div>
+    {actions}
   </header>
   {attachments}
   {body}
@@ -234,8 +366,99 @@ async fn read_message(
         folder = esc(&msg.folder),
         folder_label = if msg.folder == "INBOX" { "Inbox".to_string() } else { esc(&msg.folder) },
         id = esc(&msg.id),
+        // Read-view actions return to the message so a star/unread toggle stays in context.
+        actions = row_actions(&msg.id, msg.starred, &token, &format!("/m/{}", esc(&msg.id))),
     );
-    Html(render_page(&msg.subject, &email, &content)).into_response()
+    let html = render_page(&msg.subject, &email, &content);
+    match set_cookie {
+        Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+        None => Html(html).into_response(),
+    }
+}
+
+/// Form body for `POST /m/{id}/action`: a double-submit CSRF token, the operation `op`
+/// (`star|unstar|read|unread|archive|delete|move`), a target `folder` (only for `op=move`), and a
+/// safe local `return` path to redirect back to.
+#[derive(Deserialize, Default)]
+struct ActionForm {
+    csrf: String,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default, rename = "return")]
+    return_to: String,
+}
+
+/// `POST /m/{id}/action` — a per-message control invoked from an inbox row or the read view. CSRF
+/// double-submit guarded; enforces the SAME mailbox authorisation as the read view (a message is
+/// only actionable from its own mailbox). On success mutates via the [`crate::store::Store`], emits
+/// a tracing audit line, and redirects to the (validated-local) `return` path.
+async fn message_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ActionForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let msg = match state.store.get_message(&id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return error_page(StatusCode::NOT_FOUND, "Not found", "No such message."),
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+    if msg.mailbox != mb.addr {
+        return error_page(StatusCode::NOT_FOUND, "Not found", "No such message.");
+    }
+
+    let result = match form.op.as_str() {
+        "delete" => state.store.set_folder(&id, "Trash").await,
+        "archive" => state.store.set_folder(&id, "Archive").await,
+        "move" => {
+            let Some(folder) = move_target(&form.folder) else {
+                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown target folder.");
+            };
+            state.store.set_folder(&id, folder).await
+        }
+        "unread" => state.store.mark_unseen(&id).await,
+        "read" => state.store.mark_seen(&id).await,
+        "star" => state.store.set_starred(&id, true).await,
+        "unstar" => state.store.set_starred(&id, false).await,
+        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown action."),
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        message = %id,
+        op = %form.op,
+        folder = %form.folder,
+        "message action",
+    );
+    Redirect::to(&safe_return(&form.return_to)).into_response()
+}
+
+/// Clamp a move target to a real [`FOLDERS`] value (never [`STARRED_VIEW`], which is virtual).
+fn move_target(requested: &str) -> Option<&'static str> {
+    let r = requested.trim();
+    FOLDERS.into_iter().find(|c| c.eq_ignore_ascii_case(r))
+}
+
+/// Validate a form-supplied redirect target is a safe SAME-ORIGIN local path: a single leading `/`,
+/// no `//` (protocol-relative), and no control/space chars. Falls back to `/` otherwise.
+fn safe_return(path: &str) -> String {
+    let p = path.trim();
+    let ok = p.starts_with('/')
+        && !p.starts_with("//")
+        && !p.chars().any(|c| c.is_whitespace() || c.is_control());
+    if ok { p.to_string() } else { "/".to_string() }
 }
 
 /// Render the read-view attachment strip: one download link per MIME attachment part enumerated
@@ -612,6 +835,7 @@ async fn store_local_copy(
         received_at: now_secs(),
         seen: true,
         folder: folder.to_string(),
+        starred: false,
     };
     if let Err(e) = state.store.store_message(&msg).await {
         tracing::warn!(error = %e, folder, "failed to file local message copy");
@@ -1478,6 +1702,7 @@ mod tests {
             received_at: 0,
             seen: false,
             folder: "INBOX".to_string(),
+            starred: false,
         };
         let to = reply_all_to(&msg, "w33d@w33d.xyz");
         assert!(to.contains("alice@ex.com"));

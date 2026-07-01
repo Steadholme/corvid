@@ -214,10 +214,29 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .pad { padding: 22px; }
 
 /* folder switcher (Inbox / Sent / Drafts) above the mail list */
-.folder-tabs { display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap; }
+.folder-tabs { display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap; align-items: center; }
+.folder-tabs .search-box { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
+.folder-tabs .search-box input[type=search] {
+  min-width: 200px; padding: 6px 10px; font-size: 13px; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
 
 /* reply / reply-all / forward actions in the read view header */
 .msg-actions { margin-top: 14px; }
+
+/* -------------------------------------------------------------- per-message actions */
+.mailrow-wrap { display: flex; align-items: center; gap: 6px; }
+.mailrow-wrap .mailrow { flex: 1; min-width: 0; }
+.row-actions { display: inline-flex; gap: 4px; align-items: center; flex: none; flex-wrap: wrap; }
+.row-actions .move-select {
+  font-size: 12px; padding: 4px 6px; color: var(--ink-2);
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.maillist .row-actions { opacity: 0; transition: opacity .1s; }
+.mailrow-wrap:hover .row-actions, .mailrow-wrap:focus-within .row-actions { opacity: 1; }
+.msg-actions + .row-actions { margin-top: 10px; }
+.star.on { color: var(--warn-ink, #b9770e); }
+.page-more { margin-top: 14px; text-align: center; }
 
 /* -------------------------------------------------------------- inbox mail list */
 .maillist { list-style: none; margin: 0; padding: 8px; }

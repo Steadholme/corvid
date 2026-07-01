@@ -56,6 +56,7 @@ async fn pg_store_full_integration() {
         received_at: now,
         seen: false,
         folder: "INBOX".into(),
+        starred: false,
     };
     pg.store_message(&msg).await.unwrap();
 
@@ -67,6 +68,33 @@ async fn pg_store_full_integration() {
     pg.mark_seen(&msg.id).await.unwrap();
     assert_eq!(pg.unseen_count("w33d@w33d.xyz").await.unwrap(), 0);
     assert!(pg.get_message(&msg.id).await.unwrap().unwrap().seen);
+
+    // --- star + folder + search -------------------------------------------
+    pg.set_starred(&msg.id, true).await.unwrap();
+    assert!(pg.get_message(&msg.id).await.unwrap().unwrap().starred);
+    let starred = pg.list_starred("w33d@w33d.xyz", 10).await.unwrap();
+    assert_eq!(starred.len(), 1);
+    assert!(starred[0].starred);
+    pg.set_starred(&msg.id, false).await.unwrap();
+    assert!(pg.list_starred("w33d@w33d.xyz", 10).await.unwrap().is_empty());
+
+    // Case-insensitive LIKE search over from/subject/body, keyset-paginated.
+    assert_eq!(pg.search_messages("w33d@w33d.xyz", "subject", None, 10).await.unwrap().len(), 1);
+    assert_eq!(pg.search_messages("w33d@w33d.xyz", "ALICE", None, 10).await.unwrap().len(), 1);
+    assert!(pg.search_messages("w33d@w33d.xyz", "nomatch", None, 10).await.unwrap().is_empty());
+    // Keyset off the only row returns nothing more.
+    let page = pg.search_messages("w33d@w33d.xyz", "subject", None, 10).await.unwrap();
+    let last = &page[0];
+    assert!(pg
+        .search_messages("w33d@w33d.xyz", "subject", Some((last.received_at, last.id.clone())), 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    pg.set_folder(&msg.id, "Archive").await.unwrap();
+    assert_eq!(pg.get_message(&msg.id).await.unwrap().unwrap().folder, "Archive");
+    assert!(pg.list_folder("w33d@w33d.xyz", "INBOX", 10).await.unwrap().is_empty());
+    assert_eq!(pg.list_folder("w33d@w33d.xyz", "Archive", 10).await.unwrap().len(), 1);
 
     // --- outbound queue ----------------------------------------------------
     let item = OutboundItem {

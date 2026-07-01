@@ -480,6 +480,7 @@ impl Session {
                 received_at: now_secs(),
                 seen: false,
                 folder: "INBOX".to_string(),
+                starred: false,
             };
             if let Err(e) = self.ctx.store.store_message(&msg).await {
                 tracing::error!(error = %e, "inbound store failed");

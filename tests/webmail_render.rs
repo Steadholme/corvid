@@ -21,6 +21,7 @@ fn seed_message(mailbox: &str, subject: &str, from: &str, body: &str) -> Message
         received_at: now_secs(),
         seen: false,
         folder: "INBOX".to_string(),
+        starred: false,
     }
 }
 
@@ -570,6 +571,195 @@ async fn attachment_download_denied_across_mailboxes() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "cross-mailbox attachment access denied");
+}
+
+// ---------------------------------------------------------------------------
+// Message actions + folder navigation + search
+// ---------------------------------------------------------------------------
+
+/// POST a message action with the given CSRF `token`/`cookie` and extra urlencoded `fields`.
+async fn action(
+    state: &AppState,
+    id: &str,
+    token: &str,
+    cookie: &str,
+    fields: &str,
+) -> axum::response::Response {
+    let body = format!("csrf={token}&{fields}");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/m/{id}/action"))
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.to_string())
+        .body(Body::from(body))
+        .unwrap();
+    app(state.clone()).oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn store_starred_and_search_roundtrip() {
+    let state = build_dev_state().await;
+    let m1 = seed_message("w33d@w33d.xyz", "Quarterly report", "Alice <alice@example.com>", "numbers inside");
+    let m2 = seed_message("w33d@w33d.xyz", "Lunch", "bob@example.com", "sandwich plans");
+    state.store.store_message(&m1).await.unwrap();
+    state.store.store_message(&m2).await.unwrap();
+
+    // Star m1 -> Starred view holds it; unstar -> gone.
+    state.store.set_starred(&m1.id, true).await.unwrap();
+    let starred = state.store.list_starred("w33d@w33d.xyz", 10).await.unwrap();
+    assert_eq!(starred.len(), 1);
+    assert_eq!(starred[0].id, m1.id);
+    assert!(starred[0].starred);
+    state.store.set_starred(&m1.id, false).await.unwrap();
+    assert!(state.store.list_starred("w33d@w33d.xyz", 10).await.unwrap().is_empty());
+
+    // Search over subject / body / from, case-insensitive.
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "quarterly", None, 10).await.unwrap().len(), 1);
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "SANDWICH", None, 10).await.unwrap().len(), 1);
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "alice", None, 10).await.unwrap().len(), 1);
+    assert!(state.store.search_messages("w33d@w33d.xyz", "nomatch", None, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_is_keyset_paginated() {
+    let state = build_dev_state().await;
+    for i in 0..3i64 {
+        let mut m = seed_message("w33d@w33d.xyz", &format!("Report {i}"), "a@b.com", "report body");
+        m.received_at = 100 + i;
+        state.store.store_message(&m).await.unwrap();
+    }
+    // Page 1: the two newest.
+    let p1 = state.store.search_messages("w33d@w33d.xyz", "report", None, 2).await.unwrap();
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p1[0].received_at, 102);
+    assert_eq!(p1[1].received_at, 101);
+    // Page 2: keyset off the last row -> the remaining older one, no overlap.
+    let last = p1.last().unwrap();
+    let p2 = state
+        .store
+        .search_messages("w33d@w33d.xyz", "report", Some((last.received_at, last.id.clone())), 2)
+        .await
+        .unwrap();
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].received_at, 100);
+    assert!(!p2.iter().any(|m| p1.iter().any(|x| x.id == m.id)));
+}
+
+#[tokio::test]
+async fn message_actions_star_archive_move_delete_unread() {
+    let state = build_dev_state().await;
+    let msg = seed_message("w33d@w33d.xyz", "Actionable", "a@b.com", "hi");
+    state.store.store_message(&msg).await.unwrap();
+    let (token, cookie) = mint_csrf(&state).await;
+
+    // Star.
+    let resp = action(&state, &msg.id, &token, &cookie, "op=star&return=%2F%3Ffolder%3DINBOX").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(state.store.get_message(&msg.id).await.unwrap().unwrap().starred);
+
+    // Mark unread.
+    action(&state, &msg.id, &token, &cookie, "op=unread&return=%2F").await;
+    assert!(!state.store.get_message(&msg.id).await.unwrap().unwrap().seen);
+
+    // Archive.
+    action(&state, &msg.id, &token, &cookie, "op=archive&return=%2F").await;
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Archive");
+
+    // Move to Drafts (a real folder).
+    action(&state, &msg.id, &token, &cookie, "op=move&folder=Drafts&return=%2F").await;
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Drafts");
+
+    // Move to a bogus folder is rejected (400) and does not move.
+    let resp = action(&state, &msg.id, &token, &cookie, "op=move&folder=Nope&return=%2F").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Drafts");
+
+    // Delete -> Trash.
+    action(&state, &msg.id, &token, &cookie, "op=delete&return=%2F").await;
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Trash");
+}
+
+#[tokio::test]
+async fn message_action_rejects_bad_csrf() {
+    let state = build_dev_state().await;
+    let msg = seed_message("w33d@w33d.xyz", "Guarded", "a@b.com", "hi");
+    state.store.store_message(&msg).await.unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/m/{}/action", msg.id))
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, "__Host-csrf=realtoken")
+        .body(Body::from("csrf=WRONG&op=delete&return=%2F"))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "INBOX");
+}
+
+#[tokio::test]
+async fn message_action_denied_across_mailboxes() {
+    let state = build_dev_state().await;
+    state
+        .store
+        .upsert_mailbox(&corvid::model::Mailbox {
+            addr: "alice@w33d.xyz".to_string(),
+            owner_sub: "alice".to_string(),
+        })
+        .await
+        .unwrap();
+    let msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");
+    state.store.store_message(&msg).await.unwrap();
+    let (token, cookie) = mint_csrf(&state).await; // w33d's token
+
+    // w33d (a different mailbox) may not act on alice's message.
+    let resp = action(&state, &msg.id, &token, &cookie, "op=delete&return=%2F").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "INBOX");
+}
+
+#[tokio::test]
+async fn inbox_search_and_starred_views_render() {
+    let state = build_dev_state().await;
+    let m1 = seed_message("w33d@w33d.xyz", "Invoice March", "vendor@example.com", "please pay");
+    state.store.store_message(&m1).await.unwrap();
+    state.store.set_starred(&m1.id, true).await.unwrap();
+
+    // Search matches by subject.
+    let req = Request::builder()
+        .uri("/?q=invoice")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("Search results"), "search heading rendered");
+    assert!(html.contains("Invoice March"), "matching message listed");
+
+    // A search with no hit shows the empty state.
+    let req = Request::builder()
+        .uri("/?q=zzzznope")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("No messages here."));
+
+    // The Starred view lists the starred message and offers the Starred tab.
+    let req = Request::builder()
+        .uri("/?folder=Starred")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains(r#"href="/?folder=Starred""#), "Starred tab present");
+    assert!(html.contains("Invoice March"), "starred message listed in Starred view");
+    // The row exposes the per-message action form.
+    assert!(html.contains(r#"action="/m/"#), "row action form present");
+    assert!(html.contains(r#"value="unstar""#), "starred row offers unstar");
 }
 
 #[tokio::test]
