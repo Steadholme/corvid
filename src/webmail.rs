@@ -53,7 +53,14 @@ const SHELL: &str = include_str!("../templates/shell.html");
 const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 const CSRF_COOKIE: &str = "__Host-csrf";
 
-const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
+// Lucide-style line icons (viewBox 0 0 24 24, currentColor, 2px rounded strokes) for the
+// Odyssey v2 app-bar nav + user menu. The app-tile (envelope) icon lives in templates/shell.html.
+const ICO_INBOX: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>"#;
+const ICO_COMPOSE: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4Z"/></svg>"#;
+const ICO_GRID: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>"#;
+const ICO_CARET: &str = r#"<svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>"#;
+const ICO_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
+const ICO_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>"#;
 
 /// Build the webmail router.
 pub fn app(state: AppState) -> Router {
@@ -214,7 +221,7 @@ async fn inbox(
         tabs = folder_tabs(folder, search.unwrap_or(""), scope),
     );
     let title = if folder.is_empty() { "Search" } else { folder };
-    let html = render_page(title, &email, &content);
+    let html = render_page(title, &email, &content, "inbox");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -405,7 +412,7 @@ async fn read_message(
         // Read-view actions return to the message so a star/unread toggle stays in context.
         actions = row_actions(&msg.id, msg.starred, &token, &format!("/m/{}", esc(&msg.id))),
     );
-    let html = render_page(&msg.subject, &email, &content);
+    let html = render_page(&msg.subject, &email, &content, "inbox");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -630,7 +637,7 @@ async fn compose_form(
         in_reply_to = esc(&pre.in_reply_to),
         references = esc(&pre.references),
     );
-    let html = render_page("Compose", &email, &content);
+    let html = render_page("Compose", &email, &content, "compose");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -1175,7 +1182,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
         r#"<div class="page-head"><h1>Mailbox provisioning</h1></div>
 <section class="card pad">
   <h2>Mailboxes</h2>
-  <table class="admin-table">
+  <table class="data admin-table">
     <thead><tr><th>Address</th><th>Owner (sub)</th><th>Messages / quota</th></tr></thead>
     <tbody>{mb_rows}</tbody>
   </table>
@@ -1188,7 +1195,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
 </section>
 <section class="card pad">
   <h2>Aliases</h2>
-  <table class="admin-table">
+  <table class="data admin-table">
     <thead><tr><th>Local-part</th><th>Delivers to</th></tr></thead>
     <tbody>{alias_rows}</tbody>
   </table>
@@ -1200,7 +1207,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
   </form>
 </section>"#,
     );
-    let html = render_page("Admin", &email, &content);
+    let html = render_page("Admin", &email, &content, "");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -1511,45 +1518,75 @@ pub fn esc(s: &str) -> String {
     esc_text(s)
 }
 
-fn render_page(title: &str, email_display: &str, content: &str) -> String {
+/// Render a full page into the Odyssey v2 shell. `nav_active` marks the current app-bar nav
+/// destination (`"inbox"`, `"compose"`, or `""` for none — e.g. admin/error pages).
+fn render_page(title: &str, email_display: &str, content: &str, nav_active: &str) -> String {
     SHELL
         .replace("{{STYLE}}", APP_CSS)
-        .replace("{{SHIELD}}", SHIELD_SVG)
         .replace("{{TITLE}}", &esc(title))
+        .replace("{{NAV}}", &nav_bar(nav_active))
         .replace("{{USERBOX}}", &userbox(email_display))
         .replace("{{CONTENT}}", content)
 }
 
-/// The right side of the app-bar: an "All apps" pill back to the apex portal, a user chip
-/// (avatar initial + signed-in email) when a gateway identity is known, and the cross-subdomain
-/// logout. `email_display` is the already-escaped display string from [`email_display`]; the
-/// `—` sentinel (no gateway session) renders the chrome without a user chip.
+/// The app-bar navigation — the existing Inbox (`/`) and Compose (`/compose`) destinations as v2
+/// `.appnav` links, marking `active` (`"inbox"`/`"compose"`) with `.is-active`.
+fn nav_bar(active: &str) -> String {
+    let link = |key: &str, href: &str, label: &str, icon: &str| {
+        let cls = if key == active { "appnav is-active" } else { "appnav" };
+        format!(r#"<a class="{cls}" href="{href}">{icon}{label}</a>"#)
+    };
+    format!(
+        "{}{}",
+        link("inbox", "/", "Inbox", ICO_INBOX),
+        link("compose", "/compose", "Compose", ICO_COMPOSE),
+    )
+}
+
+/// The right side of the app-bar (Odyssey v2): an "All apps" icon button back to the apex portal,
+/// plus a focus-within avatar menu whose dropdown lists Account, All apps, and the SAME
+/// cross-subdomain sign-out (`LOGOUT_URL`, a GET link) wrapped as a danger menu item.
+/// `email_display` is the already-escaped display string from [`email_display`]; the `—` sentinel
+/// (no gateway session) still renders a minimal avatar so the chrome never breaks.
 fn userbox(email_display: &str) -> String {
     let has_email = !email_display.is_empty() && !email_display.starts_with('—');
-    let chip = if has_email {
-        let initial = email_display
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "H".to_string());
+    // Name = the local-part; initial = its first alphanumeric char (fallback "C" for Corvid).
+    let name = email_display.split('@').next().unwrap_or(email_display);
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .filter(|_| has_email)
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "C".to_string());
+
+    let name_label = if has_email {
+        format!(r#"<span class="usermenu__name">{email_display}</span>"#)
+    } else {
+        String::new()
+    };
+    let head = if has_email {
         format!(
-            "<span class=\"userchip\"><span class=\"userchip__avatar\" aria-hidden=\"true\">{}</span><span class=\"user-email\" title=\"Signed in as\">{}</span></span>",
-            esc(&initial),
-            email_display,
+            r#"<div class="usermenu__head"><span class="avatar avatar--lg">{initial}</span><div><b>{name}</b><span>{email_display}</span></div></div>"#,
         )
     } else {
         String::new()
     };
+
     format!(
-        concat!(
-            "<a class=\"allapps\" href=\"https://w33d.xyz\" title=\"All apps\">",
-            "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">",
-            "<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/>",
-            "<rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/></svg>All apps</a>",
-            "{chip}",
-            "<a class=\"btn btn-ghost btn-sm\" href=\"{logout}\">Log out</a>",
-        ),
-        chip = chip,
+        r#"<a class="iconbtn" href="https://w33d.xyz" title="All apps" aria-label="All apps">{grid}</a>
+<div class="usermenu">
+  <button class="usermenu__btn" type="button" aria-haspopup="true" aria-label="Account menu"><span class="avatar" aria-hidden="true">{initial}</span>{name_label}{caret}</button>
+  <div class="usermenu__pop" role="menu">
+    {head}
+    <a class="menuitem" role="menuitem" href="https://account.w33d.xyz">{user}Account</a>
+    <a class="menuitem" role="menuitem" href="https://w33d.xyz">{grid}All apps</a>
+    <a class="menuitem menuitem--danger" role="menuitem" href="{logout}">{logout_ico}Log out</a>
+  </div>
+</div>"#,
+        grid = ICO_GRID,
+        caret = ICO_CARET,
+        user = ICO_USER,
+        logout_ico = ICO_LOGOUT,
         logout = LOGOUT_URL,
     )
 }
@@ -1563,7 +1600,7 @@ fn email_display(headers: &HeaderMap) -> String {
 
 fn no_mailbox_page(email: &str) -> Response {
     let content = r#"<section class="card empty-card"><h1 class="empty-title">No mailbox provisioned</h1><p class="muted">Your HOLDFAST identity has no Corvid mailbox yet. Ask an administrator to provision one.</p></section>"#;
-    Html(render_page("No mailbox", email, content)).into_response()
+    Html(render_page("No mailbox", email, content, "")).into_response()
 }
 
 fn error_page(status: StatusCode, heading: &str, message: &str) -> Response {
@@ -1572,7 +1609,7 @@ fn error_page(status: StatusCode, heading: &str, message: &str) -> Response {
         esc(heading),
         esc(message),
     );
-    (status, Html(render_page(heading, "—", &content))).into_response()
+    (status, Html(render_page(heading, "—", &content, ""))).into_response()
 }
 
 /// `From:` display: prefer the display-name, else the bare address.

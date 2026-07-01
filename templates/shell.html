@@ -8,23 +8,15 @@
   <title>{{TITLE}} · HOLDFAST Corvid</title>
   <style>{{STYLE}}</style>
 </head>
-<body class="page">
-  <header class="topbar">
-    <div class="topbar__inner">
-      <div class="topbar__lead">
-        <a class="brand brand--sm" href="/" aria-label="HOLDFAST Corvid home">
-          <span class="brand__glyph" aria-hidden="true">{{SHIELD}}</span>
-          <span class="brand__word">HOLDFAST</span>
-        </a>
-        <span class="topbar__sep" aria-hidden="true"></span>
-        <span class="topbar__title">Corvid</span>
-        <nav class="topbar__nav">
-          <a href="/">Inbox</a>
-          <a href="/compose">Compose</a>
-        </nav>
-      </div>
-      <div class="topbar__right">{{USERBOX}}</div>
-    </div>
+<body>
+  <header class="appbar">
+    <a class="appbar__brand" href="/" aria-label="Corvid home">
+      <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg></span>
+      <span class="appbar__name"><b>Corvid</b><span>mail.w33d.xyz</span></span>
+    </a>
+    <nav class="appbar__nav">{{NAV}}</nav>
+    <span class="appbar__spacer"></span>
+    <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
   <main class="wrap">
