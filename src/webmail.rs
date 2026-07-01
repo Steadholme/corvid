@@ -13,11 +13,13 @@
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue + relay + file a Sent copy;
 //!                   `action=draft`: persist into the Drafts folder without sending
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
+
+use crate::rfc822::Attachment;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::Deserialize;
@@ -53,6 +55,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/", get(inbox))
         .route("/m/{id}", get(read_message))
+        .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
         .route("/api/send", post(api_send))
@@ -202,6 +205,9 @@ async fn read_message(
         format!(r#"<div class="msg-body"><pre>{}</pre></div>"#, esc(&msg.body_text))
     };
 
+    // Enumerate the stored raw source's MIME parts and offer a download link per attachment.
+    let attachments = render_attachment_list(&msg);
+
     let subject = if msg.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&msg.subject) };
     let content = format!(
         r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
@@ -219,6 +225,7 @@ async fn read_message(
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
     </div>
   </header>
+  {attachments}
   {body}
 </section>"#,
         from = esc(&msg.msg_from),
@@ -229,6 +236,74 @@ async fn read_message(
         id = esc(&msg.id),
     );
     Html(render_page(&msg.subject, &email, &content)).into_response()
+}
+
+/// Render the read-view attachment strip: one download link per MIME attachment part enumerated
+/// from the stored raw source. Empty string when the message carries no attachments.
+fn render_attachment_list(msg: &Message) -> String {
+    let attachments = crate::rfc822::list_attachments(&msg.raw_rfc822);
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let mut items = String::new();
+    for a in &attachments {
+        items.push_str(&format!(
+            r#"<li><a class="btn btn-ghost btn-sm" href="/m/{id}/attachments/{idx}" download="{name}">{name}</a> <span class="muted attach-size">{size}</span></li>"#,
+            id = esc(&msg.id),
+            idx = a.index,
+            name = esc(&a.filename),
+            size = human_size(a.size),
+        ));
+    }
+    format!(r#"<div class="attachments"><b class="attach-head">Attachments</b><ul class="attach-list">{items}</ul></div>"#)
+}
+
+/// A compact human-readable byte size (`820 B`, `4.2 KB`, `1.5 MB`).
+fn human_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// `GET /m/{id}/attachments/{idx}` — stream the Nth attachment of a message the signed-in user owns
+/// as a download (`Content-Disposition: attachment`). Enforces the SAME mailbox authorisation as the
+/// read view: a message is only reachable from its own mailbox.
+async fn download_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, idx)): Path<(String, usize)>,
+) -> Response {
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return (StatusCode::FORBIDDEN, "no mailbox").into_response();
+    };
+    let msg = match state.store.get_message(&id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such message").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if msg.mailbox != mb.addr {
+        return (StatusCode::NOT_FOUND, "no such message").into_response();
+    }
+    let Some(att) = crate::rfc822::extract_attachment(&msg.raw_rfc822, idx) else {
+        return (StatusCode::NOT_FOUND, "no such attachment").into_response();
+    };
+    // `filename` + `content_type` are already sanitised by rfc822 (no CRLF/quotes), so they are
+    // safe to echo into response headers.
+    let disposition = format!("attachment; filename=\"{}\"", att.filename);
+    (
+        [
+            (header::CONTENT_TYPE, att.content_type),
+            (header::CONTENT_DISPOSITION, disposition),
+        ],
+        att.data,
+    )
+        .into_response()
 }
 
 /// Query string for `GET /compose`: at most one of these carries a stored message id whose
@@ -272,7 +347,7 @@ async fn compose_form(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
 <section class="card pad">
   <div class="page-head"><h1>New message</h1></div>
-  <form method="post" action="/send">
+  <form method="post" action="/send" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="{token}">
     <input type="hidden" name="in_reply_to" value="{in_reply_to}">
     <input type="hidden" name="references" value="{references}">
@@ -280,6 +355,7 @@ async fn compose_form(
     <div class="field"><label for="to">To</label><input id="to" name="to" value="{to}" placeholder="someone@example.com"></div>
     <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" value="{subject}" placeholder="Subject"></div>
     <div class="field"><label for="body">Message</label><textarea id="body" name="body">{body}</textarea></div>
+    <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple></div>
     <div class="form-actions">
       <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
       <button class="btn btn-ghost" type="submit" name="action" value="draft">Save draft</button>
@@ -435,7 +511,7 @@ fn forward_body(msg: &Message) -> String {
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SendForm {
     csrf: String,
     #[serde(default)]
@@ -454,12 +530,19 @@ struct SendForm {
     action: String,
 }
 
-async fn send(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<SendForm>,
-) -> Response {
+async fn send(State(state): State<AppState>, req: Request) -> Response {
+    // Cookies/CSRF live in the headers; capture them before the body extractor consumes `req`.
+    let headers = req.headers().clone();
     let email = email_display(&headers);
+
+    // Compose now posts multipart/form-data (so it can carry file parts); the internal callers and
+    // the pre-attachment tests still post urlencoded. Accept BOTH: parse attachments only from the
+    // multipart body, an empty attachment set otherwise.
+    let (form, attachments) = match parse_send(req, &state, &headers).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
     if !verify_csrf(&headers, &form.csrf) {
         return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
     }
@@ -475,6 +558,7 @@ async fn send(
         &form.in_reply_to,
         &form.references,
         &state.config.mail_domain,
+        &attachments,
     );
 
     // "Save draft": persist without sending, and allow an incomplete recipient list.
@@ -534,6 +618,74 @@ async fn store_local_copy(
     }
 }
 
+/// Parse a `POST /send` body into its [`SendForm`] fields plus any attachment file parts. A
+/// `multipart/form-data` body (the compose form) yields both; any other content type is decoded as
+/// the legacy `application/x-www-form-urlencoded` form with no attachments (internal callers/tests).
+async fn parse_send(
+    req: Request,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(SendForm, Vec<Attachment>), Response> {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if ct.starts_with("multipart/form-data") {
+        let mut mp = Multipart::from_request(req, state)
+            .await
+            .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid request", &e.to_string()))?;
+        let mut form = SendForm::default();
+        let mut attachments = Vec::new();
+        loop {
+            let field = match mp.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => return Err(error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string())),
+            };
+            let name = field.name().unwrap_or("").to_string();
+            if name == "attachments" {
+                let filename = field.file_name().map(str::to_string).unwrap_or_default();
+                let content_type = field
+                    .content_type()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string()))?
+                    .to_vec();
+                // Skip the empty file input a user leaves untouched.
+                if !data.is_empty() && !filename.trim().is_empty() {
+                    attachments.push(Attachment {
+                        filename: crate::rfc822::sanitize_filename(&filename),
+                        content_type: crate::rfc822::content_type_base(&content_type),
+                        data,
+                    });
+                }
+            } else {
+                let text = field.text().await.unwrap_or_default();
+                match name.as_str() {
+                    "csrf" => form.csrf = text,
+                    "to" => form.to = text,
+                    "subject" => form.subject = text,
+                    "body" => form.body = text,
+                    "in_reply_to" => form.in_reply_to = text,
+                    "references" => form.references = text,
+                    "action" => form.action = text,
+                    _ => {}
+                }
+            }
+        }
+        Ok((form, attachments))
+    } else {
+        let Form(form) = Form::<SendForm>::from_request(req, state)
+            .await
+            .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid request", &e.to_string()))?;
+        Ok((form, Vec::new()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal service send API (token-guarded, NOT behind Sluice SSO/CSRF)
 // ---------------------------------------------------------------------------
@@ -590,7 +742,7 @@ async fn api_send(
         return json_status(StatusCode::BAD_REQUEST, "at least one valid recipient is required");
     }
 
-    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, "", "", &state.config.mail_domain);
+    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, "", "", &state.config.mail_domain, &[]);
     let signer = state.signer.as_deref();
     match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts).await {
         Ok(signed) => {
@@ -628,7 +780,10 @@ fn json_status(status: StatusCode, message: &str) -> Response {
 }
 
 /// Build an RFC822 message for an outbound compose. `in_reply_to`/`references` (empty to omit)
-/// carry the reply threading headers built from the original's stored raw source.
+/// carry the reply threading headers built from the original's stored raw source. With no
+/// `attachments` the body is a single `text/plain` part (unchanged wire format); with attachments
+/// it becomes a `multipart/mixed` — a `text/plain` body part followed by one base64
+/// `Content-Disposition: attachment` part per file.
 fn build_rfc822(
     from: &str,
     to: &str,
@@ -637,6 +792,7 @@ fn build_rfc822(
     in_reply_to: &str,
     references: &str,
     domain: &str,
+    attachments: &[Attachment],
 ) -> String {
     let body_norm = body.replace("\r\n", "\n").replace('\n', "\r\n");
     let mut thread = String::new();
@@ -646,13 +802,64 @@ fn build_rfc822(
     if !references.trim().is_empty() {
         thread.push_str(&format!("References: {}\r\n", references.trim()));
     }
-    format!(
-        "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n\
-         {thread}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
+
+    let head = format!(
+        "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n{thread}MIME-Version: 1.0\r\n",
         date = email_date(),
         mid = message_id(domain),
-    )
+    );
+
+    if attachments.is_empty() {
+        return format!(
+            "{head}Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
+        );
+    }
+
+    let boundary = mime_boundary();
+    let mut out = format!(
+        "{head}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
+         This is a multi-part message in MIME format.\r\n\
+         --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
+    );
+    for a in attachments {
+        let name = crate::rfc822::sanitize_filename(&a.filename);
+        let ctype = crate::rfc822::content_type_base(&a.content_type);
+        out.push_str(&format!(
+            "--{boundary}\r\nContent-Type: {ctype}; name=\"{name}\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             Content-Disposition: attachment; filename=\"{name}\"\r\n\r\n{payload}\r\n",
+            payload = base64_wrapped(&a.data),
+        ));
+    }
+    out.push_str(&format!("--{boundary}--\r\n"));
+    out
+}
+
+/// A fresh MIME multipart boundary — random enough never to occur in a payload.
+fn mime_boundary() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("=_corvid_{}", hex::encode(bytes))
+}
+
+/// Base64-encode `data` and hard-wrap it at 76 columns with CRLF (RFC 2045 line-length limit).
+fn base64_wrapped(data: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+    let mut out = String::with_capacity(b64.len() + b64.len() / 76 * 2);
+    let bytes = b64.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let end = (i + 76).min(bytes.len());
+        out.push_str(&b64[i..end]);
+        out.push_str("\r\n");
+        i = end;
+    }
+    // Trim the trailing CRLF; the caller frames the part with its own CRLF.
+    out.truncate(out.trim_end_matches("\r\n").len());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,7 +1405,7 @@ mod tests {
 
     #[test]
     fn build_rfc822_has_signed_headers() {
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Hi", "Body line", "", "", "w33d.xyz");
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Hi", "Body line", "", "", "w33d.xyz", &[]);
         for h in ["From:", "To:", "Subject:", "Date:", "Message-ID:", "MIME-Version:", "Content-Type:"] {
             assert!(raw.contains(h), "missing {h}");
         }
@@ -1218,9 +1425,33 @@ mod tests {
             "<orig@ex.com>",
             "<root@ex.com> <orig@ex.com>",
             "w33d.xyz",
+            &[],
         );
         assert!(raw.contains("In-Reply-To: <orig@ex.com>\r\n"));
         assert!(raw.contains("References: <root@ex.com> <orig@ex.com>\r\n"));
+    }
+
+    #[test]
+    fn build_rfc822_emits_multipart_mixed_with_attachment() {
+        let att = Attachment {
+            filename: "report.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: b"hello attachment".to_vec(),
+        };
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Files", "See attached", "", "", "w33d.xyz", &[att]);
+
+        assert!(raw.contains("Content-Type: multipart/mixed; boundary="), "top-level is multipart/mixed");
+        assert!(raw.contains("Content-Disposition: attachment; filename=\"report.txt\""));
+        assert!(raw.contains("Content-Transfer-Encoding: base64"));
+
+        // The stored source round-trips through the reader: body + one decodable attachment.
+        let parsed = crate::rfc822::parse(&raw);
+        assert!(parsed.body_text.contains("See attached"));
+        let metas = crate::rfc822::list_attachments(&raw);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].filename, "report.txt");
+        let got = crate::rfc822::extract_attachment(&raw, 0).unwrap();
+        assert_eq!(got.data, b"hello attachment");
     }
 
     #[test]

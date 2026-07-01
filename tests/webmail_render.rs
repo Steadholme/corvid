@@ -436,6 +436,142 @@ async fn admin_alias_rejects_unknown_mailbox() {
     assert!(state.store.list_aliases().await.unwrap().is_empty());
 }
 
+/// Encode a `multipart/form-data` body from `(name, filename?, content_type?, value)` parts.
+/// A `None` filename makes a plain text field; `Some(..)` makes a file part.
+fn multipart_body(
+    boundary: &str,
+    parts: &[(&str, Option<&str>, Option<&str>, &[u8])],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, filename, ctype, value) in parts {
+        out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        match filename {
+            Some(fname) => {
+                out.extend_from_slice(
+                    format!(
+                        "Content-Disposition: form-data; name=\"{name}\"; filename=\"{fname}\"\r\n"
+                    )
+                    .as_bytes(),
+                );
+                let ct = ctype.unwrap_or("application/octet-stream");
+                out.extend_from_slice(format!("Content-Type: {ct}\r\n\r\n").as_bytes());
+            }
+            None => {
+                out.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+                );
+            }
+        }
+        out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    out
+}
+
+#[tokio::test]
+async fn multipart_send_with_attachment_roundtrips_to_download() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_csrf(&state).await;
+
+    // Compose a multipart send: text fields + one file part.
+    let boundary = "corvidTestBoundary123";
+    let body = multipart_body(
+        boundary,
+        &[
+            ("csrf", None, None, token.as_bytes()),
+            ("action", None, None, b"send"),
+            ("to", None, None, b"friend@example.com"),
+            ("subject", None, None, b"With file"),
+            ("body", None, None, b"see attachment"),
+            ("attachments", Some("hello.txt"), Some("text/plain"), b"attached bytes"),
+        ],
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .header(header::COOKIE, cookie)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "multipart send redirects on success");
+
+    // The outbound raw is multipart/mixed carrying the base64 attachment part.
+    let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(due[0].raw.contains("multipart/mixed"));
+    assert!(due[0].raw.contains(r#"filename="hello.txt""#));
+    assert!(due[0].raw.contains("see attachment"));
+
+    // A Sent copy was filed; its read view lists the attachment with a download link.
+    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", 10).await.unwrap();
+    assert_eq!(sent.len(), 1);
+    let sent_id = sent[0].id.clone();
+
+    let req = Request::builder()
+        .uri(format!("/m/{sent_id}"))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("Attachments"), "read view shows the attachments strip");
+    assert!(html.contains(&format!("/m/{sent_id}/attachments/0")), "download link present");
+    assert!(html.contains("hello.txt"));
+
+    // Downloading the attachment returns the exact bytes with an attachment disposition.
+    let req = Request::builder()
+        .uri(format!("/m/{sent_id}/attachments/0"))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let disp = resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(disp.contains(r#"attachment; filename="hello.txt""#), "content-disposition: {disp}");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"attached bytes");
+}
+
+#[tokio::test]
+async fn attachment_download_denied_across_mailboxes() {
+    let state = build_dev_state().await;
+    // Provision a second mailbox owned by a different subject, holding an attachment message.
+    state
+        .store
+        .upsert_mailbox(&corvid::model::Mailbox {
+            addr: "alice@w33d.xyz".to_string(),
+            owner_sub: "alice".to_string(),
+        })
+        .await
+        .unwrap();
+    let mut msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");
+    msg.raw_rfc822 = "Content-Type: multipart/mixed; boundary=\"BB\"\r\n\r\n\
+        --BB\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+        --BB\r\nContent-Type: text/plain; name=\"secret.txt\"\r\n\
+        Content-Transfer-Encoding: base64\r\n\
+        Content-Disposition: attachment; filename=\"secret.txt\"\r\n\r\nc2VjcmV0\r\n--BB--\r\n"
+        .to_string();
+    state.store.store_message(&msg).await.unwrap();
+
+    // The `w33d` user (different mailbox) must NOT be able to download alice's attachment.
+    let req = Request::builder()
+        .uri(format!("/m/{}/attachments/0", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "cross-mailbox attachment access denied");
+}
+
 #[tokio::test]
 async fn send_rejects_bad_csrf() {
     let state = build_dev_state().await;

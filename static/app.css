@@ -244,8 +244,16 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 .msg-body pre { white-space: pre-wrap; font: 13px/1.6 var(--mono); margin: 0; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px; color: var(--ink-2); }
 .msg-body img { max-width: 100%; }
 
+/* -------------------------------------------------------------- attachments */
+.attachments { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.attach-head { display: block; color: var(--ink-3); font-weight: 600; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; margin: 0 0 10px; }
+.attach-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.attach-list > li { display: inline-flex; align-items: center; gap: 6px; }
+.attach-size { font-size: 12px; font-variant-numeric: tabular-nums; }
+
 /* -------------------------------------------------------------- compose form */
 .field textarea { min-height: 220px; }
+.field input[type=file] { font-size: 13px; color: var(--ink-2); }
 .form-actions { display: flex; gap: 10px; align-items: center; margin-top: 4px; }
 
 /* -------------------------------------------------------------- empty / banners */

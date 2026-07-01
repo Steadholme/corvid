@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 # HTTP framework for the webmail surface (shared with agora/keystone/…): State/Path/Form
 # extractors, typed responses.
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 # Async runtime: the SMTP listeners, the relay worker and the axum server all run on it.
 # `net`/`io-util`/`time` drive the raw SMTP sockets + UDP DNS; the Store trait is async so a
 # DB round-trip never blocks a worker thread (no block_in_place, no sync-over-async bridge).
