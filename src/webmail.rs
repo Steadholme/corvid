@@ -16,7 +16,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::{Form, Router};
+use axum::{Form, Json, Router};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::Deserialize;
@@ -29,7 +29,7 @@ use crate::AppState;
 
 const APP_CSS: &str = include_str!("../static/app.css");
 const SHELL: &str = include_str!("../templates/shell.html");
-const LOGOUT_URL: &str = "https://id.w33d.xyz/_gw/auth/logout";
+const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 const CSRF_COOKIE: &str = "__Host-csrf";
 
 const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="hf-shield-sm" x1="8" y1="4" x2="40" y2="44" gradientUnits="userSpaceOnUse"><stop stop-color="#818CF8"/><stop offset="1" stop-color="#4F46E5"/></linearGradient></defs><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" fill="url(#hf-shield-sm)"/><rect x="20" y="19" width="8" height="13" rx="1" fill="#fff" fill-opacity="0.92"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="#fff" stroke-width="2" stroke-opacity="0.92" fill="none"/></svg>"##;
@@ -42,6 +42,7 @@ pub fn app(state: AppState) -> Router {
         .route("/m/{id}", get(read_message))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
+        .route("/api/send", post(api_send))
         .with_state(state)
 }
 
@@ -207,6 +208,95 @@ async fn send(
         Ok(_) => Redirect::to("/?sent=1").into_response(),
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal service send API (token-guarded, NOT behind Sluice SSO/CSRF)
+// ---------------------------------------------------------------------------
+
+/// JSON body for `POST /api/send`.
+#[derive(Deserialize)]
+struct ApiSend {
+    from: String,
+    to: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// Token-guarded transactional send for estate services (e.g. Keystone).
+///
+/// Guarded by a `Bearer` service token from `MAIL_SEND_TOKEN` (constant-time compare; `503` when
+/// unset). The `from` address MUST be `@<mail_domain>` (so the message inherits DKIM signing via
+/// the SAME [`relay::enqueue_outbound`] path the webmail compose uses); off-domain senders would
+/// relay unsigned and are rejected with `400`. Returns `202` on enqueue.
+async fn api_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ApiSend>,
+) -> Response {
+    // Guard: token configured, and a matching Bearer presented (constant-time).
+    let expected = state.config.mail_send_token.as_str();
+    if expected.is_empty() {
+        return json_status(StatusCode::SERVICE_UNAVAILABLE, "send API disabled (MAIL_SEND_TOKEN unset)");
+    }
+    let presented = bearer_token(&headers).unwrap_or_default();
+    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return json_status(StatusCode::UNAUTHORIZED, "invalid or missing bearer token");
+    }
+
+    // From must be a bare/angle address at the signing domain, else it would relay unsigned.
+    let from_addr = extract_addr(&req.from);
+    if domain_of(&from_addr).as_deref() != Some(state.config.mail_domain.to_lowercase().as_str()) {
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            "from must be an address at the mail domain (else the message would relay unsigned)",
+        );
+    }
+
+    let rcpts: Vec<String> = req
+        .to
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|s| s.contains('@') && domain_of(s).is_some())
+        .map(str::to_string)
+        .collect();
+    if rcpts.is_empty() {
+        return json_status(StatusCode::BAD_REQUEST, "at least one valid recipient is required");
+    }
+
+    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, &state.config.mail_domain);
+    let signer = state.signer.as_deref();
+    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts).await {
+        Ok(_) => json_status(StatusCode::ACCEPTED, "queued"),
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("enqueue failed: {e}")),
+    }
+}
+
+/// Extract the `Authorization: Bearer <token>` value, if present.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = header_value(headers, "authorization")?;
+    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Extract a bare address from a possibly `Name <addr>` string (lowercased trim left to callers).
+fn extract_addr(s: &str) -> String {
+    let s = s.trim();
+    if let Some(lt) = s.find('<') {
+        if let Some(gt) = s[lt..].find('>') {
+            return s[lt + 1..lt + gt].trim().to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// A small JSON `{status, message}` response with the given HTTP status.
+fn json_status(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "status": status.as_u16(), "message": message });
+    (status, Json(body)).into_response()
 }
 
 /// Build an RFC822 message for an outbound compose.
@@ -429,5 +519,23 @@ mod tests {
             assert!(raw.contains(h), "missing {h}");
         }
         assert!(raw.contains("\r\n\r\nBody line\r\n"));
+    }
+
+    #[test]
+    fn extract_addr_handles_angle_and_bare() {
+        assert_eq!(extract_addr("no-reply@w33d.xyz"), "no-reply@w33d.xyz");
+        assert_eq!(extract_addr("HOLDFAST <no-reply@w33d.xyz>"), "no-reply@w33d.xyz");
+        assert_eq!(extract_addr("  bare@x.com  "), "bare@x.com");
+    }
+
+    #[test]
+    fn bearer_token_parses_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer s3cret".parse().unwrap());
+        assert_eq!(bearer_token(&h).as_deref(), Some("s3cret"));
+        let mut h2 = HeaderMap::new();
+        h2.insert("authorization", "Basic abc".parse().unwrap());
+        assert_eq!(bearer_token(&h2), None);
+        assert_eq!(bearer_token(&HeaderMap::new()), None);
     }
 }

@@ -50,6 +50,8 @@ pub struct Config {
     pub max_msg_size: usize,
     /// Max recipients per transaction (`MAX_RCPTS`).
     pub max_rcpts: usize,
+    /// Bearer token guarding the internal send API (`MAIL_SEND_TOKEN`). Empty disables the API.
+    pub mail_send_token: String,
 }
 
 impl Config {
@@ -74,6 +76,7 @@ impl Config {
             hostname: "mail.w33d.xyz".to_string(),
             max_msg_size: 10 * 1024 * 1024,
             max_rcpts: 100,
+            mail_send_token: String::new(),
         }
     }
 
@@ -124,6 +127,9 @@ impl Config {
         }
         if let Some(v) = env_nonempty("MAX_RCPTS").and_then(|s| s.parse().ok()) {
             c.max_rcpts = v;
+        }
+        if let Some(v) = env_nonempty("MAIL_SEND_TOKEN") {
+            c.mail_send_token = v;
         }
         c
     }
