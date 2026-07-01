@@ -61,26 +61,32 @@ pub trait Store: Send + Sync {
         mailbox: &str,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
-    /// Listing for a single folder within a mailbox, newest first, capped.
+    /// Listing for a single folder within a mailbox, newest first, keyset-paginated: `before` is
+    /// the `(received_at, id)` of the last row of the previous page (`None` for the first page).
     async fn list_folder(
         &self,
         mailbox: &str,
         folder: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
-    /// Cross-folder listing of the starred/flagged messages in a mailbox, newest first, capped.
+    /// Cross-folder listing of the starred/flagged messages in a mailbox, newest first,
+    /// keyset-paginated like [`Store::list_folder`].
     async fn list_starred(
         &self,
         mailbox: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
-    /// Search a mailbox over `From`/`Subject`/body (case-insensitive substring), newest first,
+    /// Search a mailbox over `From`/`To`/`Subject`/body (case-insensitive substring), newest
+    /// first, optionally scoped to one `folder` (`None` searches the whole mailbox),
     /// keyset-paginated: `before` is the `(received_at, id)` of the last row of the previous page
     /// (`None` for the first page). `query` is matched lowercased.
     async fn search_messages(
         &self,
         mailbox: &str,
         query: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
@@ -129,6 +135,14 @@ pub struct InMemoryStore {
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Keyset filter for the in-memory listings: keep only rows strictly older than the cursor
+/// (by `(received_at, id)` descending), i.e. the page AFTER the one that ended at `before`.
+fn apply_before(v: &mut Vec<Message>, before: Option<(i64, String)>) {
+    if let Some((ts, id)) = before {
+        v.retain(|m| m.received_at < ts || (m.received_at == ts && m.id < id));
     }
 }
 
@@ -243,6 +257,7 @@ impl Store for InMemoryStore {
         &self,
         mailbox: &str,
         folder: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let mut v: Vec<Message> = self
@@ -254,6 +269,7 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
     }
@@ -261,6 +277,7 @@ impl Store for InMemoryStore {
     async fn list_starred(
         &self,
         mailbox: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let mut v: Vec<Message> = self
@@ -272,6 +289,7 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
     }
@@ -280,6 +298,7 @@ impl Store for InMemoryStore {
         &self,
         mailbox: &str,
         query: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
@@ -291,17 +310,16 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| {
                 m.mailbox == mailbox
+                    && folder.map_or(true, |f| m.folder == f)
                     && (m.msg_from.to_lowercase().contains(&needle)
+                        || m.msg_to.to_lowercase().contains(&needle)
                         || m.subject.to_lowercase().contains(&needle)
                         || m.body_text.to_lowercase().contains(&needle))
             })
             .cloned()
             .collect();
         v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
-        // Keyset: keep only rows strictly older than the cursor (by (received_at, id) desc).
-        if let Some((ts, id)) = before {
-            v.retain(|m| m.received_at < ts || (m.received_at == ts && m.id < id));
-        }
+        apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
     }
@@ -477,6 +495,11 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_starred ON messages (mailbox, starred, received_at)")
             .execute(&self.pool)
             .await?;
+        // Keyset-pagination path: matches `ORDER BY received_at DESC, id DESC` within a mailbox
+        // exactly, so each listing page is a single index range scan.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_mailbox_keyset ON messages (mailbox, received_at DESC, id DESC)")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS outbound_queue (\
                  id TEXT PRIMARY KEY, \
@@ -535,6 +558,13 @@ impl PgStore {
             // Nullable column (pre-migration rows are NULL) — read as Option, default unset.
             starred: row.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
         })
+    }
+
+    /// The keyset cursor, defaulted to "newer than any real row" so the first page is unbounded.
+    /// The id tie-break only fires when `received_at` equals the cursor ts, so the empty id never
+    /// matches a real (non-empty) id when ts == `i64::MAX`.
+    fn cursor(before: Option<(i64, String)>) -> (i64, String) {
+        before.unwrap_or((i64::MAX, String::new()))
     }
 
     fn outbound_from_row(row: &sqlx::postgres::PgRow) -> Result<OutboundItem, sqlx::Error> {
@@ -680,14 +710,20 @@ impl Store for PgStore {
         &self,
         mailbox: &str,
         folder: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
+        let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
             "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
-             WHERE mailbox = $1 AND folder = $2 ORDER BY received_at DESC, id DESC LIMIT $3",
+             WHERE mailbox = $1 AND folder = $2 \
+               AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
+             ORDER BY received_at DESC, id DESC LIMIT $5",
         )
         .bind(mailbox)
         .bind(folder)
+        .bind(cur_ts)
+        .bind(&cur_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -701,13 +737,19 @@ impl Store for PgStore {
     async fn list_starred(
         &self,
         mailbox: &str,
+        before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
+        let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
             "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
-             WHERE mailbox = $1 AND starred = TRUE ORDER BY received_at DESC, id DESC LIMIT $2",
+             WHERE mailbox = $1 AND starred = TRUE \
+               AND (received_at < $2 OR (received_at = $2 AND id < $3)) \
+             ORDER BY received_at DESC, id DESC LIMIT $4",
         )
         .bind(mailbox)
+        .bind(cur_ts)
+        .bind(&cur_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
@@ -722,26 +764,29 @@ impl Store for PgStore {
         &self,
         mailbox: &str,
         query: &str,
+        folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         // `%needle%` with LIKE special chars escaped; matched case-insensitively via LOWER().
         let pattern = format!("%{}%", like_escape(&query.to_lowercase()));
-        // Keyset cursor: default to "newer than any real row" so the first page is unbounded.
-        // The id tie-break only fires when received_at == cursor ts, so an empty id never matches
-        // a real (non-empty) id when ts == i64::MAX.
-        let (cur_ts, cur_id) = before.unwrap_or((i64::MAX, String::new()));
+        // Optional folder scope: the empty string means "whole mailbox" ('' is never a folder).
+        let scope = folder.unwrap_or("");
+        let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
             "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
              WHERE mailbox = $1 \
                AND (LOWER(msg_from) LIKE $2 ESCAPE '\\' \
+                    OR LOWER(msg_to) LIKE $2 ESCAPE '\\' \
                     OR LOWER(subject) LIKE $2 ESCAPE '\\' \
                     OR LOWER(body_text) LIKE $2 ESCAPE '\\') \
-               AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
-             ORDER BY received_at DESC, id DESC LIMIT $5",
+               AND ($3 = '' OR folder = $3) \
+               AND (received_at < $4 OR (received_at = $4 AND id < $5)) \
+             ORDER BY received_at DESC, id DESC LIMIT $6",
         )
         .bind(mailbox)
         .bind(&pattern)
+        .bind(scope)
         .bind(cur_ts)
         .bind(&cur_id)
         .bind(limit)
@@ -757,7 +802,7 @@ impl Store for PgStore {
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
         let row = sqlx::query(
             "SELECT id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                    received_at, seen, folder FROM messages WHERE id = $1",
+                    received_at, seen, folder, starred FROM messages WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -913,4 +958,47 @@ fn like_escape(s: &str) -> String {
 /// Map an sqlx error into a [`StoreError`].
 fn backend(e: sqlx::Error) -> StoreError {
     StoreError::Backend(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn like_escape_neutralises_metacharacters() {
+        assert_eq!(like_escape("plain"), "plain");
+        assert_eq!(like_escape("50%_off\\now"), "50\\%\\_off\\\\now");
+    }
+
+    fn msg(id: &str, received_at: i64) -> Message {
+        Message {
+            id: id.to_string(),
+            mailbox: "w33d@w33d.xyz".to_string(),
+            msg_from: String::new(),
+            msg_to: String::new(),
+            subject: String::new(),
+            raw_rfc822: String::new(),
+            body_text: String::new(),
+            body_html: String::new(),
+            received_at,
+            seen: false,
+            folder: "INBOX".to_string(),
+            starred: false,
+        }
+    }
+
+    #[test]
+    fn apply_before_keeps_strictly_older_rows() {
+        // Ordering is (received_at, id) descending; the cursor row itself is excluded.
+        let all = vec![msg("m_c", 200), msg("m_b", 100), msg("m_a", 100), msg("m_z", 50)];
+
+        let mut v = all.clone();
+        apply_before(&mut v, None);
+        assert_eq!(v.len(), 4, "no cursor keeps everything");
+
+        let mut v = all.clone();
+        apply_before(&mut v, Some((100, "m_b".to_string())));
+        let ids: Vec<&str> = v.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["m_a", "m_z"], "same-ts rows tie-break on id, older ts always kept");
+    }
 }

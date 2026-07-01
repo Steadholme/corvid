@@ -223,9 +223,9 @@ async fn reply_prefills_and_sets_thread_headers() {
     assert!(due[0].raw.contains("References: <orig-123@example.com>"));
 
     // A Sent copy now exists for the sender; INBOX is unaffected.
-    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", 10).await.unwrap();
+    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", None, 10).await.unwrap();
     assert_eq!(sent.len(), 1, "one message filed into Sent");
-    let inbox = state.store.list_folder("w33d@w33d.xyz", "INBOX", 10).await.unwrap();
+    let inbox = state.store.list_folder("w33d@w33d.xyz", "INBOX", None, 10).await.unwrap();
     assert_eq!(inbox.len(), 1, "the original inbox message is untouched");
 }
 
@@ -247,7 +247,7 @@ async fn save_draft_persists_without_sending() {
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 
-    let drafts = state.store.list_folder("w33d@w33d.xyz", "Drafts", 10).await.unwrap();
+    let drafts = state.store.list_folder("w33d@w33d.xyz", "Drafts", None, 10).await.unwrap();
     assert_eq!(drafts.len(), 1, "draft saved into Drafts");
     let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
     assert!(due.is_empty(), "a draft never enqueues outbound mail");
@@ -278,8 +278,8 @@ async fn store_mark_unseen_and_set_folder_roundtrip() {
     state.store.set_folder(&msg.id, "Archive").await.unwrap();
     assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Archive");
     // list_folder now filters it out of INBOX and into the new folder.
-    assert!(state.store.list_folder("w33d@w33d.xyz", "INBOX", 10).await.unwrap().is_empty());
-    assert_eq!(state.store.list_folder("w33d@w33d.xyz", "Archive", 10).await.unwrap().len(), 1);
+    assert!(state.store.list_folder("w33d@w33d.xyz", "INBOX", None, 10).await.unwrap().is_empty());
+    assert_eq!(state.store.list_folder("w33d@w33d.xyz", "Archive", None, 10).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -507,7 +507,7 @@ async fn multipart_send_with_attachment_roundtrips_to_download() {
     assert!(due[0].raw.contains("see attachment"));
 
     // A Sent copy was filed; its read view lists the attachment with a download link.
-    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", 10).await.unwrap();
+    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", None, 10).await.unwrap();
     assert_eq!(sent.len(), 1);
     let sent_id = sent[0].id.clone();
 
@@ -607,18 +607,18 @@ async fn store_starred_and_search_roundtrip() {
 
     // Star m1 -> Starred view holds it; unstar -> gone.
     state.store.set_starred(&m1.id, true).await.unwrap();
-    let starred = state.store.list_starred("w33d@w33d.xyz", 10).await.unwrap();
+    let starred = state.store.list_starred("w33d@w33d.xyz", None, 10).await.unwrap();
     assert_eq!(starred.len(), 1);
     assert_eq!(starred[0].id, m1.id);
     assert!(starred[0].starred);
     state.store.set_starred(&m1.id, false).await.unwrap();
-    assert!(state.store.list_starred("w33d@w33d.xyz", 10).await.unwrap().is_empty());
+    assert!(state.store.list_starred("w33d@w33d.xyz", None, 10).await.unwrap().is_empty());
 
     // Search over subject / body / from, case-insensitive.
-    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "quarterly", None, 10).await.unwrap().len(), 1);
-    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "SANDWICH", None, 10).await.unwrap().len(), 1);
-    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "alice", None, 10).await.unwrap().len(), 1);
-    assert!(state.store.search_messages("w33d@w33d.xyz", "nomatch", None, 10).await.unwrap().is_empty());
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "quarterly", None, None, 10).await.unwrap().len(), 1);
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "SANDWICH", None, None, 10).await.unwrap().len(), 1);
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "alice", None, None, 10).await.unwrap().len(), 1);
+    assert!(state.store.search_messages("w33d@w33d.xyz", "nomatch", None, None, 10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -630,7 +630,7 @@ async fn search_is_keyset_paginated() {
         state.store.store_message(&m).await.unwrap();
     }
     // Page 1: the two newest.
-    let p1 = state.store.search_messages("w33d@w33d.xyz", "report", None, 2).await.unwrap();
+    let p1 = state.store.search_messages("w33d@w33d.xyz", "report", None, None, 2).await.unwrap();
     assert_eq!(p1.len(), 2);
     assert_eq!(p1[0].received_at, 102);
     assert_eq!(p1[1].received_at, 101);
@@ -638,12 +638,146 @@ async fn search_is_keyset_paginated() {
     let last = p1.last().unwrap();
     let p2 = state
         .store
-        .search_messages("w33d@w33d.xyz", "report", Some((last.received_at, last.id.clone())), 2)
+        .search_messages("w33d@w33d.xyz", "report", None, Some((last.received_at, last.id.clone())), 2)
         .await
         .unwrap();
     assert_eq!(p2.len(), 1);
     assert_eq!(p2[0].received_at, 100);
     assert!(!p2.iter().any(|m| p1.iter().any(|x| x.id == m.id)));
+}
+
+#[tokio::test]
+async fn folder_and_starred_listings_are_keyset_paginated() {
+    let state = build_dev_state().await;
+    for i in 0..3i64 {
+        let mut m = seed_message("w33d@w33d.xyz", &format!("Bulk {i}"), "a@b.com", "body");
+        m.received_at = 100 + i;
+        state.store.store_message(&m).await.unwrap();
+        state.store.set_starred(&m.id, true).await.unwrap();
+    }
+    // Folder page 1: the two newest; page 2 keysets off the last row -> the older one, no overlap.
+    let p1 = state.store.list_folder("w33d@w33d.xyz", "INBOX", None, 2).await.unwrap();
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p1[0].received_at, 102);
+    assert_eq!(p1[1].received_at, 101);
+    let last = p1.last().unwrap();
+    let p2 = state
+        .store
+        .list_folder("w33d@w33d.xyz", "INBOX", Some((last.received_at, last.id.clone())), 2)
+        .await
+        .unwrap();
+    assert_eq!(p2.len(), 1);
+    assert_eq!(p2[0].received_at, 100);
+    assert!(!p2.iter().any(|m| p1.iter().any(|x| x.id == m.id)));
+
+    // The Starred view pages by the same keyset scheme.
+    let s1 = state.store.list_starred("w33d@w33d.xyz", None, 2).await.unwrap();
+    assert_eq!(s1.len(), 2);
+    let last = s1.last().unwrap();
+    let s2 = state
+        .store
+        .list_starred("w33d@w33d.xyz", Some((last.received_at, last.id.clone())), 2)
+        .await
+        .unwrap();
+    assert_eq!(s2.len(), 1);
+    assert_eq!(s2[0].received_at, 100);
+}
+
+#[tokio::test]
+async fn search_matches_recipient_and_scopes_to_folder() {
+    let state = build_dev_state().await;
+    let mut inboxed = seed_message("w33d@w33d.xyz", "Hello inbox", "a@b.com", "body");
+    inboxed.msg_to = "team-updates@w33d.xyz".to_string();
+    state.store.store_message(&inboxed).await.unwrap();
+    let mut sent = seed_message("w33d@w33d.xyz", "Hello sent", "w33d@w33d.xyz", "body");
+    sent.folder = "Sent".to_string();
+    state.store.store_message(&sent).await.unwrap();
+
+    // The To: addresses are searchable.
+    let hits = state.store.search_messages("w33d@w33d.xyz", "team-updates", None, None, 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, inboxed.id);
+
+    // An unscoped search spans folders; a folder scope narrows it.
+    assert_eq!(state.store.search_messages("w33d@w33d.xyz", "hello", None, None, 10).await.unwrap().len(), 2);
+    let scoped = state.store.search_messages("w33d@w33d.xyz", "hello", Some("Sent"), None, 10).await.unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].id, sent.id);
+    assert!(state.store.search_messages("w33d@w33d.xyz", "hello", Some("Trash"), None, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn folder_view_paginates_with_keyset_cursor() {
+    let state = build_dev_state().await;
+    for i in 0..3i64 {
+        let mut m = seed_message("w33d@w33d.xyz", &format!("Bulk {i}"), "a@b.com", "body");
+        m.received_at = 100 + i;
+        state.store.store_message(&m).await.unwrap();
+    }
+
+    // Page 1 (?limit=2): the two newest rows plus a keyset "Load older" link.
+    let req = Request::builder()
+        .uri("/?folder=INBOX&limit=2")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("Bulk 2") && html.contains("Bulk 1"), "two newest listed");
+    assert!(!html.contains("Bulk 0"), "older row deferred to the next page");
+    assert!(html.contains("Load older"), "full page offers the older page");
+    assert!(html.contains("&before="), "link carries the keyset cursor");
+
+    // Follow the cursor: the older page holds the remaining row and no further link.
+    let p1 = state.store.list_folder("w33d@w33d.xyz", "INBOX", None, 2).await.unwrap();
+    let last = p1.last().unwrap();
+    let req = Request::builder()
+        .uri(format!("/?folder=INBOX&limit=2&before={}_{}", last.received_at, last.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("Bulk 0"), "older row reachable through the cursor");
+    assert!(!html.contains("Bulk 2") && !html.contains("Bulk 1"), "no overlap with page 1");
+    assert!(!html.contains("Load older"), "short page ends the pagination");
+}
+
+#[tokio::test]
+async fn search_view_renders_folder_scope() {
+    let state = build_dev_state().await;
+    let mut sent = seed_message("w33d@w33d.xyz", "Scoped hello", "w33d@w33d.xyz", "body");
+    sent.folder = "Sent".to_string();
+    state.store.store_message(&sent).await.unwrap();
+    let inboxed = seed_message("w33d@w33d.xyz", "Unscoped hello", "a@b.com", "body");
+    state.store.store_message(&inboxed).await.unwrap();
+
+    // ?q= + ?folder= narrows the search to that folder and says so in the heading.
+    let req = Request::builder()
+        .uri("/?q=hello&folder=Sent")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("in Sent"), "heading names the folder scope");
+    assert!(html.contains("Scoped hello"), "the Sent match is listed");
+    assert!(!html.contains("Unscoped hello"), "the INBOX row is filtered out");
+
+    // A non-INBOX folder view seeds the search box with a hidden folder scope.
+    let req = Request::builder()
+        .uri("/?folder=Sent")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains(r#"<input type="hidden" name="folder" value="Sent">"#));
+
+    // The Inbox searches the whole mailbox — no hidden scope.
+    let req = Request::builder()
+        .uri("/")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(!html.contains(r#"type="hidden" name="folder""#));
 }
 
 #[tokio::test]

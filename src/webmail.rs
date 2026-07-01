@@ -8,6 +8,8 @@
 //! Views:
 //! - `GET /healthz`  liveness (container HEALTHCHECK)
 //! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts`, newest first: from / subject / date)
+//!                   or `?q=` full-text search (subject/from/to/body, optional `?folder=` scope);
+//!                   both keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue + relay + file a Sent copy;
@@ -39,8 +41,12 @@ const FOLDERS: [&str; 5] = ["INBOX", "Sent", "Drafts", "Archive", "Trash"];
 /// but never stored in `Message.folder`.
 const STARRED_VIEW: &str = "Starred";
 
-/// How many search hits a result page holds before offering a keyset "next page" link.
-const SEARCH_PAGE: i64 = 50;
+/// Default rows per folder/search page when `?limit=` is absent.
+const PAGE_DEFAULT: i64 = 50;
+
+/// Hard ceiling for `?limit=` — one listing page never exceeds this many rows. Older mail stays
+/// reachable through the keyset `?before=` cursor instead of a bigger page.
+const PAGE_MAX: i64 = 200;
 
 const APP_CSS: &str = include_str!("../static/app.css");
 const SHELL: &str = include_str!("../templates/shell.html");
@@ -113,9 +119,10 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Query string for the inbox: an optional `?folder=` selecting which folder/view to list, an
-/// optional `?q=` full-text search, and a `?before=` keyset cursor (`<received_at>_<id>`) that
-/// pages the search results.
+/// Query string for the inbox: an optional `?folder=` selecting which folder/view to list (or
+/// scoping a search), an optional `?q=` full-text search, a `?before=` keyset cursor
+/// (`<received_at>_<id>`) paging any listing oldward, and a `?limit=` page size (clamped to
+/// [`PAGE_MAX`], default [`PAGE_DEFAULT`]).
 #[derive(Deserialize, Default)]
 struct InboxQuery {
     #[serde(default)]
@@ -124,6 +131,8 @@ struct InboxQuery {
     q: Option<String>,
     #[serde(default)]
     before: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
 }
 
 async fn inbox(
@@ -139,35 +148,37 @@ async fn inbox(
     let (token, set_cookie) = ensure_csrf(&headers);
 
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let limit = clamp_limit(q.limit);
+    let cursor = parse_cursor(q.before.as_deref());
 
-    // Fetch the rows for the active view, plus the return path row actions redirect back to and a
-    // `next` keyset link for a full search page.
-    let (folder, heading, msgs, next_link) = if let Some(query) = search {
-        let cursor = parse_cursor(q.before.as_deref());
-        let msgs = match state.store.search_messages(&mb.addr, query, cursor, SEARCH_PAGE).await {
+    // Fetch the rows for the active view, plus the return path row actions redirect back to, a
+    // `next` keyset link to the older page (only when this page is full), and the folder the
+    // search box scopes to.
+    let (folder, heading, msgs, next_link, scope) = if let Some(query) = search {
+        // Optional folder scope: only a real folder narrows the search; anything else (absent,
+        // unknown, the virtual Starred view) searches the whole mailbox.
+        let scope = q.folder.as_deref().and_then(real_folder);
+        let msgs = match state.store.search_messages(&mb.addr, query, scope, cursor, limit).await {
             Ok(m) => m,
             Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
         };
-        let next_link = if msgs.len() as i64 == SEARCH_PAGE {
-            msgs.last().map(|m| {
-                format!(
-                    r#"<div class="page-more"><a class="btn btn-ghost btn-sm" href="/?q={q}&before={cursor}">Load older results</a></div>"#,
-                    q = url_encode(query),
-                    cursor = url_encode(&format!("{}_{}", m.received_at, m.id)),
-                )
-            })
-        } else {
-            None
+        let mut base = format!("/?q={}&limit={limit}", url_encode(query));
+        if let Some(f) = scope {
+            base.push_str(&format!("&folder={f}"));
+        }
+        let heading = match scope {
+            Some(f) => format!(r#"Search results for &ldquo;{}&rdquo; in {}"#, esc(query), esc(f)),
+            None => format!(r#"Search results for &ldquo;{}&rdquo;"#, esc(query)),
         };
-        let heading = format!(r#"Search results for &ldquo;{}&rdquo;"#, esc(query));
+        let next = next_page_link(&msgs, limit, &base);
         // A search hit's return path can't carry the query cheaply — send actions back to the inbox.
-        ("", heading, msgs, next_link.unwrap_or_default())
+        ("", heading, msgs, next, scope)
     } else {
         let folder = canonical_folder(q.folder.as_deref());
         let listed = if folder == STARRED_VIEW {
-            state.store.list_starred(&mb.addr, 200).await
+            state.store.list_starred(&mb.addr, cursor, limit).await
         } else {
-            state.store.list_folder(&mb.addr, folder, 200).await
+            state.store.list_folder(&mb.addr, folder, cursor, limit).await
         };
         let msgs = match listed {
             Ok(m) => m,
@@ -179,7 +190,10 @@ async fn inbox(
         } else {
             esc(folder)
         };
-        (folder, heading, msgs, String::new())
+        let next = next_page_link(&msgs, limit, &format!("/?folder={folder}&limit={limit}"));
+        // Searching from a folder view scopes to it; the Inbox (and Starred) search everything.
+        let scope = real_folder(folder).filter(|f| *f != "INBOX");
+        (folder, heading, msgs, next, scope)
     };
 
     // Row actions redirect back to the folder/view they were invoked from (search → inbox).
@@ -197,7 +211,7 @@ async fn inbox(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
-        tabs = folder_tabs(folder, search.unwrap_or("")),
+        tabs = folder_tabs(folder, search.unwrap_or(""), scope),
     );
     let title = if folder.is_empty() { "Search" } else { folder };
     let html = render_page(title, &email, &content);
@@ -267,6 +281,24 @@ fn parse_cursor(raw: Option<&str>) -> Option<(i64, String)> {
     Some((ts, id.to_string()))
 }
 
+/// Clamp a requested `?limit=` page size to `1..=`[`PAGE_MAX`] (default [`PAGE_DEFAULT`]).
+fn clamp_limit(requested: Option<i64>) -> i64 {
+    requested.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX)
+}
+
+/// The "Load older" keyset link under a listing: rendered only when the page is FULL (`limit`
+/// rows), extending `base` (an href already carrying `q`/`folder`/`limit`) with the
+/// `(received_at, id)` cursor of the last row. A short page means nothing older exists.
+fn next_page_link(msgs: &[crate::model::MessageSummary], limit: i64, base: &str) -> String {
+    let Some(last) = msgs.last().filter(|_| msgs.len() as i64 >= limit) else {
+        return String::new();
+    };
+    format!(
+        r#"<div class="page-more"><a class="btn btn-ghost btn-sm" href="{base}&before={cursor}">Load older</a></div>"#,
+        cursor = url_encode(&format!("{}_{}", last.received_at, last.id)),
+    )
+}
+
 /// Minimal percent-encoding for a query-string value (keeps unreserved chars, encodes the rest).
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -290,16 +322,20 @@ fn canonical_folder(requested: Option<&str>) -> &'static str {
 }
 
 /// Render the folder switcher as a row of pill links (INBOX/Sent/Drafts/Archive/Trash/Starred),
-/// highlighting the active folder, followed by the `?q=` search box.
-fn folder_tabs(active: &str, search_q: &str) -> String {
+/// highlighting the active folder, followed by the `?q=` search box. `scope` is the folder the
+/// search box narrows to (carried as a hidden `folder` field); `None` searches the whole mailbox.
+fn folder_tabs(active: &str, search_q: &str, scope: Option<&str>) -> String {
     let mut out = String::from(r#"<nav class="folder-tabs">"#);
     for f in FOLDERS.iter().copied().chain(std::iter::once(STARRED_VIEW)) {
         let cls = if f == active { "btn btn-primary btn-sm" } else { "btn btn-ghost btn-sm" };
         let label = if f == "INBOX" { "Inbox" } else { f };
         out.push_str(&format!(r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#));
     }
+    let scope_input = scope
+        .map(|f| format!(r#"<input type="hidden" name="folder" value="{}">"#, esc(f)))
+        .unwrap_or_default();
     out.push_str(&format!(
-        r#"<form class="search-box" method="get" action="/"><input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button></form>"#,
+        r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button></form>"#,
         q = esc(search_q),
     ));
     out.push_str("</nav>");
@@ -419,7 +455,7 @@ async fn message_action(
         "delete" => state.store.set_folder(&id, "Trash").await,
         "archive" => state.store.set_folder(&id, "Archive").await,
         "move" => {
-            let Some(folder) = move_target(&form.folder) else {
+            let Some(folder) = real_folder(&form.folder) else {
                 return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown target folder.");
             };
             state.store.set_folder(&id, folder).await
@@ -445,8 +481,9 @@ async fn message_action(
     Redirect::to(&safe_return(&form.return_to)).into_response()
 }
 
-/// Clamp a move target to a real [`FOLDERS`] value (never [`STARRED_VIEW`], which is virtual).
-fn move_target(requested: &str) -> Option<&'static str> {
+/// Clamp a requested folder to a real [`FOLDERS`] value (never [`STARRED_VIEW`], which is
+/// virtual): the legal target of a move and the legal scope of a folder-filtered search.
+fn real_folder(requested: &str) -> Option<&'static str> {
     let r = requested.trim();
     FOLDERS.into_iter().find(|c| c.eq_ignore_ascii_case(r))
 }
@@ -1716,6 +1753,49 @@ mod tests {
         assert_eq!(canonical_folder(Some("sent")), "Sent");
         assert_eq!(canonical_folder(Some("bogus")), "INBOX");
         assert_eq!(canonical_folder(None), "INBOX");
+    }
+
+    #[test]
+    fn real_folder_accepts_only_real_folders() {
+        assert_eq!(real_folder("sent"), Some("Sent"));
+        assert_eq!(real_folder(" Trash "), Some("Trash"));
+        assert_eq!(real_folder("Starred"), None, "the virtual view is not a folder");
+        assert_eq!(real_folder("bogus"), None);
+    }
+
+    #[test]
+    fn clamp_limit_defaults_and_bounds() {
+        assert_eq!(clamp_limit(None), PAGE_DEFAULT);
+        assert_eq!(clamp_limit(Some(10)), 10);
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(-5)), 1);
+        assert_eq!(clamp_limit(Some(100_000)), PAGE_MAX);
+    }
+
+    #[test]
+    fn parse_cursor_accepts_ts_id_and_rejects_junk() {
+        assert_eq!(parse_cursor(Some("100_m_abc")), Some((100, "m_abc".to_string())), "id keeps its own underscores");
+        assert_eq!(parse_cursor(Some("junk")), None);
+        assert_eq!(parse_cursor(Some("notanum_m1")), None);
+        assert_eq!(parse_cursor(None), None);
+    }
+
+    #[test]
+    fn next_page_link_only_on_full_pages() {
+        let row = |id: &str, ts: i64| crate::model::MessageSummary {
+            id: id.to_string(),
+            msg_from: String::new(),
+            subject: String::new(),
+            received_at: ts,
+            seen: false,
+            starred: false,
+        };
+        // Short page (or empty) -> nothing older -> no link.
+        assert_eq!(next_page_link(&[], 2, "/?folder=Sent&limit=2"), "");
+        assert_eq!(next_page_link(&[row("m_1", 9)], 2, "/?folder=Sent&limit=2"), "");
+        // Full page -> link carrying the last row's (received_at, id) cursor.
+        let link = next_page_link(&[row("m_2", 9), row("m_1", 8)], 2, "/?folder=Sent&limit=2");
+        assert!(link.contains("/?folder=Sent&limit=2&before=8_m_1"), "cursor appended: {link}");
     }
 
     #[test]
