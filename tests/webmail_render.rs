@@ -282,6 +282,161 @@ async fn store_mark_unseen_and_set_folder_roundtrip() {
 }
 
 #[tokio::test]
+async fn admin_panel_gated_for_non_admin() {
+    let state = build_dev_state().await;
+    // An ordinary signed-in user (no admin group) is refused the panel with 403.
+    let req = Request::builder()
+        .uri("/admin")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let html = body_string(resp).await;
+    assert!(html.contains("administrator group"), "renders the 403 admin page");
+}
+
+#[tokio::test]
+async fn admin_panel_allowed_for_admin() {
+    let state = build_dev_state().await;
+    // A user in `admins` sees the panel listing the seeded primary mailbox.
+    let req = Request::builder()
+        .uri("/admin")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "readers, admins")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("Mailbox provisioning"));
+    assert!(html.contains("w33d@w33d.xyz"), "seeded mailbox listed");
+    assert!(html.contains("Create mailbox"));
+}
+
+/// Mint a CSRF cookie+token from an admin `GET /admin`, returning `(token, cookie_header_value)`.
+async fn mint_admin_csrf(state: &AppState) -> (String, String) {
+    let req = Request::builder()
+        .uri("/admin")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "admins")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("admin index sets a CSRF cookie");
+    let token = set_cookie
+        .split(';')
+        .next()
+        .and_then(|kv| kv.split_once('='))
+        .map(|(_, v)| v.to_string())
+        .unwrap();
+    (token.clone(), format!("__Host-csrf={token}"))
+}
+
+#[tokio::test]
+async fn admin_creates_mailbox() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_admin_csrf(&state).await;
+
+    let form = format!("csrf={token}&addr=alice%40w33d.xyz&owner_sub=alice");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/mailboxes")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "admins")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "create redirects on success");
+
+    let mb = state.store.get_mailbox("alice@w33d.xyz").await.unwrap().unwrap();
+    assert_eq!(mb.owner_sub, "alice");
+}
+
+#[tokio::test]
+async fn admin_create_mailbox_requires_admin_and_csrf() {
+    let state = build_dev_state().await;
+
+    // Non-admin POST is blocked by the gate (403) before any CSRF check.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/mailboxes")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("csrf=x&addr=bob%40w33d.xyz&owner_sub=bob"))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(state.store.get_mailbox("bob@w33d.xyz").await.unwrap().is_none());
+
+    // Admin POST with a bad CSRF token is rejected (403) and creates nothing.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/mailboxes")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "infra-admins")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, "__Host-csrf=realtoken")
+        .body(Body::from("csrf=WRONG&addr=bob%40w33d.xyz&owner_sub=bob"))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(state.store.get_mailbox("bob@w33d.xyz").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn admin_adds_alias() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_admin_csrf(&state).await;
+
+    // Alias to the seeded primary mailbox.
+    let form = format!("csrf={token}&local_part=info&mailbox=w33d%40w33d.xyz");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/aliases")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "admins")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let aliases = state.store.list_aliases().await.unwrap();
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].local_part, "info");
+    assert_eq!(aliases[0].mailbox, "w33d@w33d.xyz");
+}
+
+#[tokio::test]
+async fn admin_alias_rejects_unknown_mailbox() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_admin_csrf(&state).await;
+
+    let form = format!("csrf={token}&local_part=info&mailbox=nobody%40w33d.xyz");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/aliases")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "admins")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(state.store.list_aliases().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn send_rejects_bad_csrf() {
     let state = build_dev_state().await;
     let req = Request::builder()

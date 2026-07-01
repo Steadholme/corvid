@@ -11,6 +11,15 @@ pub struct Mailbox {
     pub owner_sub: String,
 }
 
+/// A mail alias: an address local-part that forwards to a target [`Mailbox::addr`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Alias {
+    /// The alias local-part (e.g. `info`), primary key.
+    pub local_part: String,
+    /// The mailbox address this alias delivers into.
+    pub mailbox: String,
+}
+
 /// A stored message (one row per delivered/received message).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Message {

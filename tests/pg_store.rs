@@ -26,7 +26,7 @@ async fn pg_store_full_integration() {
     pg.migrate().await.expect("migrate idempotent");
 
     // Clean slate.
-    for tbl in ["messages", "outbound_queue", "mailboxes"] {
+    for tbl in ["messages", "outbound_queue", "aliases", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
 
@@ -90,7 +90,7 @@ async fn pg_store_full_integration() {
 
     pg.mark_outbound_sent(&item.id).await.unwrap();
 
-    for tbl in ["messages", "outbound_queue", "mailboxes"] {
+    for tbl in ["messages", "outbound_queue", "aliases", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
     println!("PG STORE INTEGRATION OK: mailboxes + messages (seen) + outbound queue (rcpts/reschedule/sent)");

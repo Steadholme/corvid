@@ -24,7 +24,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{Mailbox, Message, MessageSummary, OutboundItem};
+use crate::model::{Alias, Mailbox, Message, MessageSummary, OutboundItem};
 
 /// Storage failure surfaced to the caller (mapped to a 500 in the webmail layer).
 #[derive(Debug, Error)]
@@ -43,6 +43,15 @@ pub trait Store: Send + Sync {
     async fn get_mailbox(&self, addr: &str) -> Result<Option<Mailbox>, StoreError>;
     /// The first mailbox owned by `owner_sub`, if any (webmail selects the inbox by SSO sub).
     async fn mailbox_for_owner(&self, owner_sub: &str) -> Result<Option<Mailbox>, StoreError>;
+    /// Every provisioned mailbox, ordered by address (admin listing).
+    async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError>;
+    /// Total message count across all folders for a mailbox (admin quota view).
+    async fn message_count(&self, mailbox: &str) -> Result<i64, StoreError>;
+
+    /// Upsert a mail alias (idempotent; re-points an existing local-part to `mailbox`).
+    async fn add_alias(&self, alias: &Alias) -> Result<(), StoreError>;
+    /// Every alias, ordered by local-part (admin listing).
+    async fn list_aliases(&self) -> Result<Vec<Alias>, StoreError>;
 
     /// Persist a received/delivered message.
     async fn store_message(&self, msg: &Message) -> Result<(), StoreError>;
@@ -96,6 +105,7 @@ pub struct InMemoryStore {
     mailboxes: Mutex<Vec<Mailbox>>,
     messages: Mutex<Vec<Message>>,
     outbound: Mutex<Vec<OutboundItem>>,
+    aliases: Mutex<Vec<Alias>>,
 }
 
 impl InMemoryStore {
@@ -146,6 +156,42 @@ impl Store for InMemoryStore {
             .iter()
             .find(|m| m.owner_sub == owner_sub)
             .cloned())
+    }
+
+    async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError> {
+        let mut v: Vec<Mailbox> = self
+            .mailboxes
+            .lock()
+            .expect("mailboxes lock poisoned")
+            .clone();
+        v.sort_by(|a, b| a.addr.cmp(&b.addr));
+        Ok(v)
+    }
+
+    async fn message_count(&self, mailbox: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.mailbox == mailbox)
+            .count() as i64)
+    }
+
+    async fn add_alias(&self, alias: &Alias) -> Result<(), StoreError> {
+        let mut v = self.aliases.lock().expect("aliases lock poisoned");
+        if let Some(existing) = v.iter_mut().find(|a| a.local_part == alias.local_part) {
+            existing.mailbox = alias.mailbox.clone();
+        } else {
+            v.push(alias.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_aliases(&self) -> Result<Vec<Alias>, StoreError> {
+        let mut v: Vec<Alias> = self.aliases.lock().expect("aliases lock poisoned").clone();
+        v.sort_by(|a, b| a.local_part.cmp(&b.local_part));
+        Ok(v)
     }
 
     async fn store_message(&self, msg: &Message) -> Result<(), StoreError> {
@@ -365,6 +411,14 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_outbound_due ON outbound_queue (status, next_at)")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS aliases (\
+                 local_part TEXT PRIMARY KEY, \
+                 mailbox TEXT NOT NULL\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -372,6 +426,13 @@ impl PgStore {
         Ok(Mailbox {
             addr: row.try_get("addr")?,
             owner_sub: row.try_get("owner_sub")?,
+        })
+    }
+
+    fn alias_from_row(row: &sqlx::postgres::PgRow) -> Result<Alias, sqlx::Error> {
+        Ok(Alias {
+            local_part: row.try_get("local_part")?,
+            mailbox: row.try_get("mailbox")?,
         })
     }
 
@@ -439,6 +500,50 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         row.as_ref().map(Self::mailbox_from_row).transpose().map_err(backend)
+    }
+
+    async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError> {
+        let rows = sqlx::query("SELECT addr, owner_sub FROM mailboxes ORDER BY addr ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+        rows.iter()
+            .map(Self::mailbox_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn message_count(&self, mailbox: &str) -> Result<i64, StoreError> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM messages WHERE mailbox = $1")
+            .bind(mailbox)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(backend)?;
+        row.try_get("n").map_err(backend)
+    }
+
+    async fn add_alias(&self, alias: &Alias) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO aliases (local_part, mailbox) VALUES ($1, $2) \
+             ON CONFLICT (local_part) DO UPDATE SET mailbox = EXCLUDED.mailbox",
+        )
+        .bind(&alias.local_part)
+        .bind(&alias.mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn list_aliases(&self) -> Result<Vec<Alias>, StoreError> {
+        let rows = sqlx::query("SELECT local_part, mailbox FROM aliases ORDER BY local_part ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)?;
+        rows.iter()
+            .map(Self::alias_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
     }
 
     async fn store_message(&self, msg: &Message) -> Result<(), StoreError> {

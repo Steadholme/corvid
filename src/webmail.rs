@@ -23,7 +23,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::model::{Mailbox, Message};
+use crate::model::{Alias, Mailbox, Message};
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
@@ -40,6 +40,15 @@ const SHIELD_SVG: &str = r##"<svg viewBox="0 0 48 48" fill="none" xmlns="http://
 
 /// Build the webmail router.
 pub fn app(state: AppState) -> Router {
+    // The /admin subtree (mailbox provisioning) is gated by `require_admin`: only users in an
+    // ADMIN_GROUPS group see it; every other signed-in user gets a 403. The gate is a
+    // `route_layer` so it applies uniformly to ALL admin routes.
+    let admin = Router::new()
+        .route("/admin", get(admin_index))
+        .route("/admin/mailboxes", post(admin_create_mailbox))
+        .route("/admin/aliases", post(admin_add_alias))
+        .route_layer(axum::middleware::from_fn(require_admin_mw));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(inbox))
@@ -47,11 +56,24 @@ pub fn app(state: AppState) -> Router {
         .route("/compose", get(compose_form))
         .route("/send", post(send))
         .route("/api/send", post(api_send))
+        .merge(admin)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
         // No-op when the key is unset or no identity is present (healthz / local dev).
         .layer(axum::middleware::from_fn(require_gateway_sig))
         .with_state(state)
+}
+
+/// Middleware enforcing [`require_admin`] on the /admin subtree — renders a 403 page for any
+/// signed-in user who is not in an [`ADMIN_GROUPS`] group.
+async fn require_admin_mw(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match require_admin(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(resp) => resp,
+    }
 }
 
 /// Middleware enforcing [`gateway_identity_ok`] — 401 on a missing/invalid signature.
@@ -634,6 +656,181 @@ fn build_rfc822(
 }
 
 // ---------------------------------------------------------------------------
+// Admin panel — mailbox provisioning (gated by `require_admin`)
+// ---------------------------------------------------------------------------
+
+/// Soft per-mailbox message quota, shown alongside the live count in the admin view.
+const MAILBOX_QUOTA: i64 = 10_000;
+
+/// `GET /admin` — list every provisioned mailbox with its owner + message-count/quota, plus the
+/// forms to create a mailbox and add an alias. Mints a CSRF token for the two POST forms.
+async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let email = email_display(&headers);
+    let (token, set_cookie) = ensure_csrf(&headers);
+
+    let mailboxes = match state.store.list_mailboxes().await {
+        Ok(m) => m,
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+    let aliases = match state.store.list_aliases().await {
+        Ok(a) => a,
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+
+    let mut mb_rows = String::new();
+    if mailboxes.is_empty() {
+        mb_rows.push_str(r#"<tr><td colspan="3" class="muted">No mailboxes provisioned.</td></tr>"#);
+    }
+    for mb in &mailboxes {
+        let count = state.store.message_count(&mb.addr).await.unwrap_or(0);
+        mb_rows.push_str(&format!(
+            r#"<tr><td>{addr}</td><td>{owner}</td><td>{count} / {quota}</td></tr>"#,
+            addr = esc(&mb.addr),
+            owner = esc(&mb.owner_sub),
+            quota = MAILBOX_QUOTA,
+        ));
+    }
+
+    let mut alias_rows = String::new();
+    if aliases.is_empty() {
+        alias_rows.push_str(r#"<tr><td colspan="2" class="muted">No aliases.</td></tr>"#);
+    }
+    for a in &aliases {
+        alias_rows.push_str(&format!(
+            r#"<tr><td>{lp}</td><td>{mb}</td></tr>"#,
+            lp = esc(&a.local_part),
+            mb = esc(&a.mailbox),
+        ));
+    }
+
+    let content = format!(
+        r#"<div class="page-head"><h1>Mailbox provisioning</h1></div>
+<section class="card pad">
+  <h2>Mailboxes</h2>
+  <table class="admin-table">
+    <thead><tr><th>Address</th><th>Owner (sub)</th><th>Messages / quota</th></tr></thead>
+    <tbody>{mb_rows}</tbody>
+  </table>
+  <form method="post" action="/admin/mailboxes">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="addr">New mailbox address</label><input id="addr" name="addr" placeholder="alice@w33d.xyz"></div>
+    <div class="field"><label for="owner_sub">Owner sub</label><input id="owner_sub" name="owner_sub" placeholder="alice"></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Create mailbox</button></div>
+  </form>
+</section>
+<section class="card pad">
+  <h2>Aliases</h2>
+  <table class="admin-table">
+    <thead><tr><th>Local-part</th><th>Delivers to</th></tr></thead>
+    <tbody>{alias_rows}</tbody>
+  </table>
+  <form method="post" action="/admin/aliases">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="local_part">Alias local-part</label><input id="local_part" name="local_part" placeholder="info"></div>
+    <div class="field"><label for="mailbox">Target mailbox</label><input id="mailbox" name="mailbox" placeholder="alice@w33d.xyz"></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Add alias</button></div>
+  </form>
+</section>"#,
+    );
+    let html = render_page("Admin", &email, &content);
+    match set_cookie {
+        Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+        None => Html(html).into_response(),
+    }
+}
+
+/// Create-mailbox form (`POST /admin/mailboxes`).
+#[derive(Deserialize)]
+struct CreateMailboxForm {
+    csrf: String,
+    #[serde(default)]
+    addr: String,
+    #[serde(default)]
+    owner_sub: String,
+}
+
+/// `POST /admin/mailboxes` — provision a new mailbox `(addr, owner_sub)`. CSRF-guarded; rejects a
+/// malformed address or a duplicate. On success emits a tracing audit line and redirects to `/admin`.
+async fn admin_create_mailbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateMailboxForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let addr = form.addr.trim().to_lowercase();
+    let owner_sub = form.owner_sub.trim().to_string();
+    if addr.is_empty() || !addr.contains('@') || domain_of(&addr).is_none() {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A valid mailbox address (local@domain) is required.");
+    }
+    if owner_sub.is_empty() {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "An owner sub is required.");
+    }
+    match state.store.get_mailbox(&addr).await {
+        Ok(Some(_)) => return error_page(StatusCode::CONFLICT, "Already exists", "A mailbox with that address already exists."),
+        Ok(None) => {}
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    }
+    let mb = Mailbox { addr: addr.clone(), owner_sub: owner_sub.clone() };
+    if let Err(e) = state.store.upsert_mailbox(&mb).await {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        addr = %addr,
+        owner_sub = %owner_sub,
+        "admin created mailbox"
+    );
+    Redirect::to("/admin").into_response()
+}
+
+/// Add-alias form (`POST /admin/aliases`).
+#[derive(Deserialize)]
+struct AddAliasForm {
+    csrf: String,
+    #[serde(default)]
+    local_part: String,
+    #[serde(default)]
+    mailbox: String,
+}
+
+/// `POST /admin/aliases` — map an alias local-part to an existing mailbox. CSRF-guarded; the target
+/// mailbox must exist. On success emits a tracing audit line and redirects to `/admin`.
+async fn admin_add_alias(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AddAliasForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let local_part = form.local_part.trim().to_lowercase();
+    let mailbox = form.mailbox.trim().to_lowercase();
+    if local_part.is_empty() || local_part.contains('@') {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A bare alias local-part (no @) is required.");
+    }
+    match state.store.get_mailbox(&mailbox).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "The target mailbox does not exist."),
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    }
+    let alias = Alias { local_part: local_part.clone(), mailbox: mailbox.clone() };
+    if let Err(e) = state.store.add_alias(&alias).await {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        local_part = %local_part,
+        mailbox = %mailbox,
+        "admin added alias"
+    );
+    Redirect::to("/admin").into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Identity + CSRF + mailbox resolution
 // ---------------------------------------------------------------------------
 
@@ -654,6 +851,48 @@ fn identity_subject(headers: &HeaderMap) -> Option<String> {
 /// The signed-in user's email (gateway `X-Auth-Email`).
 fn identity_email(headers: &HeaderMap) -> Option<String> {
     header_value(headers, "x-auth-email")
+}
+
+/// Group names that authorize the admin panel. Membership in ANY of these unlocks `/admin`.
+pub const ADMIN_GROUPS: &[&str] = &["admins", "infra-admins"];
+
+/// The authenticated user's groups, parsed from the comma-separated `X-Auth-Groups` header
+/// (injected AND HMAC-verified by the gateway, so it is trustworthy). Empty when absent/blank.
+fn author_groups(headers: &HeaderMap) -> Vec<String> {
+    header_value(headers, HEADER_GROUPS)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the authenticated user belongs to `group` (exact match against `X-Auth-Groups`).
+pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
+    author_groups(headers).iter().any(|g| g == group)
+}
+
+/// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
+fn is_admin(headers: &HeaderMap) -> bool {
+    ADMIN_GROUPS.iter().any(|g| has_group(headers, g))
+}
+
+/// Require admin group membership for the `/admin` subtree. On success returns `Ok(())`; when the
+/// user carries no admin group, returns a rendered `403` page as the `Err` — closes the hole where
+/// ANY signed-in user could reach mailbox provisioning.
+pub fn require_admin(headers: &HeaderMap) -> Result<(), Response> {
+    if is_admin(headers) {
+        Ok(())
+    } else {
+        Err(error_page(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "The admin panel requires an administrator group.",
+        ))
+    }
 }
 
 /// Resolve the mailbox for the signed-in user: by `owner_sub`, else (defence in depth) by an
@@ -914,6 +1153,32 @@ mod tests {
             sign_identity("test-key", "usr_bob", "", 2),
             "930f82fb1224e69c9c5bc46e545c3b108b1eeb6c9078c7a33fc24f30c595f658"
         );
+    }
+
+    #[test]
+    fn has_group_and_require_admin() {
+        // No X-Auth-Groups => no groups, not an admin, require_admin rejects.
+        let mut none = HeaderMap::new();
+        none.insert(HEADER_SUBJECT, HeaderValue::from_static("u_eve"));
+        assert!(author_groups(&none).is_empty());
+        assert!(!has_group(&none, "admins"));
+        assert!(!is_admin(&none));
+        assert!(require_admin(&none).is_err());
+
+        // Comma-separated groups, with whitespace, parse and match by exact name.
+        let mut admins = HeaderMap::new();
+        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, infra-admins ,x"));
+        assert!(has_group(&admins, "infra-admins"));
+        assert!(has_group(&admins, "dev"));
+        assert!(!has_group(&admins, "admins"));
+        assert!(is_admin(&admins), "infra-admins authorizes the admin panel");
+        assert!(require_admin(&admins).is_ok());
+
+        // A non-admin group alone does not authorize.
+        let mut other = HeaderMap::new();
+        other.insert(HEADER_GROUPS, HeaderValue::from_static("readers,writers"));
+        assert!(!is_admin(&other));
+        assert!(require_admin(&other).is_err());
     }
 
     #[test]
