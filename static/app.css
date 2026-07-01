@@ -211,6 +211,12 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
 /* card padding helper used by the read + compose views */
 .pad { padding: 22px; }
 
+/* folder switcher (Inbox / Sent / Drafts) above the mail list */
+.folder-tabs { display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap; }
+
+/* reply / reply-all / forward actions in the read view header */
+.msg-actions { margin-top: 14px; }
+
 /* -------------------------------------------------------------- inbox mail list */
 .maillist { list-style: none; margin: 0; padding: 8px; }
 .maillist > li + li { border-top: 1px solid var(--border); }

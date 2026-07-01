@@ -7,12 +7,13 @@
 //!
 //! Views:
 //! - `GET /healthz`  liveness (container HEALTHCHECK)
-//! - `GET /`         inbox list (newest first: from / subject / date / seen)
-//! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen
-//! - `GET /compose`  compose form (mints a CSRF token)
-//! - `POST /send`    build RFC822, DKIM-sign, enqueue + relay outbound
+//! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts`, newest first: from / subject / date)
+//! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
+//! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
+//! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue + relay + file a Sent copy;
+//!                   `action=draft`: persist into the Drafts folder without sending
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -22,10 +23,13 @@ use rand::RngCore;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::model::Mailbox;
+use crate::model::{Mailbox, Message};
 use crate::sanitize::esc_text;
-use crate::util::{domain_of, email_date, message_id};
+use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
+
+/// The folders the webmail surfaces (INBOX for received mail, plus the two locally-authored ones).
+const FOLDERS: [&str; 3] = ["INBOX", "Sent", "Drafts"];
 
 const APP_CSS: &str = include_str!("../static/app.css");
 const SHELL: &str = include_str!("../templates/shell.html");
@@ -74,21 +78,37 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-async fn inbox(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// Query string for the inbox: an optional `?folder=` selecting which folder to list.
+#[derive(Deserialize, Default)]
+struct InboxQuery {
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+async fn inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<InboxQuery>,
+) -> Response {
     let email = email_display(&headers);
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
     };
+    let folder = canonical_folder(q.folder.as_deref());
 
-    let msgs = match state.store.list_messages(&mb.addr, 200).await {
+    let msgs = match state.store.list_folder(&mb.addr, folder, 200).await {
         Ok(m) => m,
         Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
     };
     let unseen = state.store.unseen_count(&mb.addr).await.unwrap_or(0);
 
+    // For locally-authored folders the interesting party is the recipient, not our own address;
+    // the row still renders a single principal, so label the column accordingly below.
+    let is_outgoing = folder != "INBOX";
+
     let mut rows = String::new();
     if msgs.is_empty() {
-        rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages yet.</span></div></li>"#);
+        rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages here.</span></div></li>"#);
     }
     for m in &msgs {
         let cls = if m.seen { "mailrow" } else { "mailrow unseen" };
@@ -102,11 +122,34 @@ async fn inbox(State(state): State<AppState>, headers: HeaderMap) -> Response {
         ));
     }
 
+    let heading = if is_outgoing { esc(folder) } else { format!("Inbox <span class=\"pill\">{unseen} unread</span>") };
     let content = format!(
-        r#"<div class="page-head"><h1>Inbox <span class="pill">{unseen} unread</span></h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
+        r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
+{tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>"#,
+        tabs = folder_tabs(folder),
     );
-    Html(render_page("Inbox", &email, &content)).into_response()
+    Html(render_page(folder, &email, &content)).into_response()
+}
+
+/// Clamp an arbitrary `?folder=` to one of the known [`FOLDERS`] (defaults to `INBOX`).
+fn canonical_folder(requested: Option<&str>) -> &'static str {
+    match requested.map(str::trim) {
+        Some(f) => FOLDERS.into_iter().find(|c| c.eq_ignore_ascii_case(f)).unwrap_or("INBOX"),
+        None => "INBOX",
+    }
+}
+
+/// Render the folder switcher as a row of pill links, highlighting the active folder.
+fn folder_tabs(active: &str) -> String {
+    let mut out = String::from(r#"<nav class="folder-tabs">"#);
+    for f in FOLDERS {
+        let cls = if f == active { "btn btn-primary btn-sm" } else { "btn btn-ghost btn-sm" };
+        let label = if f == "INBOX" { "Inbox" } else { f };
+        out.push_str(&format!(r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#));
+    }
+    out.push_str("</nav>");
+    out
 }
 
 async fn read_message(
@@ -139,7 +182,7 @@ async fn read_message(
 
     let subject = if msg.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&msg.subject) };
     let content = format!(
-        r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
+        r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
 <section class="card pad">
   <header class="msg-head">
     <h1 class="msg-subject">{subject}</h1>
@@ -148,23 +191,60 @@ async fn read_message(
       <b>To</b><span>{to}</span>
       <b>Date</b><span>{date}</span>
     </div>
+    <div class="form-actions msg-actions">
+      <a class="btn btn-primary btn-sm" href="/compose?reply={id}">Reply</a>
+      <a class="btn btn-ghost btn-sm" href="/compose?replyall={id}">Reply all</a>
+      <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
+    </div>
   </header>
   {body}
 </section>"#,
         from = esc(&msg.msg_from),
         to = esc(&msg.msg_to),
         date = fmt_date(msg.received_at),
+        folder = esc(&msg.folder),
+        folder_label = if msg.folder == "INBOX" { "Inbox".to_string() } else { esc(&msg.folder) },
+        id = esc(&msg.id),
     );
     Html(render_page(&msg.subject, &email, &content)).into_response()
 }
 
-async fn compose_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// Query string for `GET /compose`: at most one of these carries a stored message id whose
+/// content seeds the reply/forward draft.
+#[derive(Deserialize, Default)]
+struct ComposeQuery {
+    #[serde(default)]
+    reply: Option<String>,
+    #[serde(default)]
+    replyall: Option<String>,
+    #[serde(default)]
+    forward: Option<String>,
+}
+
+/// The prefilled compose fields (empty for a blank New message).
+#[derive(Default)]
+struct Prefill {
+    to: String,
+    subject: String,
+    body: String,
+    in_reply_to: String,
+    references: String,
+}
+
+async fn compose_form(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ComposeQuery>,
+) -> Response {
     let email = email_display(&headers);
-    let from = match resolve_mailbox(&state, &headers).await {
-        Some(mb) => mb.addr,
-        None => return no_mailbox_page(&email),
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email);
     };
+    let from = mb.addr.clone();
     let (token, set_cookie) = ensure_csrf(&headers);
+
+    // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
+    let pre = build_prefill(&state, &mb, &q).await;
 
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
@@ -172,14 +252,25 @@ async fn compose_form(State(state): State<AppState>, headers: HeaderMap) -> Resp
   <div class="page-head"><h1>New message</h1></div>
   <form method="post" action="/send">
     <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="in_reply_to" value="{in_reply_to}">
+    <input type="hidden" name="references" value="{references}">
     <div class="field"><label>From</label><input value="{from}" disabled></div>
-    <div class="field"><label for="to">To</label><input id="to" name="to" placeholder="someone@example.com" required></div>
-    <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" placeholder="Subject"></div>
-    <div class="field"><label for="body">Message</label><textarea id="body" name="body"></textarea></div>
-    <div class="form-actions"><button class="btn btn-primary" type="submit">Send</button><a class="btn btn-ghost btn-sm" href="/">Cancel</a></div>
+    <div class="field"><label for="to">To</label><input id="to" name="to" value="{to}" placeholder="someone@example.com"></div>
+    <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" value="{subject}" placeholder="Subject"></div>
+    <div class="field"><label for="body">Message</label><textarea id="body" name="body">{body}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
+      <button class="btn btn-ghost" type="submit" name="action" value="draft">Save draft</button>
+      <a class="btn btn-ghost btn-sm" href="/">Cancel</a>
+    </div>
   </form>
 </section>"#,
         from = esc(&from),
+        to = esc(&pre.to),
+        subject = esc(&pre.subject),
+        body = esc(&pre.body),
+        in_reply_to = esc(&pre.in_reply_to),
+        references = esc(&pre.references),
     );
     let html = render_page("Compose", &email, &content);
     match set_cookie {
@@ -188,14 +279,157 @@ async fn compose_form(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+/// Build the reply/forward prefill from the original message referenced by `q`. Returns an empty
+/// [`Prefill`] for a blank compose or when the referenced message is not the user's own.
+async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Prefill {
+    let (id, kind) = if let Some(id) = &q.reply {
+        (id, "reply")
+    } else if let Some(id) = &q.replyall {
+        (id, "replyall")
+    } else if let Some(id) = &q.forward {
+        (id, "forward")
+    } else {
+        return Prefill::default();
+    };
+
+    let Ok(Some(msg)) = state.store.get_message(id).await else {
+        return Prefill::default();
+    };
+    // Authorisation: only the owning mailbox may quote a message into a new draft.
+    if msg.mailbox != mb.addr {
+        return Prefill::default();
+    }
+
+    // Thread headers come from the stored raw source (In-Reply-To / References chaining).
+    let (hb, _) = crate::rfc822::split_headers_body(&msg.raw_rfc822);
+    let hdrs = crate::rfc822::parse_headers(hb);
+    let orig_mid = crate::rfc822::header(&hdrs, "message-id").unwrap_or_default();
+    let orig_refs = crate::rfc822::header(&hdrs, "references")
+        .or_else(|| crate::rfc822::header(&hdrs, "in-reply-to"))
+        .unwrap_or_default();
+
+    let (in_reply_to, references) = if kind == "forward" {
+        (String::new(), String::new())
+    } else {
+        let references = match (orig_refs.trim().is_empty(), orig_mid.trim().is_empty()) {
+            (true, _) => orig_mid.clone(),
+            (false, true) => orig_refs.clone(),
+            (false, false) => format!("{} {}", orig_refs.trim(), orig_mid.trim()),
+        };
+        (orig_mid.clone(), references)
+    };
+
+    match kind {
+        "forward" => Prefill {
+            to: String::new(),
+            subject: fwd_subject(&msg.subject),
+            body: forward_body(&msg),
+            in_reply_to,
+            references,
+        },
+        "replyall" => Prefill {
+            to: reply_all_to(&msg, &mb.addr),
+            subject: re_subject(&msg.subject),
+            body: quote_body(&msg),
+            in_reply_to,
+            references,
+        },
+        _ => Prefill {
+            to: msg.msg_from.clone(),
+            subject: re_subject(&msg.subject),
+            body: quote_body(&msg),
+            in_reply_to,
+            references,
+        },
+    }
+}
+
+/// `Re:`-prefix a subject without stacking prefixes.
+fn re_subject(subject: &str) -> String {
+    let s = subject.trim();
+    if s.len() >= 3 && s[..3].eq_ignore_ascii_case("re:") {
+        s.to_string()
+    } else if s.is_empty() {
+        "Re:".to_string()
+    } else {
+        format!("Re: {s}")
+    }
+}
+
+/// `Fwd:`-prefix a subject without stacking prefixes.
+fn fwd_subject(subject: &str) -> String {
+    let s = subject.trim();
+    let low = s.to_ascii_lowercase();
+    if low.starts_with("fwd:") || low.starts_with("fw:") {
+        s.to_string()
+    } else if s.is_empty() {
+        "Fwd:".to_string()
+    } else {
+        format!("Fwd: {s}")
+    }
+}
+
+/// The reply-all `To`: the original sender plus its other recipients, minus our own address.
+fn reply_all_to(msg: &Message, self_addr: &str) -> String {
+    let mut recips: Vec<String> = vec![msg.msg_from.trim().to_string()];
+    for part in msg.msg_to.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if extract_addr(part).eq_ignore_ascii_case(self_addr) {
+            continue; // don't reply to ourselves
+        }
+        recips.push(part.to_string());
+    }
+    recips.retain(|s| !s.is_empty());
+    recips.join(", ")
+}
+
+/// A quoted reply body: an attribution line followed by the original text, `> `-prefixed.
+fn quote_body(msg: &Message) -> String {
+    let quoted: String = msg
+        .body_text
+        .lines()
+        .map(|l| format!("> {l}\n"))
+        .collect();
+    format!(
+        "\n\nOn {}, {} wrote:\n{}",
+        fmt_date(msg.received_at),
+        msg.msg_from,
+        quoted,
+    )
+}
+
+/// A forwarded body: a delimiter block with the original headers, then the original text.
+fn forward_body(msg: &Message) -> String {
+    format!(
+        "\n\n---------- Forwarded message ----------\nFrom: {}\nTo: {}\nSubject: {}\nDate: {}\n\n{}\n",
+        msg.msg_from,
+        msg.msg_to,
+        msg.subject,
+        fmt_date(msg.received_at),
+        msg.body_text,
+    )
+}
+
 #[derive(Deserialize)]
 struct SendForm {
     csrf: String,
+    #[serde(default)]
     to: String,
     #[serde(default)]
     subject: String,
     #[serde(default)]
     body: String,
+    /// Thread headers carried from a reply draft (empty for a fresh compose).
+    #[serde(default)]
+    in_reply_to: String,
+    #[serde(default)]
+    references: String,
+    /// `send` (default) or `draft`.
+    #[serde(default)]
+    action: String,
 }
 
 async fn send(
@@ -211,6 +445,22 @@ async fn send(
         return no_mailbox_page(&email);
     };
 
+    let raw = build_rfc822(
+        &mb.addr,
+        &form.to,
+        &form.subject,
+        &form.body,
+        &form.in_reply_to,
+        &form.references,
+        &state.config.mail_domain,
+    );
+
+    // "Save draft": persist without sending, and allow an incomplete recipient list.
+    if form.action == "draft" {
+        store_local_copy(&state, &mb.addr, &form.to, &form.subject, &form.body, &raw, "Drafts").await;
+        return Redirect::to("/?folder=Drafts").into_response();
+    }
+
     let rcpts: Vec<String> = form
         .to
         .split([',', ';'])
@@ -222,11 +472,43 @@ async fn send(
         return error_page(StatusCode::BAD_REQUEST, "Invalid request", "At least one valid recipient is required.");
     }
 
-    let raw = build_rfc822(&mb.addr, &form.to, &form.subject, &form.body, &state.config.mail_domain);
     let signer = state.signer.as_deref();
     match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &mb.addr, &rcpts).await {
-        Ok(_) => Redirect::to("/?sent=1").into_response(),
+        Ok(signed) => {
+            // File a copy of the sent message into the sender's Sent folder.
+            store_local_copy(&state, &mb.addr, &form.to, &form.subject, &form.body, &signed, "Sent").await;
+            Redirect::to("/?folder=Sent").into_response()
+        }
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
+    }
+}
+
+/// Persist a locally-authored message (a Sent copy or a Draft) into `mailbox`'s `folder`. Best
+/// effort: a storage error is logged but never fails the user's send/save (the mail already left).
+async fn store_local_copy(
+    state: &AppState,
+    mailbox: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    raw: &str,
+    folder: &str,
+) {
+    let msg = Message {
+        id: new_id("m"),
+        mailbox: mailbox.to_string(),
+        msg_from: mailbox.to_string(),
+        msg_to: to.to_string(),
+        subject: subject.to_string(),
+        raw_rfc822: raw.to_string(),
+        body_text: body.to_string(),
+        body_html: String::new(),
+        received_at: now_secs(),
+        seen: true,
+        folder: folder.to_string(),
+    };
+    if let Err(e) = state.store.store_message(&msg).await {
+        tracing::warn!(error = %e, folder, "failed to file local message copy");
     }
 }
 
@@ -286,10 +568,14 @@ async fn api_send(
         return json_status(StatusCode::BAD_REQUEST, "at least one valid recipient is required");
     }
 
-    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, &state.config.mail_domain);
+    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, "", "", &state.config.mail_domain);
     let signer = state.signer.as_deref();
     match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts).await {
-        Ok(_) => json_status(StatusCode::ACCEPTED, "queued"),
+        Ok(signed) => {
+            // File a Sent copy for the sending address (parity with the webmail /send path).
+            store_local_copy(&state, &from_addr, &req.to, &req.subject, &req.body, &signed, "Sent").await;
+            json_status(StatusCode::ACCEPTED, "queued")
+        }
         Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("enqueue failed: {e}")),
     }
 }
@@ -319,12 +605,28 @@ fn json_status(status: StatusCode, message: &str) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Build an RFC822 message for an outbound compose.
-fn build_rfc822(from: &str, to: &str, subject: &str, body: &str, domain: &str) -> String {
+/// Build an RFC822 message for an outbound compose. `in_reply_to`/`references` (empty to omit)
+/// carry the reply threading headers built from the original's stored raw source.
+fn build_rfc822(
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    in_reply_to: &str,
+    references: &str,
+    domain: &str,
+) -> String {
     let body_norm = body.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut thread = String::new();
+    if !in_reply_to.trim().is_empty() {
+        thread.push_str(&format!("In-Reply-To: {}\r\n", in_reply_to.trim()));
+    }
+    if !references.trim().is_empty() {
+        thread.push_str(&format!("References: {}\r\n", references.trim()));
+    }
     format!(
         "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n\
-         MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         {thread}MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
          Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
         date = email_date(),
         mid = message_id(domain),
@@ -631,11 +933,68 @@ mod tests {
 
     #[test]
     fn build_rfc822_has_signed_headers() {
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Hi", "Body line", "w33d.xyz");
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Hi", "Body line", "", "", "w33d.xyz");
         for h in ["From:", "To:", "Subject:", "Date:", "Message-ID:", "MIME-Version:", "Content-Type:"] {
             assert!(raw.contains(h), "missing {h}");
         }
         assert!(raw.contains("\r\n\r\nBody line\r\n"));
+        // No threading headers when none are supplied.
+        assert!(!raw.contains("In-Reply-To:"));
+        assert!(!raw.contains("References:"));
+    }
+
+    #[test]
+    fn build_rfc822_includes_thread_headers() {
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "Re: Hi",
+            "Body",
+            "<orig@ex.com>",
+            "<root@ex.com> <orig@ex.com>",
+            "w33d.xyz",
+        );
+        assert!(raw.contains("In-Reply-To: <orig@ex.com>\r\n"));
+        assert!(raw.contains("References: <root@ex.com> <orig@ex.com>\r\n"));
+    }
+
+    #[test]
+    fn subject_prefixes_do_not_stack() {
+        assert_eq!(re_subject("Hi"), "Re: Hi");
+        assert_eq!(re_subject("Re: Hi"), "Re: Hi");
+        assert_eq!(re_subject("RE: Hi"), "RE: Hi");
+        assert_eq!(fwd_subject("Hi"), "Fwd: Hi");
+        assert_eq!(fwd_subject("Fwd: Hi"), "Fwd: Hi");
+        assert_eq!(fwd_subject("fw: Hi"), "fw: Hi");
+    }
+
+    #[test]
+    fn reply_all_excludes_self() {
+        let msg = Message {
+            id: "m1".to_string(),
+            mailbox: "w33d@w33d.xyz".to_string(),
+            msg_from: "Alice <alice@ex.com>".to_string(),
+            msg_to: "w33d@w33d.xyz, Bob <bob@ex.com>".to_string(),
+            subject: "Hi".to_string(),
+            raw_rfc822: String::new(),
+            body_text: String::new(),
+            body_html: String::new(),
+            received_at: 0,
+            seen: false,
+            folder: "INBOX".to_string(),
+        };
+        let to = reply_all_to(&msg, "w33d@w33d.xyz");
+        assert!(to.contains("alice@ex.com"));
+        assert!(to.contains("bob@ex.com"));
+        assert!(!to.contains("w33d@w33d.xyz"));
+    }
+
+    #[test]
+    fn canonical_folder_clamps_unknown() {
+        assert_eq!(canonical_folder(Some("Sent")), "Sent");
+        assert_eq!(canonical_folder(Some("sent")), "Sent");
+        assert_eq!(canonical_folder(Some("bogus")), "INBOX");
+        assert_eq!(canonical_folder(None), "INBOX");
     }
 
     #[test]

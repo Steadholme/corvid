@@ -146,6 +146,141 @@ async fn compose_then_send_enqueues_outbound() {
     assert!(due[0].raw.contains("Hello outbound"));
 }
 
+/// Mint a CSRF cookie+token from `GET /compose`, returning `(token, cookie_header_value)`.
+async fn mint_csrf(state: &AppState) -> (String, String) {
+    let req = Request::builder()
+        .uri("/compose")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .expect("compose sets a CSRF cookie");
+    let token = set_cookie
+        .split(';')
+        .next()
+        .and_then(|kv| kv.split_once('='))
+        .map(|(_, v)| v.to_string())
+        .unwrap();
+    (token.clone(), format!("__Host-csrf={token}"))
+}
+
+#[tokio::test]
+async fn reply_prefills_and_sets_thread_headers() {
+    let state = build_dev_state().await;
+    let mut msg = seed_message(
+        "w33d@w33d.xyz",
+        "Project update",
+        "Alice <alice@example.com>",
+        "Original body line",
+    );
+    // Give the stored source a Message-ID so the reply can chain In-Reply-To/References.
+    msg.raw_rfc822 = format!(
+        "From: Alice <alice@example.com>\r\nTo: w33d@w33d.xyz\r\nSubject: Project update\r\n\
+         Message-ID: <orig-123@example.com>\r\n\r\nOriginal body line\r\n"
+    );
+    state.store.store_message(&msg).await.unwrap();
+
+    // The reply compose form prefills To/Subject/quote + carries the thread headers.
+    let req = Request::builder()
+        .uri(format!("/compose?reply={}", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains(r#"value="Re: Project update""#), "subject prefixed Re:");
+    assert!(html.contains("alice@example.com"), "To prefilled with sender");
+    assert!(html.contains("&lt;orig-123@example.com&gt;"), "In-Reply-To hidden field set");
+    assert!(html.contains("Alice &lt;alice@example.com&gt; wrote:"), "quoted attribution");
+
+    // Sending that reply threads the headers into the outbound raw AND files a Sent copy.
+    let (token, cookie) = mint_csrf(&state).await;
+    let form = format!(
+        "csrf={token}&action=send&to=alice%40example.com&subject=Re%3A%20Project%20update\
+         &body=my%20reply&in_reply_to=%3Corig-123%40example.com%3E&references=%3Corig-123%40example.com%3E"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(due[0].raw.contains("In-Reply-To: <orig-123@example.com>"));
+    assert!(due[0].raw.contains("References: <orig-123@example.com>"));
+
+    // A Sent copy now exists for the sender; INBOX is unaffected.
+    let sent = state.store.list_folder("w33d@w33d.xyz", "Sent", 10).await.unwrap();
+    assert_eq!(sent.len(), 1, "one message filed into Sent");
+    let inbox = state.store.list_folder("w33d@w33d.xyz", "INBOX", 10).await.unwrap();
+    assert_eq!(inbox.len(), 1, "the original inbox message is untouched");
+}
+
+#[tokio::test]
+async fn save_draft_persists_without_sending() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_csrf(&state).await;
+
+    // action=draft with an empty recipient list is allowed and must NOT enqueue anything.
+    let form = format!("csrf={token}&action=draft&to=&subject=Later&body=work%20in%20progress");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let drafts = state.store.list_folder("w33d@w33d.xyz", "Drafts", 10).await.unwrap();
+    assert_eq!(drafts.len(), 1, "draft saved into Drafts");
+    let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
+    assert!(due.is_empty(), "a draft never enqueues outbound mail");
+
+    // The folder switcher renders the Drafts tab as active for ?folder=Drafts.
+    let req = Request::builder()
+        .uri("/?folder=Drafts")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    let html = body_string(resp).await;
+    assert!(html.contains(r#"href="/?folder=Drafts""#), "Drafts tab present");
+    assert!(html.contains("Later"), "draft subject listed");
+}
+
+#[tokio::test]
+async fn store_mark_unseen_and_set_folder_roundtrip() {
+    let state = build_dev_state().await;
+    let msg = seed_message("w33d@w33d.xyz", "Toggle", "a@b.com", "x");
+    state.store.store_message(&msg).await.unwrap();
+
+    state.store.mark_seen(&msg.id).await.unwrap();
+    assert!(state.store.get_message(&msg.id).await.unwrap().unwrap().seen);
+    state.store.mark_unseen(&msg.id).await.unwrap();
+    assert!(!state.store.get_message(&msg.id).await.unwrap().unwrap().seen);
+
+    state.store.set_folder(&msg.id, "Archive").await.unwrap();
+    assert_eq!(state.store.get_message(&msg.id).await.unwrap().unwrap().folder, "Archive");
+    // list_folder now filters it out of INBOX and into the new folder.
+    assert!(state.store.list_folder("w33d@w33d.xyz", "INBOX", 10).await.unwrap().is_empty());
+    assert_eq!(state.store.list_folder("w33d@w33d.xyz", "Archive", 10).await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn send_rejects_bad_csrf() {
     let state = build_dev_state().await;

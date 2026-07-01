@@ -52,10 +52,21 @@ pub trait Store: Send + Sync {
         mailbox: &str,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
+    /// Listing for a single folder within a mailbox, newest first, capped.
+    async fn list_folder(
+        &self,
+        mailbox: &str,
+        folder: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError>;
     /// A single message by id, if it exists.
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError>;
     /// Mark a message read.
     async fn mark_seen(&self, id: &str) -> Result<(), StoreError>;
+    /// Mark a message unread.
+    async fn mark_unseen(&self, id: &str) -> Result<(), StoreError>;
+    /// Move a message into `folder`.
+    async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError>;
     /// Unread count for the app-bar badge.
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError>;
 
@@ -163,6 +174,25 @@ impl Store for InMemoryStore {
         Ok(v.iter().map(summary).collect())
     }
 
+    async fn list_folder(
+        &self,
+        mailbox: &str,
+        folder: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let mut v: Vec<Message> = self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.mailbox == mailbox && m.folder == folder)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.truncate(limit.max(0) as usize);
+        Ok(v.iter().map(summary).collect())
+    }
+
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
         Ok(self
             .messages
@@ -177,6 +207,22 @@ impl Store for InMemoryStore {
         let mut v = self.messages.lock().expect("messages lock poisoned");
         if let Some(m) = v.iter_mut().find(|m| m.id == id) {
             m.seen = true;
+        }
+        Ok(())
+    }
+
+    async fn mark_unseen(&self, id: &str) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+            m.seen = false;
+        }
+        Ok(())
+    }
+
+    async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+            m.folder = folder.to_string();
         }
         Ok(())
     }
@@ -447,6 +493,36 @@ impl Store for PgStore {
             .map_err(backend)
     }
 
+    async fn list_folder(
+        &self,
+        mailbox: &str,
+        folder: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, msg_from, subject, received_at, seen FROM messages \
+             WHERE mailbox = $1 AND folder = $2 ORDER BY received_at DESC, id DESC LIMIT $3",
+        )
+        .bind(mailbox)
+        .bind(folder)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(|r| {
+                Ok(MessageSummary {
+                    id: r.try_get("id")?,
+                    msg_from: r.try_get("msg_from")?,
+                    subject: r.try_get("subject")?,
+                    received_at: r.try_get("received_at")?,
+                    seen: r.try_get("seen")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
         let row = sqlx::query(
             "SELECT id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
@@ -461,6 +537,25 @@ impl Store for PgStore {
 
     async fn mark_seen(&self, id: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE messages SET seen = TRUE WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn mark_unseen(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE messages SET seen = FALSE WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE messages SET folder = $1 WHERE id = $2")
+            .bind(folder)
             .bind(id)
             .execute(&self.pool)
             .await
