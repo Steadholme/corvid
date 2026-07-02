@@ -657,3 +657,89 @@ mark.search-hit {
    (5.3:1, matches .pill-down). */
 .sender-list-safe .pill { background:var(--ok-soft); color:var(--ok-ink); }
 .sender-list-blocked .pill { background:var(--down-soft); color:var(--down-ink); }
+
+/* ============================================================
+   Snooze / Mute zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   .folder-snoozed (tab pill) · .snooze-menu (native <select>)
+   · .snooze-custom (epoch <input type=number>) · .btn-snooze
+   · .btn-unsnooze · .btn-mute · row states .mailrow-wrap.is-muted
+   / .is-snoozed. Tokens only — no new fonts/libs/external links.
+   Motion rides --dur/--ease (globally stilled by the
+   prefers-reduced-motion rule above); colour is token-driven so it
+   tracks any theme the same way the spam zone does. */
+
+/* Snoozed folder pill in the tab strip. Already a .btn pill, so it
+   stays unified with the other folders; an --info dot (the "time"
+   status hue, distinct from spam's --warn) gives the clock cue.
+   Scoped to .folder-tabs so any .folder-snoozed row hook is untouched. */
+.folder-tabs .folder-snoozed::before {
+  content:""; flex:none; width:6px; height:6px;
+  border-radius:50%; background:var(--info);
+}
+/* On the active (indigo) pill the dot flips to white so it stays visible. */
+.folder-tabs .btn-primary.folder-snoozed::before { background:#fff; opacity:.85; }
+
+/* Snooze time picker + custom epoch. The generic `select`/`input`
+   rules would stretch these to width:100% and blow out the action
+   row; compact them to the sibling .move-select footprint instead.
+   The .snooze-menu keeps its native popup (UA-rendered, so it never
+   overflows and needs no positioning), styled here as a tidy field:
+   surface card + border + the shared caret glyph. */
+.snooze-menu, .snooze-custom {
+  width:auto; font:inherit; font-size:12px; height:32px; line-height:normal;
+  padding:0 8px; color:var(--ink-2);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs);
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.snooze-menu {
+  appearance:none; -webkit-appearance:none; padding-right:26px;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:right 8px center;
+}
+.snooze-custom { width:104px; min-width:0; }
+.snooze-custom::placeholder { color:var(--ink-4); }
+.snooze-menu:focus, .snooze-custom:focus {
+  border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none;
+}
+
+/* Snooze / Unsnooze / Mute buttons — reuse .btn.btn-ghost.btn-sm from
+   the markup and tint only the label (same restrained idiom as the spam
+   buttons: no loud fill, a coloured border appears on hover).
+   Snooze = --info (time). Unsnooze (restore to Inbox) = quiet accent.
+   Mute is the most understated action, so it only softens its label. */
+.btn-snooze { color:var(--info-ink); }
+.btn-snooze:hover {
+  background:var(--surface-2); border-color:var(--info); color:var(--info-ink);
+}
+.btn-unsnooze { color:var(--accent-ink); }
+.btn-unsnooze:hover {
+  background:var(--surface-2); border-color:var(--accent-2); color:var(--accent-ink);
+}
+.btn-mute { color:var(--ink-3); }
+
+/* Muted thread row — weakened presentation: text drops to --ink-3 and a
+   small bell-off glyph (--ink-4, deliberately faint) leads the subject.
+   The glyph is a token-tinted inline SVG mask, so it adapts with theme
+   and degrades to nothing under reduced-motion (it has no motion). */
+.mailrow-wrap.is-muted .mailrow .from,
+.mailrow-wrap.is-muted .mailrow .subject { color:var(--ink-3); font-weight:500; }
+.mailrow-wrap.is-muted .mailrow .subject::before,
+.mailrow-wrap.is-snoozed .mailrow .subject::before {
+  content:""; display:inline-block; flex:none; width:12px; height:12px;
+  margin-right:6px; vertical-align:-2px;
+  -webkit-mask-repeat:no-repeat; mask-repeat:no-repeat;
+  -webkit-mask-position:center; mask-position:center;
+  -webkit-mask-size:contain; mask-size:contain;
+}
+.mailrow-wrap.is-muted .mailrow .subject::before {
+  background:var(--ink-4);
+  -webkit-mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9'/><path d='M10.3 21a2 2 0 0 0 3.4 0'/><path d='m3 3 18 18'/></svg>");
+  mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9'/><path d='M10.3 21a2 2 0 0 0 3.4 0'/><path d='m3 3 18 18'/></svg>");
+}
+/* Snoozed row — same faint-icon idiom with a clock in the --info hue. */
+.mailrow-wrap.is-snoozed .mailrow .subject::before {
+  background:var(--info);
+  -webkit-mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>");
+  mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>");
+}
