@@ -998,3 +998,103 @@ mark.search-hit {
   margin-top:16px; padding-top:16px;
   border-top:1px solid var(--hairline);
 }
+
+/* ============================================================
+   Advanced search + filter rules zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   · .adv-search / .adv-search__form  — the /search/advanced panel,
+     already a .card.pad, holding a run of .adv-search__field cells
+     (From / To / Subject / Has the words / Doesn't have / Size /
+     After / Before / In folder / Has attachment) + a trailing
+     .form-actions row (Search .btn-primary, Create filter .btn-ghost).
+   · .adv-search__field--size — the one multi-control cell (a compare
+     <select> + numeric <input> + unit <select>).
+   · .search-actions — the inbox search-result action row that wraps
+     .adv-search-link (entry into the advanced panel) and
+     .btn-create-filter (turn this search into a delivery rule).
+   · .filter-rules / .filter-rule-form — the settings "Filter rules"
+     card + its add-rule form; .is-prefilled flags a form seeded from
+     a search so it gets a soft accent cue.
+   Tokens only — no new fonts/libs/external links. The whole form
+   inputs already inherit the app's shared bare-<input>/<select>/<label>
+   rules; this zone only adds the aligned multi-field grid on top, so
+   colour + focus rings + light/dark track those shared rules. Motion
+   rides --dur/--ease (globally stilled by the prefers-reduced-motion
+   reset near the top of this file). */
+
+/* Two-column aligned field grid, shared by the advanced-search form and
+   the add-rule form so both read with the same rhythm. Native short
+   fields pair up; the grid gap owns the vertical spacing (so the shared
+   .field 16px margin is zeroed on the cells). */
+.adv-search__form,
+.filter-rule-form {
+  display:grid;
+  grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:16px 18px;
+  align-items:start;
+}
+.adv-search__field,
+.filter-rule-form .field { margin-bottom:0; }
+
+/* The multi-control Size cell — label on its own line, then the
+   compare / value / unit controls flow inline and wrap gracefully on
+   narrow widths. Override the shared 100%-width select/input rule so
+   the three controls share one row. */
+.adv-search__field--size { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.adv-search__field--size > label { flex:1 0 100%; margin:0; }
+.adv-search__field--size select { width:auto; flex:0 0 auto; }
+.adv-search__field--size input { width:auto; flex:1 1 96px; min-width:72px; }
+
+/* "Has attachment" is the only cell whose <label> wraps its own
+   checkbox — line it up like the kit's .check idiom. The checkbox
+   sizing works on its own; the :has() row layout is a progressive
+   enhancement (label stays a plain block where :has is unsupported). */
+.adv-search__field input[type=checkbox] {
+  width:17px; height:17px; flex:none; accent-color:var(--accent); cursor:pointer;
+}
+.adv-search__field:has(> label > input[type=checkbox]) > label {
+  display:inline-flex; align-items:center; gap:9px;
+  margin:0; font-weight:600; color:var(--ink-2); cursor:pointer;
+}
+
+/* Action bars span the full grid and separate from the fields with a
+   hairline so Search / Create filter (and Add rule) read as a footer.
+   The buttons themselves stay on the shared .btn system. */
+.adv-search__form > .form-actions,
+.filter-rule-form > .form-actions {
+  grid-column:1 / -1;
+  margin-top:6px; padding-top:16px;
+  border-top:1px solid var(--hairline);
+}
+
+/* Inbox search-result action row — a restrained cluster of the two
+   entry links. Both are already .btn.btn-ghost.btn-sm; keep them quiet
+   so they never compete with the mail list. */
+.search-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+
+/* Entry link into the advanced panel — accent-tinted label so it reads
+   as "more options", nothing louder. */
+.adv-search-link { color:var(--accent-ink); }
+.adv-search-link:hover { border-color:var(--border-2); }
+
+/* "Create filter" affordance (appears both as the ghost link in
+   .search-actions and as the secondary submit in the advanced form) —
+   a subtle accent hover border ties it to the rule-building intent
+   without a loud fill next to the primary Search button. */
+.btn-create-filter:hover { border-color:var(--accent-soft-2); color:var(--accent-ink); }
+
+/* The add-rule form seeded from a search — a soft accent panel cues the
+   user that we pre-filled it from their query. */
+.filter-rule-form.is-prefilled {
+  margin-top:6px; padding:16px;
+  background:var(--accent-soft);
+  border:1px solid var(--accent-soft-2);
+  border-radius:var(--r-sm);
+}
+
+/* Narrow screens — both field grids collapse to a single column, the
+   same breakpoint idiom the rest of the mail surfaces use. */
+@media (max-width:640px){
+  .adv-search__form,
+  .filter-rule-form { grid-template-columns:1fr; }
+}
