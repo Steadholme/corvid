@@ -17,8 +17,9 @@
 //!    raw_rfc822 TEXT, body_text TEXT, body_html TEXT, received_at BIGINT,
 //!    seen BOOLEAN DEFAULT FALSE, folder TEXT DEFAULT 'INBOX',
 //!    snooze_until BIGINT DEFAULT 0, muted BOOLEAN DEFAULT FALSE)`
-//! - `outbound_queue(id TEXT PK, raw TEXT, env_from TEXT, rcpts TEXT, to_domain TEXT,
-//!    attempts BIGINT, next_at BIGINT, status TEXT)`
+//! - `outbound_queue(id TEXT PK, mailbox TEXT, batch_id TEXT, raw TEXT, env_from TEXT,
+//!    rcpts TEXT, to_domain TEXT, attempts BIGINT, next_at BIGINT, send_at BIGINT,
+//!    sent_copy_filed BOOLEAN, status TEXT)`
 //! - `filter_rules(id TEXT PK, mailbox TEXT, position BIGINT, field TEXT, op TEXT, needle TEXT,
 //!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
@@ -33,8 +34,8 @@ use thiserror::Error;
 
 use crate::model::{
     Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
-    OutboundItem, SearchPredicate, SearchPredicateKind, SearchQuery, SearchState, SendIdentity,
-    SenderListEntry, SpamAnnotation, ThreadSummary,
+    OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
+    SearchState, SendIdentity, SenderListEntry, SpamAnnotation, ThreadSummary,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -183,8 +184,44 @@ pub trait Store: Send + Sync {
 
     /// Enqueue an outbound message for relay.
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError>;
-    /// Queued items whose `next_at <= now`, capped (the relay worker's work list).
+    /// Queued/scheduled items whose retry and schedule gates are due, capped (relay work list).
     async fn due_outbound(&self, now: i64, limit: i64) -> Result<Vec<OutboundItem>, StoreError>;
+    /// User-facing scheduled sends for one mailbox, grouped by compose submission.
+    async fn list_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<ScheduledOutbound>, StoreError>;
+    /// A single future scheduled send, grouped by compose submission.
+    async fn get_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<Option<ScheduledOutbound>, StoreError>;
+    /// Move a future scheduled send to another future epoch. Returns whether a row changed.
+    async fn reschedule_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        send_at: i64,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+    /// Remove a future scheduled send from the queue. Returns whether a row changed.
+    async fn cancel_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError>;
+    /// Claim responsibility for filing the Sent copy of a scheduled batch after delivery succeeds.
+    async fn claim_scheduled_sent_copy(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+    ) -> Result<bool, StoreError>;
     /// Mark an outbound item delivered.
     async fn mark_outbound_sent(&self, id: &str) -> Result<(), StoreError>;
     /// Bump attempts + reschedule a transient failure.
@@ -376,6 +413,50 @@ fn summary(m: &Message) -> MessageSummary {
 
 fn is_snoozed_at(m: &Message, now: i64) -> bool {
     m.snooze_until > now
+}
+
+fn scheduled_from_rows(rows: &[OutboundItem]) -> Option<ScheduledOutbound> {
+    let first = rows.first()?;
+    let mut rcpts = Vec::new();
+    for row in rows {
+        for rcpt in &row.rcpts {
+            if !rcpts.iter().any(|existing| existing == rcpt) {
+                rcpts.push(rcpt.clone());
+            }
+        }
+    }
+    Some(ScheduledOutbound {
+        batch_id: first.batch_id.clone(),
+        mailbox: first.mailbox.clone(),
+        raw: first.raw.clone(),
+        env_from: first.env_from.clone(),
+        rcpts,
+        send_at: first.send_at,
+        status: first.status.clone(),
+    })
+}
+
+fn aggregate_scheduled_rows(mut rows: Vec<OutboundItem>) -> Vec<ScheduledOutbound> {
+    rows.sort_by(|a, b| {
+        a.send_at
+            .cmp(&b.send_at)
+            .then_with(|| a.batch_id.cmp(&b.batch_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let batch_id = rows[i].batch_id.clone();
+        let mut j = i + 1;
+        while j < rows.len() && rows[j].batch_id == batch_id {
+            j += 1;
+        }
+        if let Some(scheduled) = scheduled_from_rows(&rows[i..j]) {
+            out.push(scheduled);
+        }
+        i = j;
+    }
+    out
 }
 
 fn thread_matches(m: &Message, root: &Message) -> bool {
@@ -982,12 +1063,133 @@ impl Store for InMemoryStore {
             .lock()
             .expect("outbound lock poisoned")
             .iter()
-            .filter(|o| o.status == "queued" && o.next_at <= now)
+            .filter(|o| {
+                (o.status == "queued" || o.status == "scheduled")
+                    && o.next_at <= now
+                    && (o.send_at <= 0 || o.send_at <= now)
+            })
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.next_at.cmp(&b.next_at).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.next_at
+                .cmp(&b.next_at)
+                .then_with(|| a.send_at.cmp(&b.send_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         v.truncate(limit.max(0) as usize);
         Ok(v)
+    }
+
+    async fn list_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<ScheduledOutbound>, StoreError> {
+        let rows: Vec<OutboundItem> = self
+            .outbound
+            .lock()
+            .expect("outbound lock poisoned")
+            .iter()
+            .filter(|o| {
+                o.mailbox == mailbox
+                    && o.status == "scheduled"
+                    && o.send_at > now
+                    && before.as_ref().map_or(true, |(ts, batch_id)| {
+                        o.send_at > *ts
+                            || (o.send_at == *ts && o.batch_id.as_str() > batch_id.as_str())
+                    })
+            })
+            .cloned()
+            .collect();
+        let mut scheduled = aggregate_scheduled_rows(rows);
+        scheduled.truncate(limit.max(0) as usize);
+        Ok(scheduled)
+    }
+
+    async fn get_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<Option<ScheduledOutbound>, StoreError> {
+        let rows: Vec<OutboundItem> = self
+            .outbound
+            .lock()
+            .expect("outbound lock poisoned")
+            .iter()
+            .filter(|o| {
+                o.mailbox == mailbox
+                    && o.batch_id == batch_id
+                    && o.status == "scheduled"
+                    && o.send_at > now
+            })
+            .cloned()
+            .collect();
+        Ok(scheduled_from_rows(&rows))
+    }
+
+    async fn reschedule_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        send_at: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut changed = false;
+        let mut v = self.outbound.lock().expect("outbound lock poisoned");
+        for o in v.iter_mut().filter(|o| {
+            o.mailbox == mailbox
+                && o.batch_id == batch_id
+                && o.status == "scheduled"
+                && o.send_at > now
+        }) {
+            o.send_at = send_at;
+            o.next_at = now;
+            o.attempts = 0;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    async fn cancel_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut v = self.outbound.lock().expect("outbound lock poisoned");
+        let before = v.len();
+        v.retain(|o| {
+            !(o.mailbox == mailbox
+                && o.batch_id == batch_id
+                && o.status == "scheduled"
+                && o.send_at > now)
+        });
+        Ok(v.len() != before)
+    }
+
+    async fn claim_scheduled_sent_copy(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+    ) -> Result<bool, StoreError> {
+        let mut claimed = false;
+        let mut v = self.outbound.lock().expect("outbound lock poisoned");
+        if v.iter()
+            .any(|o| o.mailbox == mailbox && o.batch_id == batch_id && o.sent_copy_filed)
+        {
+            return Ok(false);
+        }
+        for o in v
+            .iter_mut()
+            .filter(|o| o.mailbox == mailbox && o.batch_id == batch_id)
+        {
+            o.sent_copy_filed = true;
+            claimed = true;
+        }
+        Ok(claimed)
     }
 
     async fn mark_outbound_sent(&self, id: &str) -> Result<(), StoreError> {
@@ -1631,23 +1833,60 @@ impl PgStore {
             .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS outbound_queue (\
-                 id TEXT PRIMARY KEY, \
-                 raw TEXT NOT NULL, \
-                 env_from TEXT NOT NULL DEFAULT '', \
-                 rcpts TEXT NOT NULL DEFAULT '', \
-                 to_domain TEXT NOT NULL, \
-                 attempts BIGINT NOT NULL DEFAULT 0, \
-                 next_at BIGINT NOT NULL DEFAULT 0, \
-                 status TEXT NOT NULL DEFAULT 'queued'\
-             )",
+	                 id TEXT PRIMARY KEY, \
+	                 mailbox TEXT NOT NULL DEFAULT '', \
+	                 batch_id TEXT NOT NULL DEFAULT '', \
+	                 raw TEXT NOT NULL, \
+	                 env_from TEXT NOT NULL DEFAULT '', \
+	                 rcpts TEXT NOT NULL DEFAULT '', \
+	                 to_domain TEXT NOT NULL, \
+	                 attempts BIGINT NOT NULL DEFAULT 0, \
+	                 next_at BIGINT NOT NULL DEFAULT 0, \
+	                 send_at BIGINT NOT NULL DEFAULT 0, \
+	                 sent_copy_filed BOOLEAN NOT NULL DEFAULT FALSE, \
+	                 status TEXT NOT NULL DEFAULT 'queued'\
+	             )",
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "ALTER TABLE outbound_queue ADD COLUMN IF NOT EXISTS mailbox TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE outbound_queue ADD COLUMN IF NOT EXISTS batch_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE outbound_queue ADD COLUMN IF NOT EXISTS send_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+	            "ALTER TABLE outbound_queue ADD COLUMN IF NOT EXISTS sent_copy_filed BOOLEAN NOT NULL DEFAULT FALSE",
+	        )
+	        .execute(&self.pool)
+	        .await?;
+        sqlx::query("UPDATE outbound_queue SET batch_id = id WHERE batch_id = ''")
+            .execute(&self.pool)
+            .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_outbound_due ON outbound_queue (status, next_at)",
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+	            "CREATE INDEX IF NOT EXISTS idx_outbound_due_send_at ON outbound_queue (status, next_at, send_at)",
+	        )
+	        .execute(&self.pool)
+	        .await?;
+        sqlx::query(
+	            "CREATE INDEX IF NOT EXISTS idx_outbound_scheduled ON outbound_queue (mailbox, status, send_at, batch_id)",
+	        )
+	        .execute(&self.pool)
+	        .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS aliases (\
                  local_part TEXT PRIMARY KEY, \
@@ -1893,6 +2132,8 @@ impl PgStore {
         let rcpts: String = row.try_get("rcpts")?;
         Ok(OutboundItem {
             id: row.try_get("id")?,
+            mailbox: row.try_get("mailbox")?,
+            batch_id: row.try_get("batch_id")?,
             raw: row.try_get("raw")?,
             env_from: row.try_get("env_from")?,
             rcpts: rcpts
@@ -1903,6 +2144,8 @@ impl PgStore {
             to_domain: row.try_get("to_domain")?,
             attempts: row.try_get("attempts")?,
             next_at: row.try_get("next_at")?,
+            send_at: row.try_get("send_at")?,
+            sent_copy_filed: row.try_get("sent_copy_filed")?,
             status: row.try_get("status")?,
         })
     }
@@ -2559,16 +2802,20 @@ impl Store for PgStore {
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO outbound_queue \
-                 (id, raw, env_from, rcpts, to_domain, attempts, next_at, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 (id, mailbox, batch_id, raw, env_from, rcpts, to_domain, attempts, next_at, send_at, sent_copy_filed, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&item.id)
+        .bind(&item.mailbox)
+        .bind(&item.batch_id)
         .bind(&item.raw)
         .bind(&item.env_from)
         .bind(item.rcpts.join(","))
         .bind(&item.to_domain)
         .bind(item.attempts)
         .bind(item.next_at)
+        .bind(item.send_at)
+        .bind(item.sent_copy_filed)
         .bind(&item.status)
         .execute(&self.pool)
         .await
@@ -2578,9 +2825,12 @@ impl Store for PgStore {
 
     async fn due_outbound(&self, now: i64, limit: i64) -> Result<Vec<OutboundItem>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, raw, env_from, rcpts, to_domain, attempts, next_at, status \
-             FROM outbound_queue WHERE status = 'queued' AND next_at <= $1 \
-             ORDER BY next_at ASC, id ASC LIMIT $2",
+            "SELECT id, mailbox, batch_id, raw, env_from, rcpts, to_domain, attempts, next_at, send_at, sent_copy_filed, status \
+             FROM outbound_queue \
+             WHERE (status = 'queued' OR status = 'scheduled') \
+               AND next_at <= $1 \
+               AND (send_at <= 0 OR send_at <= $1) \
+             ORDER BY next_at ASC, send_at ASC, id ASC LIMIT $2",
         )
         .bind(now)
         .bind(limit)
@@ -2591,6 +2841,127 @@ impl Store for PgStore {
             .map(Self::outbound_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(backend)
+    }
+
+    async fn list_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<ScheduledOutbound>, StoreError> {
+        let (cursor_ts, cursor_batch) = before.unwrap_or((-1, String::new()));
+        let rows = sqlx::query(
+            "SELECT id, mailbox, batch_id, raw, env_from, rcpts, to_domain, attempts, next_at, send_at, sent_copy_filed, status \
+             FROM outbound_queue \
+             WHERE mailbox = $1 AND status = 'scheduled' AND send_at > $2 \
+               AND (send_at > $3 OR (send_at = $3 AND batch_id > $4)) \
+             ORDER BY send_at ASC, batch_id ASC, id ASC",
+        )
+        .bind(mailbox)
+        .bind(now)
+        .bind(cursor_ts)
+        .bind(&cursor_batch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let mut scheduled = rows
+            .iter()
+            .map(Self::outbound_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map(aggregate_scheduled_rows)
+            .map_err(backend)?;
+        scheduled.truncate(limit.max(0) as usize);
+        Ok(scheduled)
+    }
+
+    async fn get_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<Option<ScheduledOutbound>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, mailbox, batch_id, raw, env_from, rcpts, to_domain, attempts, next_at, send_at, sent_copy_filed, status \
+             FROM outbound_queue \
+             WHERE mailbox = $1 AND batch_id = $2 AND status = 'scheduled' AND send_at > $3 \
+             ORDER BY id ASC",
+        )
+        .bind(mailbox)
+        .bind(batch_id)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let rows = rows
+            .iter()
+            .map(Self::outbound_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)?;
+        Ok(scheduled_from_rows(&rows))
+    }
+
+    async fn reschedule_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        send_at: i64,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            "UPDATE outbound_queue \
+             SET send_at = $1, next_at = $2, attempts = 0, status = 'scheduled' \
+             WHERE mailbox = $3 AND batch_id = $4 AND status = 'scheduled' AND send_at > $5",
+        )
+        .bind(send_at)
+        .bind(now)
+        .bind(mailbox)
+        .bind(batch_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn cancel_scheduled_outbound(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            "DELETE FROM outbound_queue \
+             WHERE mailbox = $1 AND batch_id = $2 AND status = 'scheduled' AND send_at > $3",
+        )
+        .bind(mailbox)
+        .bind(batch_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn claim_scheduled_sent_copy(
+        &self,
+        mailbox: &str,
+        batch_id: &str,
+    ) -> Result<bool, StoreError> {
+        let res = sqlx::query(
+            "UPDATE outbound_queue SET sent_copy_filed = TRUE \
+             WHERE mailbox = $1 AND batch_id = $2 \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM outbound_queue \
+                   WHERE mailbox = $1 AND batch_id = $2 AND sent_copy_filed = TRUE\
+               )",
+        )
+        .bind(mailbox)
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn mark_outbound_sent(&self, id: &str) -> Result<(), StoreError> {

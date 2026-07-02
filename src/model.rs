@@ -458,6 +458,10 @@ pub struct Label {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OutboundItem {
     pub id: String,
+    /// Owning mailbox for user-authored scheduled sends. Empty for legacy/system queue rows.
+    pub mailbox: String,
+    /// Shared id across the per-destination queue rows produced by one compose submission.
+    pub batch_id: String,
     /// The full (already DKIM-signed) RFC822 source to transmit verbatim.
     pub raw: String,
     /// Envelope sender (`MAIL FROM`).
@@ -470,7 +474,23 @@ pub struct OutboundItem {
     pub attempts: i64,
     /// Earliest next attempt time (epoch seconds).
     pub next_at: i64,
-    /// `queued` | `sent` | `failed`.
+    /// User-selected schedule time (epoch seconds). `0` means as soon as `next_at` is due.
+    pub send_at: i64,
+    /// Whether this batch has already produced its local Sent copy.
+    pub sent_copy_filed: bool,
+    /// `queued` | `scheduled` | `sent` | `failed`.
+    pub status: String,
+}
+
+/// One user-facing scheduled send, aggregated from all destination-domain queue rows in a batch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ScheduledOutbound {
+    pub batch_id: String,
+    pub mailbox: String,
+    pub raw: String,
+    pub env_from: String,
+    pub rcpts: Vec<String>,
+    pub send_at: i64,
     pub status: String,
 }
 

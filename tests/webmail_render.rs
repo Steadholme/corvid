@@ -161,6 +161,128 @@ async fn compose_then_send_enqueues_outbound() {
     assert!(due[0].raw.contains("Hello outbound"));
 }
 
+#[tokio::test]
+async fn schedule_send_lists_reschedules_prefills_and_cancels() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_csrf(&state).await;
+    let send_at = now_secs() + 3_600;
+
+    let form = format!(
+        "csrf={token}&action=schedule&to=friend%40example.com&subject=Later&body=scheduled%20body&schedule_custom={send_at}"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/send")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone())
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    assert!(
+        state
+            .store
+            .due_outbound(send_at - 1, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "scheduled mail is not due before send_at"
+    );
+    let scheduled = state
+        .store
+        .list_scheduled_outbound("w33d@w33d.xyz", now_secs(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].status, "scheduled");
+    assert_eq!(scheduled[0].send_at, send_at);
+    let batch_id = scheduled[0].batch_id.clone();
+
+    let req = Request::builder()
+        .uri("/?folder=Scheduled")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    let html = body_string(resp).await;
+    assert!(html.contains("folder-scheduled"), "folder hook rendered");
+    assert!(html.contains("schedule-menu"), "reschedule menu rendered");
+    assert!(
+        html.contains("btn-cancel-scheduled"),
+        "cancel hook rendered"
+    );
+    assert!(html.contains("Later"), "scheduled subject listed");
+
+    let req = Request::builder()
+        .uri(format!("/compose?scheduled={batch_id}"))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    let html = body_string(resp).await;
+    assert!(
+        html.contains(&format!(r#"name="scheduled_batch_id" value="{batch_id}""#)),
+        "compose carries scheduled batch id"
+    );
+    assert!(html.contains(r#"value="Later""#), "subject prefilled");
+    assert!(html.contains("scheduled body"), "body prefilled");
+
+    let rescheduled_at = now_secs() + 7_200;
+    let form = format!(
+        "csrf={token}&op=reschedule&schedule_custom={rescheduled_at}&return=%2F%3Ffolder%3DScheduled"
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/scheduled/{batch_id}/action"))
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone())
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    assert!(
+        state
+            .store
+            .due_outbound(send_at + 1, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "old send_at no longer gates delivery after reschedule"
+    );
+    let due = state
+        .store
+        .due_outbound(rescheduled_at + 1, 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].send_at, rescheduled_at);
+
+    let form = format!("csrf={token}&op=cancel&return=%2F%3Ffolder%3DScheduled");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/scheduled/{batch_id}/action"))
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        state
+            .store
+            .list_scheduled_outbound("w33d@w33d.xyz", now_secs(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "cancel removes scheduled queue rows"
+    );
+}
+
 /// Mint a CSRF cookie+token from `GET /compose`, returning `(token, cookie_header_value)`.
 async fn mint_csrf(state: &AppState) -> (String, String) {
     let req = Request::builder()

@@ -241,12 +241,16 @@ async fn pg_store_full_integration() {
     // --- outbound queue ----------------------------------------------------
     let item = OutboundItem {
         id: new_id("o"),
+        mailbox: "w33d@w33d.xyz".into(),
+        batch_id: new_id("ob"),
         raw: "DKIM-Signature: ...\r\nFrom: w33d@w33d.xyz\r\n\r\nhi".into(),
         env_from: "w33d@w33d.xyz".into(),
         rcpts: vec!["friend@elsewhere.net".into(), "other@elsewhere.net".into()],
         to_domain: "elsewhere.net".into(),
         attempts: 0,
         next_at: now,
+        send_at: 0,
+        sent_copy_filed: false,
         status: "queued".into(),
     };
     pg.enqueue_outbound(&item).await.unwrap();

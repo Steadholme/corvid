@@ -30,8 +30,8 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::model::{
-    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, SearchQuery,
-    SenderListEntry, SpamAnnotation,
+    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
+    SearchQuery, SenderListEntry, SpamAnnotation,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -55,6 +55,8 @@ const STARRED_VIEW: &str = "Starred";
 
 /// A virtual, cross-folder view of messages whose `snooze_until` is still in the future.
 const SNOOZED_VIEW: &str = "Snoozed";
+/// A virtual view of outbound queue batches scheduled for future delivery.
+const SCHEDULED_VIEW: &str = "Scheduled";
 
 /// Default rows per folder/search page when `?limit=` is absent.
 const PAGE_DEFAULT: i64 = 50;
@@ -532,6 +534,7 @@ pub fn app(state: AppState) -> Router {
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
+        .route("/scheduled/{batch_id}/action", post(scheduled_action))
         .route("/api/send", post(api_send))
         .route("/contacts/suggest", get(contacts_suggest))
         // Progressive-enhancement JS, served as cacheable static assets (never inlined).
@@ -717,7 +720,7 @@ async fn inbox(
     let threads_on = q.view.as_deref() == Some("threads") && search.is_none();
     if threads_on {
         let folder = canonical_folder(q.folder.as_deref());
-        if folder != STARRED_VIEW && folder != SNOOZED_VIEW {
+        if folder != STARRED_VIEW && folder != SNOOZED_VIEW && folder != SCHEDULED_VIEW {
             let threads = match state
                 .store
                 .list_folder_threads(&mb.addr, folder, cursor, limit)
@@ -769,6 +772,54 @@ async fn inbox(
                 None => Html(html).into_response(),
             };
         }
+    }
+
+    if search.is_none() && canonical_folder(q.folder.as_deref()) == SCHEDULED_VIEW {
+        let scheduled = match state
+            .store
+            .list_scheduled_outbound(&mb.addr, now_secs(), cursor, limit)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                )
+            }
+        };
+        let mut rows = String::new();
+        if scheduled.is_empty() {
+            rows.push_str(&empty_row(
+                "No scheduled sends.",
+                "Messages you schedule from Compose show up here until their send time.",
+            ));
+        }
+        for item in &scheduled {
+            rows.push_str(&render_scheduled_row(item, &token));
+        }
+        let base = format!("/?folder=Scheduled&limit={limit}");
+        let next_link = next_scheduled_link(&scheduled, limit, &base);
+        let content = format!(
+            r#"<div class="page-head"><h1>Scheduled</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
+{tabs}
+<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+<script src="/assets/webmail.js"></script>"#,
+            tabs = folder_tabs(&FolderTabs {
+                active: SCHEDULED_VIEW,
+                search_q: "",
+                scope: None,
+                labels: &labels,
+                active_label: "",
+                threads_on: false,
+            }),
+        );
+        let html = render_page(SCHEDULED_VIEW, &email, &content, "inbox");
+        return match set_cookie {
+            Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+            None => Html(html).into_response(),
+        };
     }
 
     // Fetch the rows for the active view, plus the return path row actions redirect back to, a
@@ -963,6 +1014,46 @@ fn render_row_inner(
     )
 }
 
+fn render_scheduled_row(item: &ScheduledOutbound, token: &str) -> String {
+    let parsed = crate::rfc822::parse(&item.raw);
+    let subject_text = if parsed.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        parsed.subject
+    };
+    let to_display = if parsed.to.trim().is_empty() {
+        item.rcpts.join(", ")
+    } else {
+        parsed.to
+    };
+    let from_display = if parsed.from.trim().is_empty() {
+        item.env_from.clone()
+    } else {
+        parsed.from
+    };
+    let controls = schedule_controls_for(now_secs(), item.send_at);
+    format!(
+        r#"<li class="mailrow-wrap folder-scheduled is-scheduled" data-id="{id}" data-send-at="{send_at}"><a class="mailrow" href="/compose?scheduled={scheduled}"><span class="dot seen"></span><span class="from">{to}</span><span class="subject">{subject}</span><span class="date">{date}</span></a><form class="row-actions scheduled-actions" method="post" action="/scheduled/{scheduled}/action">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="return" value="/?folder=Scheduled">
+  {controls}
+  <button class="btn btn-ghost btn-sm btn-reschedule-scheduled" type="submit" name="op" value="reschedule">Reschedule</button>
+  <a class="btn btn-ghost btn-sm btn-edit-scheduled" href="/compose?scheduled={scheduled}">Edit</a>
+  <button class="btn btn-ghost btn-sm btn-draft-scheduled" type="submit" name="op" value="draft">Move to Drafts</button>
+  <button class="btn btn-danger btn-sm btn-cancel-scheduled" type="submit" name="op" value="cancel">Cancel</button>
+</form><span class="sr-only">From {from}</span></li>"#,
+        id = esc(&item.batch_id),
+        scheduled = url_encode(&item.batch_id),
+        send_at = item.send_at,
+        token = esc(token),
+        controls = controls,
+        to = esc(&to_display),
+        from = esc(&from_display),
+        subject = esc(&subject_text),
+        date = fmt_date(item.send_at),
+    )
+}
+
 fn highlight_search_hits(text: &str, query: &SearchQuery) -> String {
     let terms: Vec<&str> = query
         .positive_text_terms()
@@ -1064,6 +1155,60 @@ fn snooze_controls(now: i64) -> String {
   <input class="snooze-custom" type="number" name="snooze_custom" min="{min}" placeholder="Epoch" aria-label="Custom snooze epoch">"#,
         min = now + 1,
     )
+}
+
+fn schedule_controls_for(now: i64, selected: i64) -> String {
+    let presets = schedule_presets(now);
+    let mut opts = String::new();
+    let mut matched = false;
+    for (send_at, label) in presets {
+        let sel = if selected == send_at {
+            matched = true;
+            " selected"
+        } else {
+            ""
+        };
+        opts.push_str(&format!(
+            r#"<option value="{send_at}"{sel}>{label}</option>"#
+        ));
+    }
+    let custom_value = if selected > now && !matched {
+        format!(r#" value="{selected}""#)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<select class="schedule-menu" name="schedule_at" aria-label="Schedule send time">{opts}</select>
+  <input class="schedule-custom" type="number" name="schedule_custom" min="{min}" placeholder="Epoch" aria-label="Custom schedule epoch"{custom_value}>"#,
+        min = now + 1,
+    )
+}
+
+fn schedule_presets(now: i64) -> [(i64, &'static str); 3] {
+    let day = now.div_euclid(86_400) * 86_400;
+    let tonight = future_utc_time(day + 20 * 60 * 60, now);
+    let tomorrow_morning = future_utc_time(day + 86_400 + 9 * 60 * 60, now);
+    let days_since_epoch = day.div_euclid(86_400);
+    // 1970-01-01 was Thursday; with Monday=0 this is 3.
+    let weekday = (days_since_epoch + 3).rem_euclid(7);
+    let mut days_until_monday = (7 - weekday).rem_euclid(7);
+    if days_until_monday == 0 {
+        days_until_monday = 7;
+    }
+    let next_monday_morning = day + days_until_monday * 86_400 + 9 * 60 * 60;
+    [
+        (tonight, "Tonight"),
+        (tomorrow_morning, "Tomorrow morning"),
+        (next_monday_morning, "Next Monday morning"),
+    ]
+}
+
+fn future_utc_time(candidate: i64, now: i64) -> i64 {
+    if candidate > now {
+        candidate
+    } else {
+        candidate + 86_400
+    }
 }
 
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
@@ -1210,6 +1355,16 @@ fn next_page_link(msgs: &[crate::model::MessageSummary], limit: i64, base: &str)
     )
 }
 
+fn next_scheduled_link(msgs: &[ScheduledOutbound], limit: i64, base: &str) -> String {
+    let Some(last) = msgs.last().filter(|_| msgs.len() as i64 >= limit) else {
+        return String::new();
+    };
+    format!(
+        r#"<div class="page-more"><a class="btn btn-ghost btn-sm" href="{base}&before={cursor}">Load more</a></div>"#,
+        cursor = url_encode(&format!("{}_{}", last.send_at, last.batch_id)),
+    )
+}
+
 /// Minimal percent-encoding for a query-string value (keeps unreserved chars, encodes the rest).
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1230,6 +1385,7 @@ fn canonical_folder(requested: Option<&str>) -> &'static str {
     match requested.map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case(STARRED_VIEW) => STARRED_VIEW,
         Some(f) if f.eq_ignore_ascii_case(SNOOZED_VIEW) => SNOOZED_VIEW,
+        Some(f) if f.eq_ignore_ascii_case(SCHEDULED_VIEW) => SCHEDULED_VIEW,
         Some(f) => FOLDERS
             .into_iter()
             .find(|c| c.eq_ignore_ascii_case(f))
@@ -1255,7 +1411,11 @@ struct FolderTabs<'a> {
 /// (carried as a hidden `folder` field); `None` searches the whole mailbox.
 fn folder_tabs(t: &FolderTabs) -> String {
     let mut out = String::from(r#"<nav class="folder-tabs">"#);
-    for f in FOLDERS.iter().copied().chain([SNOOZED_VIEW, STARRED_VIEW]) {
+    for f in FOLDERS
+        .iter()
+        .copied()
+        .chain([SNOOZED_VIEW, SCHEDULED_VIEW, STARRED_VIEW])
+    {
         // A folder pill is only "active" when no label filter is in effect.
         let cls = if f == t.active && t.active_label.is_empty() {
             "btn btn-primary btn-sm"
@@ -1273,6 +1433,7 @@ fn folder_tabs(t: &FolderTabs) -> String {
         && !t.active.is_empty()
         && t.active != STARRED_VIEW
         && t.active != SNOOZED_VIEW
+        && t.active != SCHEDULED_VIEW
     {
         if t.threads_on {
             out.push_str(&format!(
@@ -1929,18 +2090,181 @@ async fn apply_message_op(
 }
 
 fn parse_snooze_epoch(preset: &str, custom: &str) -> Result<i64, (StatusCode, String)> {
+    parse_future_epoch(preset, custom, "snooze")
+}
+
+fn parse_schedule_epoch(preset: &str, custom: &str) -> Result<i64, (StatusCode, String)> {
+    parse_future_epoch(preset, custom, "schedule")
+}
+
+fn parse_future_epoch(
+    preset: &str,
+    custom: &str,
+    label: &str,
+) -> Result<i64, (StatusCode, String)> {
     let raw = custom.trim();
     let raw = if raw.is_empty() { preset.trim() } else { raw };
     let until = raw
         .parse::<i64>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid snooze time".to_string()))?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {label} time")))?;
     if until <= now_secs() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "snooze time must be in the future".to_string(),
+            format!("{label} time must be in the future"),
         ));
     }
     Ok(until)
+}
+
+#[derive(Deserialize, Default)]
+struct ScheduledActionForm {
+    csrf: String,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    schedule_at: String,
+    #[serde(default)]
+    schedule_custom: String,
+    #[serde(default, rename = "return")]
+    return_to: String,
+}
+
+async fn scheduled_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
+    Form(form): Form<ScheduledActionForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let now = now_secs();
+    let result = match form.op.as_str() {
+        "reschedule" => {
+            let send_at = match parse_schedule_epoch(&form.schedule_at, &form.schedule_custom) {
+                Ok(ts) => ts,
+                Err((code, message)) => return error_page(code, "Invalid request", &message),
+            };
+            state
+                .store
+                .reschedule_scheduled_outbound(&mb.addr, &batch_id, send_at, now)
+                .await
+        }
+        "cancel" => {
+            state
+                .store
+                .cancel_scheduled_outbound(&mb.addr, &batch_id, now)
+                .await
+        }
+        "draft" => {
+            let item = match state
+                .store
+                .get_scheduled_outbound(&mb.addr, &batch_id, now)
+                .await
+            {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    return error_page(
+                        StatusCode::NOT_FOUND,
+                        "Not found",
+                        "No such scheduled send.",
+                    )
+                }
+                Err(e) => {
+                    return error_page(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Storage error",
+                        &e.to_string(),
+                    )
+                }
+            };
+            let parsed = crate::rfc822::parse(&item.raw);
+            let from = if parsed.from.trim().is_empty() {
+                item.env_from.clone()
+            } else {
+                parsed.from
+            };
+            let to = if parsed.to.trim().is_empty() {
+                item.rcpts.join(", ")
+            } else {
+                parsed.to
+            };
+            store_local_copy(
+                &state,
+                &mb.addr,
+                &from,
+                &to,
+                &parsed.subject,
+                &parsed.body_text,
+                &parsed.body_html,
+                &item.raw,
+                "Drafts",
+            )
+            .await;
+            state
+                .store
+                .cancel_scheduled_outbound(&mb.addr, &batch_id, now)
+                .await
+        }
+        _ => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid request",
+                "Unknown action.",
+            )
+        }
+    };
+    let changed = match result {
+        Ok(changed) => changed,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
+    if !changed {
+        return error_page(
+            StatusCode::NOT_FOUND,
+            "Not found",
+            "No such scheduled send.",
+        );
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        batch = %batch_id,
+        op = %form.op,
+        "scheduled send action",
+    );
+    if form.op == "draft" {
+        Redirect::to("/?folder=Drafts").into_response()
+    } else {
+        Redirect::to(&safe_return(&form.return_to)).into_response()
+    }
+}
+
+async fn cancel_replaced_scheduled(state: &AppState, mailbox: &str, batch_id: &str) {
+    let batch_id = batch_id.trim();
+    if batch_id.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .store
+        .cancel_scheduled_outbound(mailbox, batch_id, now_secs())
+        .await
+    {
+        tracing::warn!(error = %e, mailbox, batch_id, "failed to remove replaced scheduled send");
+    }
 }
 
 async fn upsert_sender_for_message(
@@ -2237,16 +2561,22 @@ struct ComposeQuery {
     replyall: Option<String>,
     #[serde(default)]
     forward: Option<String>,
+    #[serde(default)]
+    scheduled: Option<String>,
 }
 
 /// The prefilled compose fields (empty for a blank New message).
 #[derive(Default)]
 struct Prefill {
     to: String,
+    cc: String,
     subject: String,
     body: String,
+    body_html: String,
     in_reply_to: String,
     references: String,
+    scheduled_batch_id: String,
+    schedule_at: i64,
 }
 
 async fn compose_form(
@@ -2305,6 +2635,7 @@ async fn compose_form(
     <input type="hidden" name="csrf" value="{token}">
     <input type="hidden" name="in_reply_to" value="{in_reply_to}">
     <input type="hidden" name="references" value="{references}">
+    <input type="hidden" name="scheduled_batch_id" value="{scheduled_batch_id}">
     <div class="field"><label for="from">From</label><select id="from" name="identity">{from_options}</select></div>
     <div class="field"><label for="to">To</label>
       <div class="combo"><input id="to" name="to" value="{to}" placeholder="someone@example.com" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="to-list" autocomplete="off" data-autocomplete><ul class="combo__list" id="to-list" role="listbox" hidden></ul></div>
@@ -2314,7 +2645,7 @@ async fn compose_form(
     </div>
     <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" value="{subject}" placeholder="Subject"></div>
     <div class="field compose-field"><label for="body">Message</label>
-      <input type="hidden" id="body_html" name="body_html" value="">
+      <input type="hidden" id="body_html" name="body_html" value="{body_html}">
       <div class="compose-toolbar" data-compose-toolbar role="toolbar" aria-label="Formatting tools" hidden>
         <button class="btn btn-ghost btn-sm" type="button" data-cmd="bold" title="Bold" aria-label="Bold"><strong>B</strong></button>
         <button class="btn btn-ghost btn-sm" type="button" data-cmd="italic" title="Italic" aria-label="Italic"><em>I</em></button>
@@ -2333,7 +2664,11 @@ async fn compose_form(
     </div>
     <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple></div>
     <div class="form-actions">
-      <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
+      <div class="send-split">
+        <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
+        {schedule_controls}
+        <button class="btn btn-ghost btn-schedule-send" type="submit" name="action" value="schedule">Schedule send</button>
+      </div>
       <button class="btn btn-ghost" type="submit" name="action" value="draft">Save draft</button>
       <a class="btn btn-ghost btn-sm" href="/">Cancel</a>
     </div>
@@ -2341,11 +2676,14 @@ async fn compose_form(
 </section>
 <script src="/assets/compose.js"></script>"#,
         to = esc(&pre.to),
-        cc = String::new(),
+        cc = esc(&pre.cc),
         subject = esc(&pre.subject),
         body = esc(&pre.body),
+        body_html = esc(&pre.body_html),
         in_reply_to = esc(&pre.in_reply_to),
         references = esc(&pre.references),
+        scheduled_batch_id = esc(&pre.scheduled_batch_id),
+        schedule_controls = schedule_controls_for(now_secs(), pre.schedule_at),
     );
     let html = render_page("Compose", &email, &content, "compose");
     match set_cookie {
@@ -2357,6 +2695,34 @@ async fn compose_form(
 /// Build the reply/forward prefill from the original message referenced by `q`. Returns an empty
 /// [`Prefill`] for a blank compose or when the referenced message is not the user's own.
 async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Prefill {
+    if let Some(batch_id) = q
+        .scheduled
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(Some(item)) = state
+            .store
+            .get_scheduled_outbound(&mb.addr, batch_id, now_secs())
+            .await
+        {
+            let parsed = crate::rfc822::parse(&item.raw);
+            let (headers, _) = crate::rfc822::split_headers_body(&item.raw);
+            let hdrs = crate::rfc822::parse_headers(headers);
+            return Prefill {
+                to: parsed.to,
+                cc: crate::rfc822::header(&hdrs, "cc").unwrap_or_default(),
+                subject: parsed.subject,
+                body: parsed.body_text,
+                body_html: parsed.body_html,
+                in_reply_to: crate::rfc822::header(&hdrs, "in-reply-to").unwrap_or_default(),
+                references: crate::rfc822::header(&hdrs, "references").unwrap_or_default(),
+                scheduled_batch_id: item.batch_id,
+                schedule_at: item.send_at,
+            };
+        }
+    }
+
     let (id, kind) = if let Some(id) = &q.reply {
         (id, "reply")
     } else if let Some(id) = &q.replyall {
@@ -2401,6 +2767,7 @@ async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Pref
             body: forward_body(&msg),
             in_reply_to,
             references,
+            ..Prefill::default()
         },
         "replyall" => Prefill {
             to: reply_all_to(&msg, &mb.addr),
@@ -2408,6 +2775,7 @@ async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Pref
             body: quote_body(&msg),
             in_reply_to,
             references,
+            ..Prefill::default()
         },
         _ => Prefill {
             to: msg.msg_from.clone(),
@@ -2415,6 +2783,7 @@ async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Pref
             body: quote_body(&msg),
             in_reply_to,
             references,
+            ..Prefill::default()
         },
     }
 }
@@ -2507,7 +2876,16 @@ struct SendForm {
     /// Chosen send-identity id (empty = the mailbox's own address, the default identity).
     #[serde(default)]
     identity: String,
-    /// `send` (default) or `draft`.
+    /// Existing scheduled batch being edited/replaced.
+    #[serde(default)]
+    scheduled_batch_id: String,
+    /// Preset schedule epoch used when `action=schedule`.
+    #[serde(default)]
+    schedule_at: String,
+    /// Custom schedule epoch overrides `schedule_at` when present.
+    #[serde(default)]
+    schedule_custom: String,
+    /// `send` (default), `schedule`, or `draft`.
     #[serde(default)]
     action: String,
 }
@@ -2572,6 +2950,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             "Drafts",
         )
         .await;
+        cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
         return Redirect::to("/?folder=Drafts").into_response();
     }
 
@@ -2593,6 +2972,30 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
     }
 
     let signer = state.signer.as_deref();
+    if form.action == "schedule" {
+        let send_at = match parse_schedule_epoch(&form.schedule_at, &form.schedule_custom) {
+            Ok(ts) => ts,
+            Err((code, message)) => return error_page(code, "Invalid request", &message),
+        };
+        return match crate::relay::enqueue_outbound_at(
+            state.store.as_ref(),
+            signer,
+            &raw,
+            &env_from,
+            &rcpts,
+            &mb.addr,
+            send_at,
+        )
+        .await
+        {
+            Ok(_) => {
+                cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
+                Redirect::to("/?folder=Scheduled").into_response()
+            }
+            Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
+        };
+    }
+
     match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &env_from, &rcpts)
         .await
     {
@@ -2610,6 +3013,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
                 "Sent",
             )
             .await;
+            cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
             Redirect::to("/?folder=Sent").into_response()
         }
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
@@ -2783,6 +3187,9 @@ async fn parse_send(
                     "in_reply_to" => form.in_reply_to = text,
                     "references" => form.references = text,
                     "identity" => form.identity = text,
+                    "scheduled_batch_id" => form.scheduled_batch_id = text,
+                    "schedule_at" => form.schedule_at = text,
+                    "schedule_custom" => form.schedule_custom = text,
                     "action" => form.action = text,
                     _ => {}
                 }
@@ -4815,6 +5222,9 @@ mod tests {
             r#"data-cmd="bold""#,
             r#"data-cmd="createLink""#,
             r#"<textarea id="body" name="body">"#,
+            r#"class="send-split""#,
+            r#"class="schedule-menu""#,
+            r#"btn-schedule-send"#,
         ] {
             assert!(html.contains(needle), "missing compose hook {needle}");
         }
@@ -5091,6 +5501,7 @@ mod tests {
         assert_eq!(canonical_folder(Some("sent")), "Sent");
         assert_eq!(canonical_folder(Some("spam")), "Spam");
         assert_eq!(canonical_folder(Some("snoozed")), "Snoozed");
+        assert_eq!(canonical_folder(Some("scheduled")), "Scheduled");
         assert_eq!(canonical_folder(Some("bogus")), "INBOX");
         assert_eq!(canonical_folder(None), "INBOX");
     }
@@ -5110,6 +5521,11 @@ mod tests {
             None,
             "the virtual view is not a folder"
         );
+        assert_eq!(
+            real_folder("Scheduled"),
+            None,
+            "the scheduled queue view is not a folder"
+        );
         assert_eq!(real_folder("bogus"), None);
     }
 
@@ -5117,6 +5533,7 @@ mod tests {
     fn folder_class_exposes_spam_hook() {
         assert_eq!(folder_class("Spam"), "folder-spam");
         assert_eq!(folder_class("Snoozed"), "folder-snoozed");
+        assert_eq!(folder_class("Scheduled"), "folder-scheduled");
         assert_eq!(folder_class("INBOX"), "folder-inbox");
     }
 

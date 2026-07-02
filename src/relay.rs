@@ -17,7 +17,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::dkim::DkimSigner;
 use crate::dns;
-use crate::model::OutboundItem;
+use crate::model::{Message, OutboundItem};
 use crate::store::Store;
 use crate::util::{domain_of, new_id, now_secs, read_line};
 
@@ -36,6 +36,20 @@ pub async fn enqueue_outbound(
     env_from: &str,
     rcpts: &[String],
 ) -> Result<String, String> {
+    enqueue_outbound_at(store, signer, raw, env_from, rcpts, "", 0).await
+}
+
+/// Enqueue one compose submission for a future send time. `send_at <= now` keeps the legacy immediate
+/// semantics; a future value marks rows `scheduled` while the relay due query gates on that epoch.
+pub async fn enqueue_outbound_at(
+    store: &dyn Store,
+    signer: Option<&DkimSigner>,
+    raw: &str,
+    env_from: &str,
+    rcpts: &[String],
+    mailbox: &str,
+    send_at: i64,
+) -> Result<String, String> {
     let signed = match signer {
         Some(s) if from_domain_matches(raw, &s.domain) => {
             s.sign(raw).map_err(|e| format!("dkim sign: {e}"))?
@@ -51,16 +65,27 @@ pub async fn enqueue_outbound(
         }
     }
     let now = now_secs();
+    let scheduled_at = if send_at > now { send_at } else { 0 };
+    let status = if scheduled_at > 0 {
+        "scheduled"
+    } else {
+        "queued"
+    };
+    let batch_id = new_id("ob");
     for (domain, drcpts) in by_domain {
         let item = OutboundItem {
             id: new_id("o"),
+            mailbox: mailbox.to_string(),
+            batch_id: batch_id.clone(),
             raw: signed.clone(),
             env_from: env_from.to_string(),
             rcpts: drcpts,
             to_domain: domain,
             attempts: 0,
             next_at: now,
-            status: "queued".to_string(),
+            send_at: scheduled_at,
+            sent_copy_filed: false,
+            status: status.to_string(),
         };
         store
             .enqueue_outbound(&item)
@@ -77,7 +102,11 @@ fn from_domain_matches(raw: &str, domain: &str) -> bool {
     let from = parsed.from;
     let addr = from
         .rfind('<')
-        .and_then(|i| from[i + 1..].find('>').map(|j| from[i + 1..i + 1 + j].to_string()))
+        .and_then(|i| {
+            from[i + 1..]
+                .find('>')
+                .map(|j| from[i + 1..i + 1 + j].to_string())
+        })
         .unwrap_or(from);
     domain_of(&addr).map(|d| d == domain).unwrap_or(false)
 }
@@ -107,6 +136,7 @@ async fn process_item(store: &dyn Store, item: &OutboundItem, myhost: &str, try_
     match deliver(item, myhost, try_tls).await {
         Ok(()) => {
             let _ = store.mark_outbound_sent(&item.id).await;
+            file_scheduled_sent_copy(store, item).await;
             tracing::info!(id = %item.id, domain = %item.to_domain, "relay: delivered");
         }
         Err(err) => {
@@ -125,16 +155,77 @@ async fn process_item(store: &dyn Store, item: &OutboundItem, myhost: &str, try_
     }
 }
 
+async fn file_scheduled_sent_copy(store: &dyn Store, item: &OutboundItem) {
+    if item.mailbox.trim().is_empty() || item.send_at <= 0 {
+        return;
+    }
+    match store
+        .claim_scheduled_sent_copy(&item.mailbox, &item.batch_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            tracing::warn!(id = %item.id, error = %e, "relay: failed to claim scheduled sent copy");
+            return;
+        }
+    }
+    let parsed = crate::rfc822::parse(&item.raw);
+    let from = if parsed.from.trim().is_empty() {
+        item.env_from.clone()
+    } else {
+        parsed.from.clone()
+    };
+    let to = if parsed.to.trim().is_empty() {
+        item.rcpts.join(", ")
+    } else {
+        parsed.to.clone()
+    };
+    let (message_id, thread_id) =
+        crate::delivery::resolve_thread(store, &item.mailbox, &item.raw, &parsed.subject)
+            .await
+            .unwrap_or_default();
+    let msg = Message {
+        id: new_id("m"),
+        mailbox: item.mailbox.clone(),
+        msg_from: from,
+        msg_to: to.clone(),
+        subject: parsed.subject,
+        raw_rfc822: item.raw.clone(),
+        body_text: parsed.body_text,
+        body_html: parsed.body_html,
+        received_at: now_secs(),
+        seen: true,
+        folder: "Sent".to_string(),
+        starred: false,
+        snooze_until: 0,
+        muted: false,
+        thread_id,
+        message_id,
+    };
+    if let Err(e) = store.store_message(&msg).await {
+        tracing::warn!(id = %item.id, error = %e, "relay: failed to file scheduled sent copy");
+        return;
+    }
+    crate::delivery::harvest_contacts(store, &item.mailbox, "", &to).await;
+}
+
 struct DeliverErr {
     transient: bool,
     msg: String,
 }
 impl DeliverErr {
     fn transient(msg: impl Into<String>) -> Self {
-        Self { transient: true, msg: msg.into() }
+        Self {
+            transient: true,
+            msg: msg.into(),
+        }
     }
     fn permanent(msg: impl Into<String>) -> Self {
-        Self { transient: false, msg: msg.into() }
+        Self {
+            transient: false,
+            msg: msg.into(),
+        }
     }
 }
 
@@ -170,13 +261,10 @@ async fn smtp_deliver(
     item: &OutboundItem,
     try_tls: bool,
 ) -> Result<(), DeliverErr> {
-    let connect = tokio::time::timeout(
-        Duration::from_secs(20),
-        TcpStream::connect((host, 25)),
-    )
-    .await
-    .map_err(|_| DeliverErr::transient("connect timeout"))?
-    .map_err(|e| DeliverErr::transient(format!("connect {host}:25: {e}")))?;
+    let connect = tokio::time::timeout(Duration::from_secs(20), TcpStream::connect((host, 25)))
+        .await
+        .map_err(|_| DeliverErr::transient("connect timeout"))?
+        .map_err(|e| DeliverErr::transient(format!("connect {host}:25: {e}")))?;
 
     let mut tcp = connect;
     let mut buf = Vec::new();
@@ -408,6 +496,7 @@ mod danger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::InMemoryStore;
 
     #[test]
     fn dot_stuffing_doubles_leading_dots() {
@@ -416,5 +505,36 @@ mod tests {
         assert!(s.contains("\r\n..hidden\r\n"));
         assert!(s.contains("\r\n...already\r\n"));
         assert!(s.ends_with("last"));
+    }
+
+    #[tokio::test]
+    async fn scheduled_sent_copy_is_claimed_once_per_batch() {
+        let store = InMemoryStore::new();
+        let item = OutboundItem {
+            id: "o_one".to_string(),
+            mailbox: "w33d@w33d.xyz".to_string(),
+            batch_id: "ob_batch".to_string(),
+            raw: "From: w33d@w33d.xyz\r\nTo: friend@example.com\r\nSubject: Scheduled\r\n\r\nbody"
+                .to_string(),
+            env_from: "w33d@w33d.xyz".to_string(),
+            rcpts: vec!["friend@example.com".to_string()],
+            to_domain: "example.com".to_string(),
+            attempts: 0,
+            next_at: now_secs(),
+            send_at: now_secs() - 1,
+            sent_copy_filed: false,
+            status: "scheduled".to_string(),
+        };
+
+        store.enqueue_outbound(&item).await.unwrap();
+        file_scheduled_sent_copy(&store, &item).await;
+        file_scheduled_sent_copy(&store, &item).await;
+
+        let sent = store
+            .list_folder("w33d@w33d.xyz", "Sent", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].subject, "Scheduled");
     }
 }
