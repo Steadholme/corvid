@@ -486,6 +486,21 @@ async fn signature_prefills_compose_and_reply() {
         .set_signature(MAILBOX, "Cheers,\nw33d")
         .await
         .unwrap();
+    let signatures = state.store.list_signatures(MAILBOX).await.unwrap();
+    assert_eq!(signatures.len(), 1);
+    assert_eq!(signatures[0].identity, "");
+    assert!(signatures[0].is_default);
+    assert_eq!(
+        state
+            .store
+            .get_default_signature_for_identity(MAILBOX, "info@w33d.xyz")
+            .await
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "Cheers,\nw33d",
+        "legacy signature is the general fallback"
+    );
 
     // Blank compose: the body starts with the signature block.
     let req = Request::builder()

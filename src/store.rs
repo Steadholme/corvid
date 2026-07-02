@@ -24,6 +24,8 @@
 //!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
 //! - `sender_lists(id TEXT PK, user TEXT, address_or_domain TEXT, kind TEXT, created_at BIGINT)`
+//! - `signatures(id TEXT PK, user TEXT, identity TEXT, name TEXT, body_html TEXT, body_text TEXT,
+//!    is_default BOOLEAN, created_at BIGINT)`
 //! - `templates(id TEXT PK, user TEXT, name TEXT, body_html TEXT, body_text TEXT,
 //!    created_at BIGINT, updated_at BIGINT)`
 //! - `spam_annotations(message_id TEXT PK, mailbox TEXT, score BIGINT, reason TEXT)`
@@ -36,10 +38,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::model::{
-    Alias, Contact, DEFAULT_UNDO_SEND_WINDOW_SECS, FilterRule, Label, Mailbox, MailboxSettings,
-    Message, MessageSummary, OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind,
-    SearchQuery, SearchState, SendIdentity, SenderListEntry, SpamAnnotation, Template,
-    ThreadSummary,
+    Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
+    OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
+    SearchState, SendIdentity, SenderListEntry, Signature, SpamAnnotation, Template, ThreadSummary,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -172,6 +174,23 @@ pub trait Store: Send + Sync {
     async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError>;
     /// Set the compose signature (empty clears it).
     async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError>;
+    /// Every reusable signature owned by a mailbox, ordered by identity/default/name.
+    async fn list_signatures(&self, mailbox: &str) -> Result<Vec<Signature>, StoreError>;
+    /// A single signature, scoped to `mailbox`.
+    async fn get_signature(&self, mailbox: &str, id: &str)
+        -> Result<Option<Signature>, StoreError>;
+    /// The default signature for `identity`, falling back to the general default (`identity = ''`).
+    async fn get_default_signature_for_identity(
+        &self,
+        mailbox: &str,
+        identity: &str,
+    ) -> Result<Option<Signature>, StoreError>;
+    /// Persist a new reusable signature.
+    async fn create_signature(&self, signature: &Signature) -> Result<(), StoreError>;
+    /// Update an existing reusable signature, scoped by its `user` and `id`.
+    async fn update_signature(&self, signature: &Signature) -> Result<(), StoreError>;
+    /// Delete one reusable signature, scoped to `mailbox`.
+    async fn delete_signature(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
     /// Set the undo-send hold window in seconds (`0` keeps the legacy immediate-send path).
     async fn set_undo_send_window(&self, mailbox: &str, secs: i64) -> Result<(), StoreError>;
     /// Set the auto-reply (vacation) configuration (`until` of 0 = no expiry).
@@ -395,6 +414,7 @@ pub struct InMemoryStore {
     settings: Mutex<Vec<MailboxSettings>>,
     /// Auto-reply dedupe log entries: `(mailbox, sender, sent_at)`.
     auto_replies: Mutex<Vec<(String, String, i64)>>,
+    signatures: Mutex<Vec<Signature>>,
     templates: Mutex<Vec<Template>>,
     send_identities: Mutex<Vec<SendIdentity>>,
     /// Contacts qualified by their owning mailbox: `(mailbox, contact)`.
@@ -432,6 +452,20 @@ fn summary(m: &Message) -> MessageSummary {
         muted: m.muted,
         folder: m.folder.clone(),
     }
+}
+
+fn legacy_signature_id(mailbox: &str) -> String {
+    format!("sig_legacy_{mailbox}")
+}
+
+fn sort_signatures(v: &mut [Signature]) {
+    v.sort_by(|a, b| {
+        a.identity
+            .cmp(&b.identity)
+            .then_with(|| b.is_default.cmp(&a.is_default))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn is_snoozed_at(m: &Message, now: i64) -> bool {
@@ -1052,6 +1086,149 @@ impl Store for InMemoryStore {
             s.signature = signature.to_string();
             v.push(s);
         }
+        drop(v);
+
+        let sig = signature.trim();
+        let mut signatures = self.signatures.lock().expect("signatures lock poisoned");
+        if sig.is_empty() {
+            signatures.retain(|s| {
+                !(s.user == mailbox
+                    && s.identity.is_empty()
+                    && s.id == legacy_signature_id(mailbox))
+            });
+            return Ok(());
+        }
+        for s in signatures
+            .iter_mut()
+            .filter(|s| s.user == mailbox && s.identity.is_empty())
+        {
+            s.is_default = false;
+        }
+        let id = legacy_signature_id(mailbox);
+        if let Some(existing) = signatures
+            .iter_mut()
+            .find(|s| s.user == mailbox && s.id == id)
+        {
+            existing.identity.clear();
+            existing.name = "Default".to_string();
+            existing.body_html.clear();
+            existing.body_text = sig.to_string();
+            existing.is_default = true;
+        } else {
+            signatures.push(Signature {
+                id,
+                user: mailbox.to_string(),
+                identity: String::new(),
+                name: "Default".to_string(),
+                body_html: String::new(),
+                body_text: sig.to_string(),
+                is_default: true,
+                created_at: crate::util::now_secs(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_signatures(&self, mailbox: &str) -> Result<Vec<Signature>, StoreError> {
+        let mut v: Vec<Signature> = self
+            .signatures
+            .lock()
+            .expect("signatures lock poisoned")
+            .iter()
+            .filter(|s| s.user == mailbox)
+            .cloned()
+            .collect();
+        sort_signatures(&mut v);
+        Ok(v)
+    }
+
+    async fn get_signature(
+        &self,
+        mailbox: &str,
+        id: &str,
+    ) -> Result<Option<Signature>, StoreError> {
+        Ok(self
+            .signatures
+            .lock()
+            .expect("signatures lock poisoned")
+            .iter()
+            .find(|s| s.user == mailbox && s.id == id)
+            .cloned())
+    }
+
+    async fn get_default_signature_for_identity(
+        &self,
+        mailbox: &str,
+        identity: &str,
+    ) -> Result<Option<Signature>, StoreError> {
+        let signatures = self.signatures.lock().expect("signatures lock poisoned");
+        let exact_identity = identity.trim();
+        if !exact_identity.is_empty() {
+            if let Some(sig) = signatures
+                .iter()
+                .filter(|s| s.user == mailbox && s.identity == exact_identity && s.is_default)
+                .max_by(|a, b| {
+                    a.created_at
+                        .cmp(&b.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                })
+                .cloned()
+            {
+                return Ok(Some(sig));
+            }
+        }
+        Ok(signatures
+            .iter()
+            .filter(|s| s.user == mailbox && s.identity.is_empty() && s.is_default)
+            .max_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+            .cloned())
+    }
+
+    async fn create_signature(&self, signature: &Signature) -> Result<(), StoreError> {
+        let mut v = self.signatures.lock().expect("signatures lock poisoned");
+        if signature.is_default {
+            for existing in v
+                .iter_mut()
+                .filter(|s| s.user == signature.user && s.identity == signature.identity)
+            {
+                existing.is_default = false;
+            }
+        }
+        v.push(signature.clone());
+        Ok(())
+    }
+
+    async fn update_signature(&self, signature: &Signature) -> Result<(), StoreError> {
+        let mut v = self.signatures.lock().expect("signatures lock poisoned");
+        if signature.is_default {
+            for existing in v.iter_mut().filter(|s| {
+                s.user == signature.user && s.identity == signature.identity && s.id != signature.id
+            }) {
+                existing.is_default = false;
+            }
+        }
+        if let Some(existing) = v
+            .iter_mut()
+            .find(|s| s.user == signature.user && s.id == signature.id)
+        {
+            existing.identity = signature.identity.clone();
+            existing.name = signature.name.clone();
+            existing.body_html = signature.body_html.clone();
+            existing.body_text = signature.body_text.clone();
+            existing.is_default = signature.is_default;
+        }
+        Ok(())
+    }
+
+    async fn delete_signature(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        self.signatures
+            .lock()
+            .expect("signatures lock poisoned")
+            .retain(|s| !(s.user == mailbox && s.id == id));
         Ok(())
     }
 
@@ -1848,8 +2025,8 @@ impl Store for InMemoryStore {
 // PostgreSQL-backed store (portable: standard SQL, runtime queries, no macros).
 // --------------------------------------------------------------------------------------
 
-use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Row;
 
 /// PostgreSQL-backed [`Store`]. Holds just a `PgPool`; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -2117,6 +2294,40 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS signatures (\
+                 id TEXT PRIMARY KEY, \
+                 \"user\" TEXT NOT NULL, \
+                 identity TEXT NOT NULL DEFAULT '', \
+                 name TEXT NOT NULL, \
+                 body_html TEXT NOT NULL DEFAULT '', \
+                 body_text TEXT NOT NULL DEFAULT '', \
+                 is_default BOOLEAN NOT NULL DEFAULT FALSE, \
+                 created_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_signatures_user_identity \
+             ON signatures (\"user\", identity, is_default, name, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO signatures \
+                 (id, \"user\", identity, name, body_html, body_text, is_default, created_at) \
+             SELECT 'sig_legacy_' || addr, addr, '', 'Default', '', signature, TRUE, 0 \
+             FROM mailboxes m \
+             WHERE COALESCE(signature, '') <> '' \
+               AND NOT EXISTS (\
+                   SELECT 1 FROM signatures s \
+                   WHERE s.\"user\" = m.addr AND s.identity = '' AND s.is_default = TRUE\
+               ) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS templates (\
                  id TEXT PRIMARY KEY, \
                  \"user\" TEXT NOT NULL, \
@@ -2328,6 +2539,19 @@ impl PgStore {
             user: row.try_get("user")?,
             address_or_domain: row.try_get("address_or_domain")?,
             kind: row.try_get("kind")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn signature_from_row(row: &sqlx::postgres::PgRow) -> Result<Signature, sqlx::Error> {
+        Ok(Signature {
+            id: row.try_get("id")?,
+            user: row.try_get("user")?,
+            identity: row.try_get("identity")?,
+            name: row.try_get("name")?,
+            body_html: row.try_get("body_html")?,
+            body_text: row.try_get("body_text")?,
+            is_default: row.try_get("is_default")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -2968,6 +3192,197 @@ impl Store for PgStore {
         sqlx::query("UPDATE mailboxes SET signature = $1 WHERE addr = $2")
             .bind(signature)
             .bind(mailbox)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        let sig = signature.trim();
+        let id = legacy_signature_id(mailbox);
+        if sig.is_empty() {
+            sqlx::query("DELETE FROM signatures WHERE \"user\" = $1 AND id = $2")
+                .bind(mailbox)
+                .bind(&id)
+                .execute(&self.pool)
+                .await
+                .map_err(backend)?;
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE signatures SET is_default = FALSE \
+             WHERE \"user\" = $1 AND identity = '' AND id <> $2",
+        )
+        .bind(mailbox)
+        .bind(&id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        sqlx::query(
+            "INSERT INTO signatures \
+                 (id, \"user\", identity, name, body_html, body_text, is_default, created_at) \
+             VALUES ($1, $2, '', 'Default', '', $3, TRUE, $4) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 \"user\" = EXCLUDED.\"user\", \
+                 identity = '', \
+                 name = 'Default', \
+                 body_html = '', \
+                 body_text = EXCLUDED.body_text, \
+                 is_default = TRUE",
+        )
+        .bind(&id)
+        .bind(mailbox)
+        .bind(sig)
+        .bind(crate::util::now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn list_signatures(&self, mailbox: &str) -> Result<Vec<Signature>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, \"user\", identity, name, body_html, body_text, is_default, created_at \
+             FROM signatures WHERE \"user\" = $1 \
+             ORDER BY identity ASC, is_default DESC, name ASC, id ASC",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::signature_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn get_signature(
+        &self,
+        mailbox: &str,
+        id: &str,
+    ) -> Result<Option<Signature>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, \"user\", identity, name, body_html, body_text, is_default, created_at \
+             FROM signatures WHERE \"user\" = $1 AND id = $2",
+        )
+        .bind(mailbox)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.as_ref()
+            .map(Self::signature_from_row)
+            .transpose()
+            .map_err(backend)
+    }
+
+    async fn get_default_signature_for_identity(
+        &self,
+        mailbox: &str,
+        identity: &str,
+    ) -> Result<Option<Signature>, StoreError> {
+        let wanted = identity.trim();
+        if !wanted.is_empty() {
+            let row = sqlx::query(
+                "SELECT id, \"user\", identity, name, body_html, body_text, is_default, created_at \
+                 FROM signatures \
+                 WHERE \"user\" = $1 AND identity = $2 AND is_default = TRUE \
+                 ORDER BY created_at DESC, id ASC LIMIT 1",
+            )
+            .bind(mailbox)
+            .bind(wanted)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+            if let Some(sig) = row
+                .as_ref()
+                .map(Self::signature_from_row)
+                .transpose()
+                .map_err(backend)?
+            {
+                return Ok(Some(sig));
+            }
+        }
+        let row = sqlx::query(
+            "SELECT id, \"user\", identity, name, body_html, body_text, is_default, created_at \
+             FROM signatures \
+             WHERE \"user\" = $1 AND identity = '' AND is_default = TRUE \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(mailbox)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.as_ref()
+            .map(Self::signature_from_row)
+            .transpose()
+            .map_err(backend)
+    }
+
+    async fn create_signature(&self, signature: &Signature) -> Result<(), StoreError> {
+        if signature.is_default {
+            sqlx::query(
+                "UPDATE signatures SET is_default = FALSE \
+                 WHERE \"user\" = $1 AND identity = $2 AND id <> $3",
+            )
+            .bind(&signature.user)
+            .bind(&signature.identity)
+            .bind(&signature.id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        }
+        sqlx::query(
+            "INSERT INTO signatures \
+                 (id, \"user\", identity, name, body_html, body_text, is_default, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&signature.id)
+        .bind(&signature.user)
+        .bind(&signature.identity)
+        .bind(&signature.name)
+        .bind(&signature.body_html)
+        .bind(&signature.body_text)
+        .bind(signature.is_default)
+        .bind(signature.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn update_signature(&self, signature: &Signature) -> Result<(), StoreError> {
+        if signature.is_default {
+            sqlx::query(
+                "UPDATE signatures SET is_default = FALSE \
+                 WHERE \"user\" = $1 AND identity = $2 AND id <> $3",
+            )
+            .bind(&signature.user)
+            .bind(&signature.identity)
+            .bind(&signature.id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        }
+        sqlx::query(
+            "UPDATE signatures SET identity = $1, name = $2, body_html = $3, \
+                    body_text = $4, is_default = $5 \
+             WHERE \"user\" = $6 AND id = $7",
+        )
+        .bind(&signature.identity)
+        .bind(&signature.name)
+        .bind(&signature.body_html)
+        .bind(&signature.body_text)
+        .bind(signature.is_default)
+        .bind(&signature.user)
+        .bind(&signature.id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_signature(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM signatures WHERE \"user\" = $1 AND id = $2")
+            .bind(mailbox)
+            .bind(id)
             .execute(&self.pool)
             .await
             .map_err(backend)?;
@@ -3991,13 +4406,11 @@ mod tests {
         store.store_message(&m).await.unwrap();
 
         store.snooze_message(&m.id, now + 60).await.unwrap();
-        assert!(
-            store
-                .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+            .await
+            .unwrap()
+            .is_empty());
         let snoozed = store
             .list_snoozed("w33d@w33d.xyz", now, None, 10)
             .await
@@ -4033,22 +4446,18 @@ mod tests {
         store.store_message(&reply).await.unwrap();
 
         store.set_thread_muted(&root, true).await.unwrap();
-        assert!(
-            store
-                .is_thread_muted("w33d@w33d.xyz", "thr:1")
-                .await
-                .unwrap()
-        );
+        assert!(store
+            .is_thread_muted("w33d@w33d.xyz", "thr:1")
+            .await
+            .unwrap());
         assert!(store.get_message("m_root").await.unwrap().unwrap().muted);
         assert!(store.get_message("m_reply").await.unwrap().unwrap().muted);
 
         store.set_thread_muted(&root, false).await.unwrap();
-        assert!(
-            !store
-                .is_thread_muted("w33d@w33d.xyz", "thr:1")
-                .await
-                .unwrap()
-        );
+        assert!(!store
+            .is_thread_muted("w33d@w33d.xyz", "thr:1")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -4093,13 +4502,11 @@ mod tests {
             .delete_spam_annotation("w33d@w33d.xyz", "m_1")
             .await
             .unwrap();
-        assert!(
-            store
-                .spam_annotation("w33d@w33d.xyz", "m_1")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .spam_annotation("w33d@w33d.xyz", "m_1")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -4158,13 +4565,11 @@ mod tests {
             .delete_template("w33d@w33d.xyz", "tpl_welcome")
             .await
             .unwrap();
-        assert!(
-            store
-                .list_templates("w33d@w33d.xyz")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(store
+            .list_templates("w33d@w33d.xyz")
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
             store.list_templates("alice@w33d.xyz").await.unwrap().len(),
             1

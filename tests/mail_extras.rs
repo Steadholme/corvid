@@ -8,7 +8,7 @@ use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
 use corvid::delivery::process_inbound;
-use corvid::model::{Label, Message};
+use corvid::model::{Label, Message, SendIdentity};
 use corvid::store::{InMemoryStore, Store};
 use corvid::{app, build_dev_state, new_id, now_secs, AppState};
 
@@ -827,6 +827,132 @@ async fn settings_templates_crud_and_compose_insert_hooks() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn settings_signatures_crud_and_identity_defaults_prefill_compose() {
+    let state = build_dev_state().await;
+    state
+        .store
+        .add_send_identity(&SendIdentity {
+            id: "si_info".to_string(),
+            mailbox: MAILBOX.to_string(),
+            from_addr: "info@w33d.xyz".to_string(),
+            display_name: "Info".to_string(),
+            is_default: true,
+        })
+        .await
+        .unwrap();
+    let (token, cookie) = mint_csrf(&state).await;
+
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/signatures",
+            &cookie,
+            format!(
+                "csrf={token}&cmd=add&name={}&body_text={}&is_default=on",
+                urlencode("General"),
+                urlencode("General\nSig")
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let signatures = state.store.list_signatures(MAILBOX).await.unwrap();
+    assert_eq!(signatures.len(), 1);
+    assert_eq!(signatures[0].identity, "");
+
+    let req = Request::builder()
+        .uri("/compose")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(
+        html.contains("General\nSig"),
+        "default send identity falls back to the general signature"
+    );
+    assert!(
+        html.contains(r#"data-current-signature-text="#),
+        "compose carries signature switch hooks"
+    );
+
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/signatures",
+            &cookie,
+            format!(
+                "csrf={token}&cmd=add&identity={}&name={}&body_text={}&body_html={}&is_default=on",
+                urlencode("info@w33d.xyz"),
+                urlencode("Info"),
+                urlencode("Info Sig"),
+                urlencode("<p><strong>Info</strong></p>")
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let signatures = state.store.list_signatures(MAILBOX).await.unwrap();
+    assert_eq!(signatures.len(), 2);
+    let info_sig = signatures
+        .iter()
+        .find(|s| s.identity == "info@w33d.xyz")
+        .expect("identity signature");
+    assert!(info_sig.is_default);
+    assert!(info_sig.body_html.contains("<strong>Info</strong>"));
+
+    let req = Request::builder()
+        .uri("/compose")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("Info Sig"));
+    assert!(
+        html.contains("&lt;strong&gt;Info&lt;/strong&gt;"),
+        "rich signature is prefilled into body_html"
+    );
+
+    let id = info_sig.id.clone();
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/signatures",
+            &cookie,
+            format!(
+                "csrf={token}&cmd=update&id={}&identity={}&name={}&body_text={}&is_default=on",
+                urlencode(&id),
+                urlencode("info@w33d.xyz"),
+                urlencode("Updated"),
+                urlencode("Updated Sig")
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let updated = state
+        .store
+        .get_signature(MAILBOX, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "Updated");
+    assert_eq!(updated.body_text, "Updated Sig");
+
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/signatures",
+            &cookie,
+            format!("csrf={token}&cmd=delete&id={}", urlencode(&id)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(state
+        .store
+        .get_signature(MAILBOX, &id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Minimal percent-encoding matching the webmail's own (unreserved chars pass through).

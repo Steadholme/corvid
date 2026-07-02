@@ -87,6 +87,28 @@ impl MailboxSettings {
     }
 }
 
+/// A reusable compose signature. `identity` is the From address this default belongs to; empty
+/// means the mailbox-wide fallback/default signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Signature {
+    /// Opaque id, primary key.
+    pub id: String,
+    /// The mailbox/user this signature belongs to.
+    pub user: String,
+    /// From identity address this signature is scoped to; empty = general fallback.
+    pub identity: String,
+    /// User-facing name.
+    pub name: String,
+    /// Sanitised rich HTML body. Empty means use `body_text`.
+    pub body_html: String,
+    /// Plain-text fallback/body.
+    pub body_text: String,
+    /// Whether this is the default signature for its `identity`.
+    pub is_default: bool,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
+}
+
 /// A per-mailbox sender allow/block entry used by delivery-time spam placement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SenderListEntry {

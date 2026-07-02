@@ -10,7 +10,9 @@
 //! docker rm -f corvid-testpg
 //! ```
 
-use corvid::model::{parse_search_query, FilterRule, Mailbox, Message, OutboundItem, Template};
+use corvid::model::{
+    parse_search_query, FilterRule, Mailbox, Message, OutboundItem, Signature, Template,
+};
 use corvid::store::{PgStore, Store, AUTO_REPLY_DEDUPE_SECS};
 use corvid::{new_id, now_secs};
 
@@ -36,6 +38,7 @@ async fn pg_store_full_integration() {
         "contacts",
         "labels",
         "message_labels",
+        "signatures",
         "templates",
         "mailboxes",
     ] {
@@ -350,6 +353,72 @@ async fn pg_store_full_integration() {
     assert_eq!(s.auto_reply_subject, "OOO");
     assert_eq!(s.auto_reply_body, "away until Monday");
     assert_eq!(s.auto_reply_until, now + 3600);
+    let sigs = pg.list_signatures("w33d@w33d.xyz").await.unwrap();
+    assert_eq!(
+        sigs.len(),
+        1,
+        "legacy signature is mirrored into signatures"
+    );
+    assert_eq!(sigs[0].identity, "");
+    assert!(sigs[0].is_default);
+    assert_eq!(
+        pg.get_default_signature_for_identity("w33d@w33d.xyz", "info@w33d.xyz")
+            .await
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "-- w33d",
+        "identity without its own default falls back to general"
+    );
+    pg.create_signature(&Signature {
+        id: "sig_info".into(),
+        user: "w33d@w33d.xyz".into(),
+        identity: "info@w33d.xyz".into(),
+        name: "Info".into(),
+        body_html: "<p>Info</p>".into(),
+        body_text: "Info".into(),
+        is_default: true,
+        created_at: now,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        pg.get_default_signature_for_identity("w33d@w33d.xyz", "info@w33d.xyz")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "sig_info",
+        "identity-specific default wins"
+    );
+    pg.update_signature(&Signature {
+        id: "sig_info".into(),
+        user: "w33d@w33d.xyz".into(),
+        identity: "info@w33d.xyz".into(),
+        name: "Info Updated".into(),
+        body_html: String::new(),
+        body_text: "Updated".into(),
+        is_default: true,
+        created_at: now,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        pg.get_signature("w33d@w33d.xyz", "sig_info")
+            .await
+            .unwrap()
+            .unwrap()
+            .body_text,
+        "Updated"
+    );
+    pg.delete_signature("w33d@w33d.xyz", "sig_info")
+        .await
+        .unwrap();
+    assert!(pg
+        .get_signature("w33d@w33d.xyz", "sig_info")
+        .await
+        .unwrap()
+        .is_none());
     // An unknown mailbox yields the defaults instead of an error.
     assert!(
         !pg.get_settings("ghost@w33d.xyz")

@@ -22,26 +22,26 @@
 //! - `POST /settings/rules|undo-send|signature|autoreply` settings mutations (CSRF-guarded)
 
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 
 use crate::rfc822::Attachment;
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::Deserialize;
 use std::collections::HashMap;
 use time::{Date, Month, OffsetDateTime};
 
-use crate::AppState;
 use crate::model::{
-    Alias, Contact, DEFAULT_UNDO_SEND_WINDOW_SECS, FilterRule, Label, Mailbox, Message,
-    ScheduledOutbound, SearchPredicateKind, SearchQuery, SenderListEntry, SpamAnnotation, Template,
-    parse_search_query,
+    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
+    SearchPredicateKind, SearchQuery, SenderListEntry, Signature, SpamAnnotation, Template,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
+use crate::AppState;
 
 /// The real (column-backed) folders the webmail surfaces: INBOX for received mail, the two
 /// locally-authored ones, plus Archive/Spam/Trash that message actions move mail into. These are
@@ -516,6 +516,80 @@ const COMPOSE_UX_JS: &str = r#"
     templateButton.addEventListener('click', function (e) { e.preventDefault(); insertTemplate(); });
   }
 
+  function decodeData(v) {
+    try { return decodeURIComponent(v || ''); } catch (_) { return ''; }
+  }
+  function encodeData(v) {
+    try { return encodeURIComponent(v || ''); } catch (_) { return ''; }
+  }
+  var identitySelect = form.querySelector('[name="identity"]');
+  var initialSignatureText = decodeData(form.getAttribute('data-current-signature-text'));
+  var initialSignatureHtml = decodeData(form.getAttribute('data-current-signature-html'));
+  var initialBodyText = body ? body.value : '';
+  var initialBodyHtml = bodyHtml ? bodyHtml.value : '';
+  function selectedSignature(attr) {
+    if (!identitySelect) return '';
+    var opt = identitySelect.options[identitySelect.selectedIndex];
+    return opt ? decodeData(opt.getAttribute(attr)) : '';
+  }
+  function currentHtml() {
+    if (rich && !rich.hidden) return rich.innerHTML;
+    return bodyHtml ? bodyHtml.value : '';
+  }
+  function setCurrentSignature(text, html) {
+    form.setAttribute('data-current-signature-text', encodeData(text));
+    form.setAttribute('data-current-signature-html', encodeData(html));
+  }
+  function replaceSignatureForIdentity() {
+    if (!identitySelect || !body) return;
+    syncRich();
+    var oldText = decodeData(form.getAttribute('data-current-signature-text'));
+    var oldHtml = decodeData(form.getAttribute('data-current-signature-html'));
+    var newText = selectedSignature('data-signature-text');
+    var newHtml = selectedSignature('data-signature-html');
+    var html = currentHtml();
+    var changed = false;
+
+    if (oldHtml && html.slice(-oldHtml.length) === oldHtml) {
+      if (rich && !rich.hidden) {
+        rich.innerHTML = html.slice(0, -oldHtml.length) + newHtml;
+      } else if (bodyHtml) {
+        bodyHtml.value = html.slice(0, -oldHtml.length) + newHtml;
+      }
+      syncRich();
+      changed = true;
+    } else if (oldText && body.value.slice(-oldText.length) === oldText) {
+      body.value = body.value.slice(0, -oldText.length) + newText;
+      if (rich && !rich.hidden) rich.innerHTML = textToHtml(body.value);
+      if (bodyHtml && oldHtml && bodyHtml.value.slice(-oldHtml.length) === oldHtml) {
+        bodyHtml.value = bodyHtml.value.slice(0, -oldHtml.length) + newHtml;
+      }
+      syncRich();
+      changed = true;
+    } else if (!oldText && !oldHtml && body.value === initialBodyText && html === initialBodyHtml) {
+      if (newHtml && rich && !rich.hidden) {
+        rich.innerHTML = (html || textToHtml(body.value)) + newHtml;
+        syncRich();
+      } else {
+        body.value = body.value + newText;
+        if (rich && !rich.hidden) rich.innerHTML = textToHtml(body.value);
+        syncRich();
+      }
+      changed = !!(newText || newHtml);
+    }
+
+    if (changed) {
+      setCurrentSignature(newText, newHtml);
+      initialSignatureText = newText;
+      initialSignatureHtml = newHtml;
+      scheduleAutosave(800);
+    }
+  }
+  if (identitySelect) {
+    identitySelect.addEventListener('change', replaceSignatureForIdentity);
+    setCurrentSignature(initialSignatureText, initialSignatureHtml);
+  }
+
   var subject = form.querySelector('#subject');
   if (subject) {
     var cc = document.createElement('span'); cc.className = 'charcount';
@@ -678,6 +752,10 @@ pub fn app(state: AppState) -> Router {
             get(settings_rules_redirect).post(settings_rules_post),
         )
         .route("/settings/signature", post(settings_signature))
+        .route(
+            "/settings/signatures",
+            get(settings_signatures_redirect).post(settings_signatures_post),
+        )
         .route("/settings/undo-send", post(settings_undo_send))
         .route("/settings/autoreply", post(settings_autoreply))
         .route(
@@ -1248,7 +1326,11 @@ fn advanced_folder_options(selected: &str) -> String {
 }
 
 fn selected_attr(value: &str, selected: &str) -> &'static str {
-    if value == selected { " selected" } else { "" }
+    if value == selected {
+        " selected"
+    } else {
+        ""
+    }
 }
 
 fn build_advanced_search_query(q: &AdvancedSearchQuery) -> Option<String> {
@@ -3397,7 +3479,11 @@ fn safe_return(path: &str) -> String {
     let ok = p.starts_with('/')
         && !p.starts_with("//")
         && !p.chars().any(|c| c.is_whitespace() || c.is_control());
-    if ok { p.to_string() } else { "/".to_string() }
+    if ok {
+        p.to_string()
+    } else {
+        "/".to_string()
+    }
 }
 
 /// Render the read-view attachment strip: one download link per MIME attachment part enumerated
@@ -3528,6 +3614,84 @@ struct Prefill {
     schedule_at: i64,
 }
 
+fn default_signature_for_identity<'a>(
+    signatures: &'a [Signature],
+    identity: &str,
+) -> Option<&'a Signature> {
+    let wanted = identity.trim();
+    if !wanted.is_empty() {
+        if let Some(sig) = signatures
+            .iter()
+            .filter(|s| s.identity == wanted && s.is_default)
+            .max_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+        {
+            return Some(sig);
+        }
+    }
+    signatures
+        .iter()
+        .filter(|s| s.identity.is_empty() && s.is_default)
+        .max_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        })
+}
+
+fn plain_text_to_compose_html(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!("<p>{}</p>", esc(text).replace('\n', "<br>"))
+}
+
+fn signature_blocks(sig: &Signature) -> (String, String) {
+    let clean_html = crate::sanitize::sanitize_html(&sig.body_html);
+    let body_text = if sig.body_text.trim().is_empty() && !clean_html.trim().is_empty() {
+        crate::sanitize::html_to_text(&clean_html)
+    } else {
+        sig.body_text.trim().to_string()
+    };
+    if body_text.trim().is_empty() && clean_html.trim().is_empty() {
+        return (String::new(), String::new());
+    }
+
+    let text_block = if body_text.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n--\n{}", body_text.trim())
+    };
+    let html_block = if clean_html.trim().is_empty() {
+        plain_text_to_compose_html(&text_block)
+    } else {
+        format!("<p><br></p><p>--</p>{clean_html}")
+    };
+    (text_block, html_block)
+}
+
+fn append_signature_to_prefill(pre: &mut Prefill, sig: &Signature) -> (String, String) {
+    let (sig_text, sig_html) = signature_blocks(sig);
+    if sig_text.is_empty() && sig_html.is_empty() {
+        return (String::new(), String::new());
+    }
+    let base_text = pre.body.clone();
+    pre.body.push_str(&sig_text);
+    if !sig_html.trim().is_empty() && !sig.body_html.trim().is_empty() {
+        let base_html = if pre.body_html.trim().is_empty() {
+            plain_text_to_compose_html(&base_text)
+        } else {
+            crate::sanitize::sanitize_html(&pre.body_html)
+        };
+        pre.body_html = format!("{base_html}{sig_html}");
+    }
+    (sig_text, sig_html)
+}
+
 async fn compose_form(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3541,16 +3705,6 @@ async fn compose_form(
 
     // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
     let mut pre = build_prefill(&state, &mb, &q).await;
-    // Per-mailbox signature: appended to every draft (blank compose, reply, forward) as the
-    // conventional `--` delimited block. Best effort — a settings read failure just skips it.
-    if pre.draft_id.is_empty() {
-        if let Ok(settings) = state.store.get_settings(&mb.addr).await {
-            let sig = settings.signature.trim();
-            if !sig.is_empty() {
-                pre.body.push_str(&format!("\n\n--\n{sig}"));
-            }
-        }
-    }
 
     // The "From" selector: the mailbox's own address (implicit default) plus any owned identities.
     let identities = state
@@ -3558,10 +3712,39 @@ async fn compose_form(
         .list_send_identities(&mb.addr)
         .await
         .unwrap_or_default();
+    let signatures = state
+        .store
+        .list_signatures(&mb.addr)
+        .await
+        .unwrap_or_default();
     let default_selected = !identities.iter().any(|i| i.is_default);
+    let selected_identity_addr = identities
+        .iter()
+        .find(|i| i.is_default)
+        .map(|i| i.from_addr.as_str())
+        .unwrap_or(mb.addr.as_str());
+    let mut current_signature_text = String::new();
+    let mut current_signature_html = String::new();
+    // Per-identity signature: appended to new drafts (blank compose, reply, forward) as the
+    // conventional `--` delimited block. Editing an existing Drafts row or scheduled send keeps
+    // the stored body unchanged.
+    if pre.draft_id.is_empty() && pre.scheduled_batch_id.is_empty() {
+        if let Some(sig) = default_signature_for_identity(&signatures, selected_identity_addr) {
+            let (text, html) = append_signature_to_prefill(&mut pre, sig);
+            current_signature_text = text;
+            current_signature_html = html;
+        }
+    }
+    let (mailbox_sig_text, mailbox_sig_html) =
+        default_signature_for_identity(&signatures, &mb.addr)
+            .map(signature_blocks)
+            .unwrap_or_default();
     let mut from_options = format!(
-        r#"<option value=""{sel}>{addr}</option>"#,
+        r#"<option value="" data-identity-addr="{identity}" data-signature-text="{sig_text}" data-signature-html="{sig_html}"{sel}>{addr}</option>"#,
         addr = esc(&mb.addr),
+        identity = esc(&mb.addr),
+        sig_text = url_encode(&mailbox_sig_text),
+        sig_html = url_encode(&mailbox_sig_html),
         sel = if default_selected { " selected" } else { "" },
     );
     for idn in &identities {
@@ -3570,9 +3753,15 @@ async fn compose_form(
         } else {
             format!("{} <{}>", idn.display_name, idn.from_addr)
         };
+        let (sig_text, sig_html) = default_signature_for_identity(&signatures, &idn.from_addr)
+            .map(signature_blocks)
+            .unwrap_or_default();
         from_options.push_str(&format!(
-            r#"<option value="{id}"{sel}>{label}</option>"#,
+            r#"<option value="{id}" data-identity-addr="{identity}" data-signature-text="{sig_text}" data-signature-html="{sig_html}"{sel}>{label}</option>"#,
             id = esc(&idn.id),
+            identity = esc(&idn.from_addr),
+            sig_text = url_encode(&sig_text),
+            sig_html = url_encode(&sig_html),
             label = esc(&label),
             sel = if idn.is_default { " selected" } else { "" },
         ));
@@ -3587,7 +3776,7 @@ async fn compose_form(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
 <section class="card pad">
   <div class="page-head"><h1>New message</h1></div>
-  <form method="post" action="/send" enctype="multipart/form-data">
+  <form method="post" action="/send" enctype="multipart/form-data" data-current-signature-text="{current_signature_text}" data-current-signature-html="{current_signature_html}">
     <input type="hidden" name="csrf" value="{token}">
     <input type="hidden" name="in_reply_to" value="{in_reply_to}">
     <input type="hidden" name="references" value="{references}">
@@ -3646,6 +3835,8 @@ async fn compose_form(
         attachment_refs = esc(&pre.attachment_refs),
         attachment_list = pre.attachment_list,
         scheduled_batch_id = esc(&pre.scheduled_batch_id),
+        current_signature_text = url_encode(&current_signature_text),
+        current_signature_html = url_encode(&current_signature_html),
         schedule_controls = schedule_controls_for(now_secs(), pre.schedule_at),
         template_controls = render_compose_template_controls(&templates),
     );
@@ -5105,6 +5296,16 @@ async fn settings_page(
         .list_send_identities(&mb.addr)
         .await
         .unwrap_or_default();
+    let signatures = match state.store.list_signatures(&mb.addr).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
     let contacts = state
         .store
         .suggest_contacts(&mb.addr, "", 200)
@@ -5202,20 +5403,13 @@ async fn settings_page(
 {labels_section}
 {identities_section}
 {contacts_section}
+{signatures_section}
 <section class="card pad undo-send-settings">
   <h2>Undo send</h2>
   <form method="post" action="/settings/undo-send">
     <input type="hidden" name="csrf" value="{token}">
     <div class="field"><label for="undo_send_window_secs">Cancellation period</label><select id="undo_send_window_secs" name="window_secs">{undo_window_opts}</select><p class="hint">Messages wait in the outbound queue for this period before delivery.</p></div>
     <div class="form-actions"><button class="btn btn-primary" type="submit">Save undo send</button></div>
-  </form>
-</section>
-<section class="card pad">
-  <h2>Signature</h2>
-  <form method="post" action="/settings/signature">
-    <input type="hidden" name="csrf" value="{token}">
-    <div class="field"><label for="signature">Signature</label><textarea id="signature" name="signature">{sig}</textarea><p class="hint">Appended to new messages and replies below a "--" delimiter. Leave empty for none.</p></div>
-    <div class="form-actions"><button class="btn btn-primary" type="submit">Save signature</button></div>
   </form>
 </section>
 <section class="card pad">
@@ -5231,7 +5425,6 @@ async fn settings_page(
 </section>"#,
         token = esc(&token),
         rule_needle = esc(rule_needle),
-        sig = esc(&settings.signature),
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
@@ -5240,6 +5433,7 @@ async fn settings_page(
         labels_section = render_labels_section(&labels, &token),
         senders_section = render_sender_lists_section(&sender_lists, &token),
         identities_section = render_identities_section(&identities, &mb.addr, &token),
+        signatures_section = render_signatures_section(&signatures, &identities, &mb.addr, &token),
         contacts_section = render_contacts_section(&contacts, &token),
     );
     let html = render_page("Settings", &email, &content, "settings");
@@ -5628,6 +5822,318 @@ async fn settings_signature(
         "signature updated",
     );
     Redirect::to("/settings").into_response()
+}
+
+/// `GET /settings/signatures` — signatures are managed on the main settings page.
+async fn settings_signatures_redirect() -> Response {
+    Redirect::to("/settings#signatures").into_response()
+}
+
+fn render_signature_identity_options(
+    identities: &[crate::model::SendIdentity],
+    mailbox: &str,
+    selected: &str,
+) -> String {
+    let mut opts = String::new();
+    let general_selected = selected.trim().is_empty();
+    opts.push_str(&format!(
+        r#"<option value=""{sel}>General default</option>"#,
+        sel = if general_selected { " selected" } else { "" },
+    ));
+    opts.push_str(&format!(
+        r#"<option value="{addr}"{sel}>{addr}</option>"#,
+        addr = esc(mailbox),
+        sel = if selected == mailbox { " selected" } else { "" },
+    ));
+    let mut known = selected.trim().is_empty() || selected == mailbox;
+    for i in identities {
+        if i.from_addr == selected {
+            known = true;
+        }
+        let label = if i.display_name.trim().is_empty() {
+            i.from_addr.clone()
+        } else {
+            format!("{} <{}>", i.display_name, i.from_addr)
+        };
+        opts.push_str(&format!(
+            r#"<option value="{addr}"{sel}>{label}</option>"#,
+            addr = esc(&i.from_addr),
+            label = esc(&label),
+            sel = if i.from_addr == selected {
+                " selected"
+            } else {
+                ""
+            },
+        ));
+    }
+    if !known {
+        opts.push_str(&format!(
+            r#"<option value="{addr}" selected>{addr}</option>"#,
+            addr = esc(selected)
+        ));
+    }
+    opts
+}
+
+fn render_signatures_section(
+    signatures: &[Signature],
+    identities: &[crate::model::SendIdentity],
+    mailbox: &str,
+    token: &str,
+) -> String {
+    let mut list = String::new();
+    if signatures.is_empty() {
+        list.push_str(r#"<p class="muted">No signatures yet.</p>"#);
+    }
+    for (i, s) in signatures.iter().enumerate() {
+        let class = if s.is_default {
+            "signature-item signature-default"
+        } else {
+            "signature-item"
+        };
+        let checked = if s.is_default { " checked" } else { "" };
+        let identity_opts = render_signature_identity_options(identities, mailbox, &s.identity);
+        list.push_str(&format!(
+            r#"<div class="{class}">
+  <form method="post" action="/settings/signatures">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="id" value="{id}">
+    <div class="field"><label for="sig_name_{i}">Name</label><input id="sig_name_{i}" name="name" value="{name}"></div>
+    <div class="field"><label for="sig_identity_{i}">From identity</label><select id="sig_identity_{i}" name="identity">{identity_opts}</select></div>
+    <div class="field"><label for="sig_body_{i}">Plain text</label><textarea id="sig_body_{i}" name="body_text">{body_text}</textarea></div>
+    <div class="field"><label for="sig_html_{i}">Rich HTML</label><textarea id="sig_html_{i}" name="body_html">{body_html}</textarea></div>
+    <div class="field"><label><input type="checkbox" name="is_default" value="on"{checked}> Default for this identity</label></div>
+    <div class="form-actions">
+      <button class="btn btn-primary btn-sm" type="submit" name="cmd" value="update">Save signature</button>
+      <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+    </div>
+  </form>
+</div>"#,
+            token = esc(token),
+            id = esc(&s.id),
+            name = esc(&s.name),
+            body_text = esc(&s.body_text),
+            body_html = esc(&s.body_html),
+        ));
+    }
+    let identity_opts = render_signature_identity_options(identities, mailbox, "");
+    format!(
+        r#"<section id="signatures" class="card pad signature-list">
+  <h2>Signatures</h2>
+  <div class="signature-list__items">{list}</div>
+  <form class="signature-create" method="post" action="/settings/signatures">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="sig_new_name">Name</label><input id="sig_new_name" name="name" placeholder="Default"></div>
+    <div class="field"><label for="sig_new_identity">From identity</label><select id="sig_new_identity" name="identity">{identity_opts}</select></div>
+    <div class="field"><label for="sig_new_body">Plain text</label><textarea id="sig_new_body" name="body_text"></textarea></div>
+    <div class="field"><label for="sig_new_html">Rich HTML</label><textarea id="sig_new_html" name="body_html"></textarea></div>
+    <div class="field"><label><input type="checkbox" name="is_default" value="on" checked> Default for this identity</label></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add signature</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+/// Form body for `POST /settings/signatures`: add/update/delete a reusable compose signature.
+#[derive(Deserialize, Default)]
+struct SignatureCrudForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    identity: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    body_text: String,
+    #[serde(default)]
+    body_html: String,
+    #[serde(default)]
+    is_default: String,
+}
+
+enum SignatureFormError {
+    Invalid(String),
+    Store(crate::store::StoreError),
+}
+
+async fn settings_signatures_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SignatureCrudForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let identities = match state.store.list_send_identities(&mb.addr).await {
+        Ok(v) => v,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
+    let result = match form.cmd.as_str() {
+        "delete" => state
+            .store
+            .delete_signature(&mb.addr, form.id.trim())
+            .await
+            .map_err(SignatureFormError::Store),
+        "update" => update_signature_from_form(&state, &mb.addr, &identities, &form).await,
+        "" | "add" => create_signature_from_form(&state, &mb.addr, &identities, &form).await,
+        _ => Err(SignatureFormError::Invalid(
+            "Unknown signature command.".to_string(),
+        )),
+    };
+    if let Err(e) = result {
+        return match e {
+            SignatureFormError::Invalid(message) => {
+                error_page(StatusCode::BAD_REQUEST, "Invalid request", &message)
+            }
+            SignatureFormError::Store(e) => error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            ),
+        };
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        signature = %form.id,
+        "signature change",
+    );
+    Redirect::to("/settings#signatures").into_response()
+}
+
+async fn create_signature_from_form(
+    state: &AppState,
+    mailbox: &str,
+    identities: &[crate::model::SendIdentity],
+    form: &SignatureCrudForm,
+) -> Result<(), SignatureFormError> {
+    let name = signature_name(&form.name)?;
+    let identity = signature_identity(&form.identity, mailbox, identities)?;
+    let (body_text, body_html) = signature_body_parts(&form.body_text, &form.body_html)?;
+    let signature = Signature {
+        id: new_id("sig"),
+        user: mailbox.to_string(),
+        identity,
+        name,
+        body_html,
+        body_text,
+        is_default: !form.is_default.trim().is_empty(),
+        created_at: now_secs(),
+    };
+    state
+        .store
+        .create_signature(&signature)
+        .await
+        .map_err(SignatureFormError::Store)
+}
+
+async fn update_signature_from_form(
+    state: &AppState,
+    mailbox: &str,
+    identities: &[crate::model::SendIdentity],
+    form: &SignatureCrudForm,
+) -> Result<(), SignatureFormError> {
+    let id = form.id.trim();
+    let Some(existing) = state
+        .store
+        .get_signature(mailbox, id)
+        .await
+        .map_err(SignatureFormError::Store)?
+    else {
+        return Err(SignatureFormError::Invalid(
+            "No such signature.".to_string(),
+        ));
+    };
+    let name = signature_name(&form.name)?;
+    let identity = signature_identity(&form.identity, mailbox, identities)?;
+    let (body_text, body_html) = signature_body_parts(&form.body_text, &form.body_html)?;
+    let signature = Signature {
+        id: existing.id,
+        user: mailbox.to_string(),
+        identity,
+        name,
+        body_html,
+        body_text,
+        is_default: !form.is_default.trim().is_empty(),
+        created_at: existing.created_at,
+    };
+    state
+        .store
+        .update_signature(&signature)
+        .await
+        .map_err(SignatureFormError::Store)
+}
+
+fn signature_name(raw: &str) -> Result<String, SignatureFormError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(SignatureFormError::Invalid(
+            "A signature name is required.".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn signature_identity(
+    raw: &str,
+    mailbox: &str,
+    identities: &[crate::model::SendIdentity],
+) -> Result<String, SignatureFormError> {
+    let identity = raw.trim();
+    if identity.is_empty() {
+        return Ok(String::new());
+    }
+    if identity.eq_ignore_ascii_case(mailbox)
+        || identities
+            .iter()
+            .any(|i| i.from_addr.eq_ignore_ascii_case(identity))
+    {
+        return Ok(identity.to_lowercase());
+    }
+    Err(SignatureFormError::Invalid(
+        "That From identity is not available for this mailbox.".to_string(),
+    ))
+}
+
+fn signature_body_parts(
+    body_text: &str,
+    body_html: &str,
+) -> Result<(String, String), SignatureFormError> {
+    let clean_html = crate::sanitize::sanitize_html(body_html);
+    if clean_html.trim().is_empty() {
+        let text = body_text.trim();
+        if text.is_empty() {
+            return Err(SignatureFormError::Invalid(
+                "A signature body is required.".to_string(),
+            ));
+        }
+        return Ok((text.to_string(), String::new()));
+    }
+    let text = if body_text.trim().is_empty() {
+        crate::sanitize::html_to_text(&clean_html)
+    } else {
+        body_text.trim().to_string()
+    };
+    Ok((text, clean_html))
 }
 
 /// Form body for `POST /settings/undo-send`.
@@ -6943,16 +7449,12 @@ mod tests {
 
         let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
         assert_eq!(due.len(), 1);
-        assert!(
-            due[0]
-                .raw
-                .contains("Content-Type: multipart/alternative; boundary=")
-        );
-        assert!(
-            due[0]
-                .raw
-                .contains("Content-Type: text/html; charset=utf-8")
-        );
+        assert!(due[0]
+            .raw
+            .contains("Content-Type: multipart/alternative; boundary="));
+        assert!(due[0]
+            .raw
+            .contains("Content-Type: text/html; charset=utf-8"));
         assert!(due[0].raw.contains("<strong>rich</strong>"));
         assert!(!due[0].raw.contains("<script"));
         assert!(!due[0].raw.contains("alert(1)"));
