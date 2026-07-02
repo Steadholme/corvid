@@ -1128,3 +1128,76 @@ mark.search-hit {
    drops its auto-margin so the button row is left untouched. */
 .autosave-status:empty { margin-left:0; opacity:0; }
 .autosave-status:empty::before { display:none; }
+
+/* ============================================================================
+   Message body — inline images + quote folding
+   Visual layer for the SSR `.msg-body` container (webmail.rs): sanitized inline
+   HTML with <img src="/m/…/attachments/…">, gmail quotes wrapped in
+   <blockquote>, and a <details class="quote-fold"> whose <summary
+   class="btn-expand-quote"> reads "··· Show quoted text". Tokens only — dark and
+   reduced-motion follow the global rules already defined above.
+   ============================================================================ */
+
+/* Inline images never break the reading column. Extends the earlier
+   `.msg-body img` rule (same specificity, defined later → wins) with height:auto
+   so scaled-down images keep their aspect ratio, plus a soft corner. */
+.msg-body img {
+  max-width:100%; height:auto;
+  border-radius:var(--r-xs);
+}
+
+/* Body typography — readable paragraph rhythm without fighting sanitized inline
+   styles. Last block drops its trailing margin so the frame stays tight. */
+.msg-body p { margin:0 0 12px; }
+.msg-body p:last-child { margin-bottom:0; }
+.msg-body ul, .msg-body ol { margin:0 0 12px; padding-left:22px; }
+.msg-body li { margin:2px 0; }
+
+/* Links stand out in body copy (global `a` is underline-less; here we underline
+   for scan-ability against arbitrary sender markup). */
+.msg-body a {
+  color:var(--accent-ink);
+  text-decoration:underline; text-underline-offset:2px;
+  text-decoration-thickness:1px;
+}
+.msg-body a:hover { color:var(--accent); }
+
+/* Quoted HTML — a weakened, left-ruled block that visually recedes behind the
+   new message text. Also tames the browser default 40px blockquote indent. */
+.msg-body blockquote {
+  margin:8px 0; padding:2px 0 2px 14px;
+  border-left:2px solid var(--border-2);
+  color:var(--ink-2);
+}
+
+/* ---- Collapsed quote control (Gmail-style restrained "···") ---------------- */
+.msg-body .quote-fold { margin:14px 0; }
+
+.msg-body .btn-expand-quote {
+  display:inline-flex; align-items:center;
+  cursor:pointer; user-select:none;
+  list-style:none;                      /* Firefox: drop the disclosure triangle */
+  padding:2px 12px;
+  border-radius:var(--r-pill);
+  font-size:13px; line-height:1.4;
+  color:var(--ink-3);                   /* weakened — a quiet affordance, not a headline */
+  background:var(--surface-2);
+  transition:background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+/* WebKit/Blink: drop the disclosure triangle */
+.msg-body .btn-expand-quote::-webkit-details-marker { display:none; }
+.msg-body .btn-expand-quote:hover { background:var(--surface-3); color:var(--ink-2); }
+/* Keyboard reachable + visible focus (summary is natively focusable). */
+.msg-body .btn-expand-quote:focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+
+/* ---- Expanded quote body -------------------------------------------------- */
+/* Once open, separate the control from the revealed quote. */
+.msg-body .quote-fold[open] > .btn-expand-quote { margin-bottom:8px; }
+/* Non-blockquote / non-pre quoted content (divs, paragraphs) still reads as a
+   quote: same weakened left rule as `.msg-body blockquote`. blockquote/pre keep
+   their own styling (pre already carries a full surface + border above). */
+.msg-body .quote-fold[open] > :not(.btn-expand-quote):not(blockquote):not(pre) {
+  padding:2px 0 2px 14px;
+  border-left:2px solid var(--border-2);
+  color:var(--ink-2);
+}
