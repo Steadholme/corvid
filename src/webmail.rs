@@ -128,6 +128,257 @@ const COMPOSE_JS: &str = r#"
   });
 })();
 "#;
+/// Shared, dependency-free toast helper. Defines `window.__corvidToast(msg, kind)` used by the
+/// webmail + compose enhancement scripts. Remote/dynamic strings are written with `textContent`
+/// (never innerHTML). The host is an ARIA live region so success/failure feedback is announced.
+const TOAST_JS: &str = r#"
+window.__corvidToast = function (msg, kind) {
+  var host = document.getElementById('toast-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'toast-host'; host.className = 'toast-host';
+    host.setAttribute('aria-live', 'polite'); host.setAttribute('role', 'status');
+    document.body.appendChild(host);
+  }
+  var t = document.createElement('div');
+  t.className = 'toast' + (kind === 'ok' ? ' toast--ok' : kind === 'err' ? ' toast--err' : '');
+  var s = document.createElement('span'); s.textContent = msg; t.appendChild(s);
+  host.appendChild(t);
+  requestAnimationFrame(function () { t.classList.add('is-in'); });
+  setTimeout(function () {
+    t.classList.remove('is-in');
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 220);
+  }, 3000);
+};
+"#;
+
+/// Webmail progressive-enhancement layer (inbox list + read/conversation views). Everything here
+/// is ADDITIVE: with JS off, the original `<form>` POSTs still work. It provides:
+/// - optimistic per-message actions (star / mark-read / archive / delete / move) via `fetch()` to
+///   the JSON siblings of the form routes, rolling back + toasting on failure;
+/// - checkbox multi-select + a sticky bulk toolbar (mark-read / archive / move / delete);
+/// - keyboard nav (j/k prev-next, e archive, # delete, r reply, x select, Enter open);
+/// - collapse/expand for older messages in a conversation.
+///
+/// Remote strings are only ever written with `textContent`.
+const WEBMAIL_JS: &str = r#"
+(function () {
+  var toast = window.__corvidToast || function () {};
+  function apiUrl(form) { try { return '/api' + new URL(form.action, location.origin).pathname; } catch (e) { return null; } }
+  function field(form, name) { var el = form.querySelector('[name=' + name + ']'); return el ? el.value : ''; }
+  function post(url, params) {
+    var body = new URLSearchParams();
+    Object.keys(params).forEach(function (k) { body.append(k, params[k]); });
+    return fetch(url, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: body.toString()
+    }).then(function (r) { return r.ok; });
+  }
+
+  // ---- optimistic per-message actions ------------------------------------
+  function inverse(op) { return op === 'star' ? 'unstar' : op === 'unstar' ? 'star' : op === 'unread' ? 'read' : 'unread'; }
+  function applyToggle(row, form, op) {
+    if (op === 'star' || op === 'unstar') {
+      var on = op === 'star';
+      var btn = form.querySelector('button[name=op][value=star],button[name=op][value=unstar]');
+      if (btn) { btn.value = on ? 'unstar' : 'star'; btn.title = on ? 'Unstar' : 'Star'; btn.textContent = on ? '★' : '☆'; }
+      if (row) {
+        row.setAttribute('data-starred', on ? 'true' : 'false');
+        var subj = row.querySelector('.mailrow .subject');
+        if (subj) {
+          var st = subj.querySelector('.star');
+          if (on && !st) {
+            var sp = document.createElement('span'); sp.className = 'star on';
+            sp.setAttribute('aria-label', 'starred'); sp.textContent = '★';
+            subj.insertBefore(document.createTextNode(' '), subj.firstChild);
+            subj.insertBefore(sp, subj.firstChild);
+          } else if (!on && st) { st.remove(); }
+        }
+      }
+    } else if (op === 'unread' || op === 'read') {
+      if (row) {
+        var mr = row.querySelector('.mailrow');
+        if (mr) {
+          mr.classList.toggle('unseen', op === 'unread');
+          var dot = mr.querySelector('.dot'); if (dot) { dot.className = op === 'unread' ? 'dot' : 'dot seen'; }
+        }
+        row.setAttribute('data-seen', op === 'read' ? 'true' : 'false');
+      }
+      var ub = form.querySelector('button[name=op][value=read],button[name=op][value=unread]');
+      if (ub) {
+        var toUnread = op === 'unread';
+        ub.value = toUnread ? 'read' : 'unread';
+        ub.title = toUnread ? 'Mark read' : 'Mark unread';
+        ub.textContent = toUnread ? 'Read' : 'Unread';
+      }
+    }
+  }
+  function enhanceAction(form) {
+    form.addEventListener('submit', function (e) {
+      var btn = e.submitter; if (!btn || btn.name !== 'op') return;
+      var op = btn.value, url = apiUrl(form); if (!url) return;
+      var row = form.closest('.mailrow-wrap'), inList = !!form.closest('.maillist');
+      if (op === 'star' || op === 'unstar' || op === 'read' || op === 'unread') {
+        e.preventDefault();
+        applyToggle(row, form, op);
+        post(url, { csrf: field(form, 'csrf'), op: op }).then(function (ok) {
+          if (!ok) { applyToggle(row, form, inverse(op)); toast('Action failed', 'err'); }
+        }).catch(function () { applyToggle(row, form, inverse(op)); toast('Action failed', 'err'); });
+        return;
+      }
+      if (op === 'archive' || op === 'delete' || op === 'move') {
+        var folder = op === 'move' ? field(form, 'folder') : '';
+        if (op === 'move' && !folder) { e.preventDefault(); toast('Choose a folder to move to', 'err'); return; }
+        if (inList && row) {
+          e.preventDefault();
+          var parent = row.parentNode, next = row.nextSibling;
+          row.remove();
+          post(url, { csrf: field(form, 'csrf'), op: op, folder: folder }).then(function (ok) {
+            if (ok) { toast(op === 'delete' ? 'Moved to Trash' : op === 'archive' ? 'Archived' : 'Moved', 'ok'); }
+            else { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); }
+          }).catch(function () { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); });
+        }
+        // read view (not in a list): fall through to the native form POST + navigation.
+      }
+    });
+  }
+  document.querySelectorAll('form.row-actions').forEach(function (form) {
+    if (/\/m\/[^/]+\/action$/.test(form.getAttribute('action') || '')) enhanceAction(form);
+  });
+
+  // ---- multi-select + sticky bulk toolbar --------------------------------
+  var bar = document.querySelector('[data-bulkbar]');
+  if (bar) {
+    var checks = Array.prototype.slice.call(document.querySelectorAll('.rowcheck'));
+    var countEl = bar.querySelector('[data-bulk-count]');
+    function selectedRows() { return Array.prototype.slice.call(document.querySelectorAll('.mailrow-wrap.is-selected')); }
+    function refresh() { var n = selectedRows().length; if (countEl) countEl.textContent = n + ' selected'; bar.hidden = n === 0; }
+    function clearAll() { checks.forEach(function (c) { c.checked = false; var r = c.closest('.mailrow-wrap'); if (r) r.classList.remove('is-selected'); }); refresh(); }
+    checks.forEach(function (c) {
+      c.addEventListener('change', function () { var r = c.closest('.mailrow-wrap'); if (r) r.classList.toggle('is-selected', c.checked); refresh(); });
+    });
+    var clearBtn = bar.querySelector('[data-bulk-clear]'); if (clearBtn) clearBtn.addEventListener('click', clearAll);
+    bar.querySelectorAll('[data-bulk]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var op = b.getAttribute('data-bulk'), rows = selectedRows(); if (!rows.length) return;
+        var ids = rows.map(function (r) { return r.getAttribute('data-id'); }).filter(Boolean);
+        var csrf = bar.getAttribute('data-csrf');
+        if (op === 'read') {
+          var changed = rows.map(function (r) {
+            var mr = r.querySelector('.mailrow'), was = mr && mr.classList.contains('unseen');
+            if (mr) { mr.classList.remove('unseen'); var d = mr.querySelector('.dot'); if (d) d.className = 'dot seen'; }
+            r.setAttribute('data-seen', 'true'); return { row: r, was: was };
+          });
+          post('/api/m/bulk', { csrf: csrf, op: op, ids: ids.join(',') }).then(function (ok) {
+            if (ok) { toast(ids.length + ' marked read', 'ok'); clearAll(); }
+            else { changed.forEach(function (c) { if (c.was) { var mr = c.row.querySelector('.mailrow'); if (mr) { mr.classList.add('unseen'); var d = mr.querySelector('.dot'); if (d) d.className = 'dot'; } } }); toast('Bulk action failed', 'err'); }
+          }).catch(function () { toast('Bulk action failed', 'err'); });
+          return;
+        }
+        var folder = '';
+        if (op === 'move') { var sel = bar.querySelector('[data-bulk-folder]'); folder = sel ? sel.value : ''; if (!folder) { toast('Choose a folder to move to', 'err'); return; } }
+        var det = rows.map(function (r) { return { row: r, parent: r.parentNode, next: r.nextSibling }; });
+        det.forEach(function (d) { d.row.remove(); });
+        post('/api/m/bulk', { csrf: csrf, op: op, folder: folder, ids: ids.join(',') }).then(function (ok) {
+          if (ok) { toast(ids.length + ' ' + (op === 'delete' ? 'deleted' : op === 'archive' ? 'archived' : 'moved'), 'ok'); clearAll(); }
+          else { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); }
+        }).catch(function () { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); });
+      });
+    });
+    refresh();
+  }
+
+  // ---- keyboard navigation (list views) ----------------------------------
+  var list = document.querySelector('.maillist');
+  if (list) {
+    function rows() { return Array.prototype.slice.call(list.querySelectorAll('.mailrow-wrap')); }
+    function cursorIndex(rs) { for (var i = 0; i < rs.length; i++) if (rs[i].classList.contains('is-cursor')) return i; return -1; }
+    function setCursor(i) { var rs = rows(); if (!rs.length) return; if (i < 0) i = 0; if (i >= rs.length) i = rs.length - 1; rs.forEach(function (r) { r.classList.remove('is-cursor'); }); rs[i].classList.add('is-cursor'); rs[i].scrollIntoView({ block: 'nearest' }); }
+    document.addEventListener('keydown', function (e) {
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      var t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      var rs = rows(); if (!rs.length) return; var i = cursorIndex(rs), cur = i >= 0 ? rs[i] : null;
+      function clickBtn(val) { if (!cur || !cur.getAttribute('data-id')) return; var b = cur.querySelector('button[name=op][value=' + val + ']'); if (b) { e.preventDefault(); b.click(); setCursor(Math.min(i, rows().length - 1)); } }
+      switch (e.key) {
+        case 'j': e.preventDefault(); setCursor(i < 0 ? 0 : i + 1); break;
+        case 'k': e.preventDefault(); setCursor(i < 0 ? 0 : i - 1); break;
+        case 'Enter': if (cur) { var a = cur.querySelector('a.mailrow'); if (a) { e.preventDefault(); location.href = a.getAttribute('href'); } } break;
+        case 'x': if (cur) { var c = cur.querySelector('.rowcheck'); if (c) { e.preventDefault(); c.checked = !c.checked; c.dispatchEvent(new Event('change', { bubbles: true })); } } break;
+        case 'e': clickBtn('archive'); break;
+        case '#': clickBtn('delete'); break;
+        case 'r': if (cur && cur.getAttribute('data-id')) { e.preventDefault(); location.href = '/compose?reply=' + encodeURIComponent(cur.getAttribute('data-id')); } break;
+      }
+    });
+  }
+
+  // ---- conversation collapse/expand --------------------------------------
+  var convo = Array.prototype.slice.call(document.querySelectorAll('[data-convo-item]'));
+  if (convo.length > 1) {
+    convo.forEach(function (item, idx) {
+      var toggle = item.querySelector('[data-convo-toggle]'); if (!toggle) return;
+      function set(collapsed) { item.classList.toggle('is-collapsed', collapsed); toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true'); toggle.textContent = collapsed ? 'Expand' : 'Collapse'; }
+      if (idx < convo.length - 1) set(true);
+      toggle.addEventListener('click', function () { set(!item.classList.contains('is-collapsed')); });
+    });
+  }
+})();
+"#;
+
+/// Compose-form enhancement layer (additive; the plain form still submits with JS off). Adds a
+/// subject character counter, an in-flight ("Sending…"/"Saving…") button state, a client-side
+/// recipient check before send, and a blur-rendered recipient-chip reflection of the To/Cc fields
+/// (the text inputs stay the canonical `name=` source of truth).
+const COMPOSE_UX_JS: &str = r#"
+(function () {
+  var toast = window.__corvidToast || function () {};
+  var form = document.querySelector('form[action="/send"]'); if (!form) return;
+
+  var subject = form.querySelector('#subject');
+  if (subject) {
+    var cc = document.createElement('span'); cc.className = 'charcount';
+    subject.insertAdjacentElement('afterend', cc);
+    var MAX = 200;
+    function upd() { var n = subject.value.length; cc.textContent = n + ' / ' + MAX; cc.classList.toggle('over', n > MAX); }
+    subject.addEventListener('input', upd); upd();
+  }
+
+  function chipify(input) {
+    if (!input) return;
+    var combo = input.closest('.combo') || input;
+    var wrap = document.createElement('div'); wrap.className = 'chips'; wrap.hidden = true;
+    combo.parentNode.insertBefore(wrap, combo.nextSibling);
+    function tokens() { return input.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean); }
+    function render() {
+      wrap.textContent = ''; var list = tokens();
+      list.forEach(function (tok, idx) {
+        var chip = document.createElement('span'); chip.className = 'chip';
+        var lbl = document.createElement('span'); lbl.textContent = tok; chip.appendChild(lbl);
+        var x = document.createElement('button'); x.type = 'button'; x.className = 'chip__x';
+        x.setAttribute('aria-label', 'Remove ' + tok); x.textContent = '×';
+        x.addEventListener('click', function () { var l = tokens(); l.splice(idx, 1); input.value = l.length ? l.join(', ') + ', ' : ''; render(); input.focus(); });
+        chip.appendChild(x); wrap.appendChild(chip);
+      });
+      wrap.hidden = list.length === 0;
+    }
+    input.addEventListener('input', function () { wrap.hidden = true; });
+    input.addEventListener('blur', function () { setTimeout(render, 160); });
+    render();
+  }
+  chipify(form.querySelector('#to'));
+  chipify(form.querySelector('#cc'));
+
+  form.addEventListener('submit', function (e) {
+    var btn = e.submitter, action = btn ? btn.value : 'send';
+    if (action === 'send') {
+      var to = form.querySelector('#to');
+      if (to && !to.value.trim()) { e.preventDefault(); toast('Add at least one recipient', 'err'); to.focus(); return; }
+    }
+    // Disable AFTER the submit is queued so the submitter's name/value still posts.
+    if (btn) setTimeout(function () { btn.disabled = true; btn.classList.add('is-busy'); btn.textContent = action === 'draft' ? 'Saving…' : 'Sending…'; }, 0);
+  });
+})();
+"#;
 const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 const CSRF_COOKIE: &str = "__Host-csrf";
 
@@ -158,12 +409,19 @@ pub fn app(state: AppState) -> Router {
         .route("/t", get(conversation))
         .route("/m/{id}", get(read_message))
         .route("/m/{id}/action", post(message_action))
+        // JSON siblings of the form routes above — progressive enhancement for the optimistic,
+        // no-reload row/bulk actions. Same double-submit CSRF + owner authz + audit; small JSON out.
+        .route("/api/m/{id}/action", post(api_message_action))
+        .route("/api/m/bulk", post(api_bulk_action))
         .route("/m/{id}/labels", post(message_labels_post))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
         .route("/api/send", post(api_send))
         .route("/contacts/suggest", get(contacts_suggest))
+        // Progressive-enhancement JS, served as cacheable static assets (never inlined).
+        .route("/assets/webmail.js", get(asset_webmail_js))
+        .route("/assets/compose.js", get(asset_compose_js))
         .route("/settings", get(settings_page))
         .route("/settings/rules", get(settings_rules_redirect).post(settings_rules_post))
         .route("/settings/signature", post(settings_signature))
@@ -213,6 +471,31 @@ async fn require_gateway_sig(
 
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// `GET /assets/webmail.js` — the inbox/read/conversation progressive-enhancement bundle (toast +
+/// optimistic actions + multi-select bulk toolbar + keyboard nav + conversation collapse). Served
+/// as a cacheable static asset (not inlined) so the pages carry no inline `<script>`.
+async fn asset_webmail_js() -> Response {
+    js_asset(&format!("{TOAST_JS}\n{WEBMAIL_JS}"))
+}
+
+/// `GET /assets/compose.js` — the compose bundle (contacts autocomplete + toast + subject counter,
+/// in-flight send state, and the recipient-chip reflection).
+async fn asset_compose_js() -> Response {
+    js_asset(&format!("{COMPOSE_JS}\n{TOAST_JS}\n{COMPOSE_UX_JS}"))
+}
+
+/// Wrap a JS body in a cacheable `application/javascript` response.
+fn js_asset(body: &str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// Query string for the inbox: an optional `?folder=` selecting which folder/view to list (or
@@ -269,7 +552,10 @@ async fn inbox(
         let return_to = base.clone();
         let mut rows = String::new();
         if msgs.is_empty() {
-            rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages with this label.</span></div></li>"#);
+            rows.push_str(&empty_row(
+                "No messages with this label.",
+                "Apply this label from a message or an \"Add label\" filter rule and it shows up here.",
+            ));
         }
         for m in &msgs {
             rows.push_str(&render_row(m, &token, &return_to));
@@ -278,8 +564,10 @@ async fn inbox(
         let content = format!(
             r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+<section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+<script src="/assets/webmail.js"></script>"#,
             tabs = folder_tabs(&FolderTabs { active: "", search_q: "", scope: None, labels: &labels, active_label: label_id, threads_on: false }),
+            bulk = bulk_toolbar(&token),
         );
         let html = render_page(&label.name, &email, &content, "inbox");
         return match set_cookie {
@@ -299,7 +587,10 @@ async fn inbox(
             };
             let mut rows = String::new();
             if threads.is_empty() {
-                rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No conversations here.</span></div></li>"#);
+                rows.push_str(&empty_row(
+                    "No conversations here.",
+                    "Mail you receive and send groups into conversations automatically.",
+                ));
             }
             for t in &threads {
                 rows.push_str(&render_thread_row(t));
@@ -310,7 +601,8 @@ async fn inbox(
             let content = format!(
                 r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+<script src="/assets/webmail.js"></script>"#,
                 tabs = folder_tabs(&FolderTabs { active: folder, search_q: "", scope: real_folder(folder).filter(|f| *f != "INBOX"), labels: &labels, active_label: "", threads_on: true }),
             );
             let html = render_page(folder, &email, &content, "inbox");
@@ -371,7 +663,12 @@ async fn inbox(
 
     let mut rows = String::new();
     if msgs.is_empty() {
-        rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages here.</span></div></li>"#);
+        let subtext = if folder.is_empty() {
+            "No mail matched your search. Try a different term or clear the search."
+        } else {
+            "This folder is empty. New mail will appear here."
+        };
+        rows.push_str(&empty_row("No messages here.", subtext));
     }
     for m in &msgs {
         rows.push_str(&render_row(m, &token, &return_to));
@@ -380,7 +677,8 @@ async fn inbox(
     let content = format!(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+<section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+<script src="/assets/webmail.js"></script>"#,
         tabs = folder_tabs(&FolderTabs {
             active: folder,
             search_q: search.unwrap_or(""),
@@ -389,6 +687,7 @@ async fn inbox(
             active_label: "",
             threads_on: false,
         }),
+        bulk = bulk_toolbar(&token),
     );
     let title = if folder.is_empty() { "Search" } else { folder };
     let html = render_page(title, &email, &content, "inbox");
@@ -407,11 +706,13 @@ fn render_row(m: &crate::model::MessageSummary, token: &str, return_to: &str) ->
     let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
     let star = star_mark(m.starred);
     format!(
-        r#"<li class="mailrow-wrap"><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap" data-id="{id}" data-starred="{starred}" data-seen="{seen}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
+        starred = m.starred,
+        seen = m.seen,
         from = esc(&display_from(&m.msg_from)),
         date = fmt_date(m.received_at),
-        actions = row_actions(&m.id, m.starred, token, return_to),
+        actions = row_actions(&m.id, m.starred, m.seen, token, return_to),
     )
 }
 
@@ -421,13 +722,16 @@ fn star_mark(starred: bool) -> &'static str {
 }
 
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
-/// button submits the same form with a distinct `op`.
-fn row_actions(id: &str, starred: bool, token: &str, return_to: &str) -> String {
+/// button submits the same form with a distinct `op`. The read/unread button reflects the current
+/// `seen` state (so a read row offers "Unread" and an unread row offers "Read" — the optimistic
+/// mark-read affordance). No-JS users still POST this form; the enhancement layer intercepts it.
+fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str) -> String {
     let (star_op, star_label, star_glyph) = if starred {
         ("unstar", "Unstar", "★")
     } else {
         ("star", "Star", "☆")
     };
+    let (seen_op, seen_label) = if seen { ("unread", "Unread") } else { ("read", "Read") };
     let mut opts = String::new();
     for f in FOLDERS {
         opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
@@ -437,7 +741,7 @@ fn row_actions(id: &str, starred: bool, token: &str, return_to: &str) -> String 
   <input type="hidden" name="csrf" value="{token}">
   <input type="hidden" name="return" value="{ret}">
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{star_op}" title="{star_label}">{star_glyph}</button>
-  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="unread" title="Mark unread">Unread</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{seen_op}" title="Mark {seen_label_lc}">{seen_label}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="archive" title="Archive">Archive</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
   <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Move…</option>{opts}</select>
@@ -446,6 +750,40 @@ fn row_actions(id: &str, starred: bool, token: &str, return_to: &str) -> String 
         id = esc(id),
         token = esc(token),
         ret = esc(return_to),
+        seen_label_lc = seen_label.to_ascii_lowercase(),
+    )
+}
+
+/// An Odyssey v2 `.empty` state as a `maillist` row: soft icon + title + subtext + a primary action.
+/// `title` carries the exact copy older tests assert on (e.g. "No messages here.").
+fn empty_row(title: &str, subtext: &str) -> String {
+    format!(
+        r#"<li class="maillist-empty"><div class="empty"><div class="empty__ico">{ico}</div><h3>{title}</h3><p>{sub}</p><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div></li>"#,
+        ico = ICO_INBOX,
+        title = esc(title),
+        sub = esc(subtext),
+    )
+}
+
+/// The sticky multi-select bulk toolbar (hidden until the enhancement layer reveals it on the first
+/// selection). Buttons are plain `type=button`s driven by [`WEBMAIL_JS`] against `/api/m/bulk`;
+/// `data-csrf` carries the double-submit token. No-JS users never see it (it stays `hidden`).
+fn bulk_toolbar(token: &str) -> String {
+    let mut opts = String::new();
+    for f in FOLDERS {
+        opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
+    }
+    format!(
+        r#"<div class="bulkbar" role="toolbar" aria-label="Bulk actions" data-bulkbar data-csrf="{token}" hidden>
+  <span class="bulkbar__count" data-bulk-count>0 selected</span>
+  <button class="btn btn-ghost btn-sm" type="button" data-bulk="read">Mark read</button>
+  <button class="btn btn-ghost btn-sm" type="button" data-bulk="archive">Archive</button>
+  <select class="move-select" data-bulk-folder aria-label="Move selected to folder"><option value="" selected disabled>Move…</option>{opts}</select>
+  <button class="btn btn-ghost btn-sm" type="button" data-bulk="move">Move</button>
+  <button class="btn btn-ghost btn-sm bulkbar__del" type="button" data-bulk="delete">Delete</button>
+  <button class="btn btn-ghost btn-sm" type="button" data-bulk-clear>Clear</button>
+</div>"#,
+        token = esc(token),
     )
 }
 
@@ -678,8 +1016,9 @@ async fn read_message(
         convo = convo_html,
         labels = labels_html,
         // Read-view actions return to the message so a star/unread toggle stays in context.
-        actions = row_actions(&msg.id, msg.starred, &token, &format!("/m/{}", esc(&msg.id))),
+        actions = row_actions(&msg.id, msg.starred, msg.seen, &token, &format!("/m/{}", esc(&msg.id))),
     );
+    let content = format!("{content}\n<script src=\"/assets/webmail.js\"></script>");
     let html = render_page(&msg.subject, &email, &content, "inbox");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
@@ -759,7 +1098,7 @@ async fn conversation(
         };
         let attachments = render_attachment_list(m);
         blocks.push_str(&format!(
-            r#"<section class="card pad convo-msg">
+            r#"<section class="card pad convo-msg" data-convo-item>
   <header class="msg-head">
     <div class="msg-meta">
       <b>From</b><span>{from}</span>
@@ -767,6 +1106,7 @@ async fn conversation(
       <b>Date</b><span>{date}</span>
     </div>
     <div class="form-actions msg-actions">
+      <button class="btn btn-ghost btn-sm convo-toggle" type="button" data-convo-toggle aria-expanded="true">Collapse</button>
       <a class="btn btn-ghost btn-sm" href="/m/{id}">Open</a>
       <a class="btn btn-ghost btn-sm" href="/compose?reply={id}">Reply</a>
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
@@ -785,7 +1125,8 @@ async fn conversation(
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
 <div class="page-head"><h1>{subject} <span class="pill thread-count">{count}</span></h1><a class="btn btn-primary btn-sm" href="/compose?replyall={latest}">Reply all</a></div>
-{blocks}"#,
+{blocks}
+<script src="/assets/webmail.js"></script>"#,
         count = msgs.len(),
         latest = esc(&latest_id),
     );
@@ -911,6 +1252,136 @@ async fn message_action(
         "message action",
     );
     Redirect::to(&safe_return(&form.return_to)).into_response()
+}
+
+/// Apply a single per-message `op` to `id`, returning the message's resulting (op-implied) state as
+/// a small JSON value on success. Shared by [`api_message_action`] (one message) and
+/// [`api_bulk_action`] (a batch) so both endpoints run the SAME store mutations as the form route.
+/// `Err((status, message))` marks an invalid op / target folder or a storage failure.
+async fn apply_message_op(
+    state: &AppState,
+    id: &str,
+    op: &str,
+    folder: &str,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    use serde_json::json;
+    let err500 = |e: crate::store::StoreError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    match op {
+        "delete" => state.store.set_folder(id, "Trash").await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Trash"})).map_err(err500),
+        "archive" => state.store.set_folder(id, "Archive").await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Archive"})).map_err(err500),
+        "move" => {
+            let Some(f) = real_folder(folder) else {
+                return Err((StatusCode::BAD_REQUEST, "unknown target folder".to_string()));
+            };
+            state.store.set_folder(id, f).await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": f})).map_err(err500)
+        }
+        "unread" => state.store.mark_unseen(id).await.map(|_| json!({"ok": true, "id": id, "op": op, "seen": false})).map_err(err500),
+        "read" => state.store.mark_seen(id).await.map(|_| json!({"ok": true, "id": id, "op": op, "seen": true})).map_err(err500),
+        "star" => state.store.set_starred(id, true).await.map(|_| json!({"ok": true, "id": id, "op": op, "starred": true})).map_err(err500),
+        "unstar" => state.store.set_starred(id, false).await.map(|_| json!({"ok": true, "id": id, "op": op, "starred": false})).map_err(err500),
+        _ => Err((StatusCode::BAD_REQUEST, "unknown action".to_string())),
+    }
+}
+
+/// `POST /api/m/{id}/action` — the JSON sibling of [`message_action`] powering the optimistic,
+/// no-reload row/read actions. IDENTICAL guard rails: double-submit CSRF, the SAME owner
+/// authorisation (a message is only actionable from its own mailbox), the SAME store mutation, and
+/// a mirrored audit line. Returns a small JSON envelope describing the message's new state.
+async fn api_message_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<ActionForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return json_status(StatusCode::FORBIDDEN, "CSRF token missing or mismatched");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return json_status(StatusCode::FORBIDDEN, "no mailbox for this identity");
+    };
+    let msg = match state.store.get_message(&id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return json_status(StatusCode::NOT_FOUND, "no such message"),
+        Err(e) => return json_status(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    if msg.mailbox != mb.addr {
+        return json_status(StatusCode::NOT_FOUND, "no such message");
+    }
+    match apply_message_op(&state, &id, &form.op, &form.folder).await {
+        Ok(body) => {
+            tracing::info!(
+                target: "corvid::audit",
+                actor = %identity_subject(&headers).unwrap_or_default(),
+                mailbox = %mb.addr,
+                message = %id,
+                op = %form.op,
+                folder = %form.folder,
+                "message action (api)",
+            );
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err((code, message)) => json_status(code, &message),
+    }
+}
+
+/// Form body for `POST /api/m/bulk`: CSRF, `op`, an optional `folder` (for `move`), and a
+/// comma-separated `ids` batch.
+#[derive(Deserialize, Default)]
+struct BulkForm {
+    csrf: String,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    ids: String,
+}
+
+/// `POST /api/m/bulk` — apply one `op` (`read|unread|archive|delete|move`) to a batch of the
+/// signed-in mailbox's messages, for the multi-select bulk toolbar. Double-submit CSRF; EACH id is
+/// re-checked to belong to this mailbox (a forged/foreign id in the batch is skipped, never
+/// actioned), reusing the SAME per-message store mutations via [`apply_message_op`]. Returns the
+/// count actually applied.
+async fn api_bulk_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<BulkForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return json_status(StatusCode::FORBIDDEN, "CSRF token missing or mismatched");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return json_status(StatusCode::FORBIDDEN, "no mailbox for this identity");
+    };
+    // A deliberately narrow (non-star) bulk op set; `move` still needs a real target folder.
+    if !matches!(form.op.as_str(), "read" | "unread" | "archive" | "delete" | "move") {
+        return json_status(StatusCode::BAD_REQUEST, "unknown bulk action");
+    }
+    if form.op == "move" && real_folder(&form.folder).is_none() {
+        return json_status(StatusCode::BAD_REQUEST, "unknown target folder");
+    }
+    let ids: Vec<&str> = form.ids.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let mut applied = 0i64;
+    for id in ids {
+        // Cross-mailbox safety: only act on ids this mailbox actually owns.
+        match state.store.get_message(id).await {
+            Ok(Some(m)) if m.mailbox == mb.addr => {}
+            _ => continue,
+        }
+        if apply_message_op(&state, id, &form.op, &form.folder).await.is_ok() {
+            applied += 1;
+        }
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        op = %form.op,
+        folder = %form.folder,
+        applied,
+        "bulk message action (api)",
+    );
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "op": form.op, "applied": applied }))).into_response()
 }
 
 /// Clamp a requested folder to a real [`FOLDERS`] value (never [`STARRED_VIEW`], which is
@@ -1089,14 +1560,13 @@ async fn compose_form(
     </div>
   </form>
 </section>
-<script>{compose_js}</script>"#,
+<script src="/assets/compose.js"></script>"#,
         to = esc(&pre.to),
         cc = String::new(),
         subject = esc(&pre.subject),
         body = esc(&pre.body),
         in_reply_to = esc(&pre.in_reply_to),
         references = esc(&pre.references),
-        compose_js = COMPOSE_JS,
     );
     let html = render_page("Compose", &email, &content, "compose");
     match set_cookie {
