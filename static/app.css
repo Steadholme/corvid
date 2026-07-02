@@ -1469,3 +1469,189 @@ mark.search-hit {
 .contact-import { margin-top:20px; padding-top:20px; border-top:1px solid var(--hairline); }
 .contact-import .field { margin-bottom:12px; }
 .contact-import textarea { min-height:96px; font:12.5px/1.55 var(--mono); }
+
+/* ============================================================================
+   DISPLAY DENSITY · READING PANE · DARK MODE  (pure CSS visual layer)
+   Server (webmail.rs → shell.html) emits three hooks on the root <html>:
+       data-density = comfortable | normal | compact
+       data-pane    = off | right | bottom
+       data-theme   = system | light | dark
+   plus per-list/-row density hooks (.maillist / .mailrow[-wrap]--{density})
+   and the split container `.mailbox-layout--{right|bottom}` wrapping the
+   `.mail-list-pane` (list card) + `.read-pane` (reading card).
+   Nothing structural is touched here — only spacing, the layout of the split
+   container, and colour-token re-definition. The default triplet
+   (normal / off / light — and system while the OS is light) is byte-for-byte
+   the existing look; only genuine dark themes repaint. All values reuse the
+   Odyssey v2 tokens, so reduced-motion (global rule above) is inherited free.
+   ============================================================================ */
+
+/* ---- 1. Display density --------------------------------------------------
+   Re-space the mail rows only (padding · gap · type size · from/date widths).
+   Scoped to the root [data-density] hook so the split reading-pane list is
+   tightened too. `normal` is deliberately absent → inherits the base .mailrow. */
+
+/* compact — denser scan, more rows per screen */
+[data-density="compact"] .maillist        { padding:5px; }
+[data-density="compact"] .mailrow-wrap     { gap:4px; }
+[data-density="compact"] .mailrow          { padding:5px 12px; gap:10px; font-size:13px; }
+[data-density="compact"] .mailrow .from    { width:172px; }
+[data-density="compact"] .mailrow .subject { font-size:13px; }
+[data-density="compact"] .mailrow .date    { font-size:11.5px; }
+
+/* comfortable — airier, calmer rhythm */
+[data-density="comfortable"] .maillist     { padding:12px; }
+[data-density="comfortable"] .mailrow-wrap { gap:8px; }
+[data-density="comfortable"] .mailrow      { padding:13px 16px; gap:16px; }
+[data-density="comfortable"] .mailrow .from{ width:220px; }
+
+/* ---- 2. Reading pane -----------------------------------------------------
+   Only reacts to the .mailbox-layout element, which the server emits ONLY when
+   data-pane != off. With pane=off no such element exists, so the classic
+   single-column flow is completely untouched. `align-items:start` keeps the
+   list card its natural height; min-width:0 lets the reading column shrink so
+   <pre>/long tokens never blow the grid out. */
+.mailbox-layout      { margin-top:4px; }
+.mailbox-layout > *  { min-width:0; }
+
+/* right: narrow list column beside a wide reading column; list stays put
+   (sticky, own scroll) while the reader below it changes. */
+.mailbox-layout--right {
+  display:grid;
+  grid-template-columns:minmax(300px,360px) minmax(0,1fr);
+  gap:16px; align-items:start;
+}
+.mailbox-layout--right > .mail-list-pane {
+  grid-column:1;
+  position:sticky; top:72px;                 /* clears the 56px sticky appbar + wrap pad */
+  max-height:calc(100vh - 96px); overflow:auto;
+}
+.mailbox-layout--right > .read-pane { grid-column:2; }
+/* narrow rows reflow: sender + date on line 1, subject wraps to line 2 */
+.mailbox-layout--right .mailrow          { flex-wrap:wrap; row-gap:3px; }
+.mailbox-layout--right .mailrow .from    { width:auto; flex:1; order:1; }
+.mailbox-layout--right .mailrow .date    { margin-left:auto; order:2; }
+.mailbox-layout--right .mailrow .subject { flex-basis:100%; order:3; }
+
+/* bottom: list on top (capped, own scroll), reading area below it */
+.mailbox-layout--bottom {
+  display:grid; grid-template-columns:minmax(0,1fr); gap:16px;
+}
+.mailbox-layout--bottom > .mail-list-pane { max-height:40vh; overflow:auto; }
+
+/* empty reading pane — a calm placeholder instead of a blank card */
+.read-pane--empty {
+  display:grid; place-items:center; min-height:300px;
+  color:var(--ink-3); font-size:13.5px;
+}
+.read-pane--empty::after { content:"Select a message to read"; }
+
+/* narrow screens: both split modes gracefully collapse to a single stacked
+   column (display:block neutralises the grid + order rules) and unpin/uncap
+   the list so it never traps scroll on mobile. */
+@media (max-width:720px) {
+  .mailbox-layout--right,
+  .mailbox-layout--bottom { display:block; }
+  .mailbox-layout--right > * + *,
+  .mailbox-layout--bottom > * + * { margin-top:16px; }
+  .mailbox-layout--right > .mail-list-pane,
+  .mailbox-layout--bottom > .mail-list-pane {
+    position:static; max-height:none; overflow:visible;
+  }
+}
+
+/* ---- 3. Dark mode --------------------------------------------------------
+   Because every component paints through var(--token), overriding the tokens
+   in the dark scope repaints the whole UI with zero hard-coded colour — the
+   dividend of a fully tokenised sheet. Every colour token defined in :root is
+   re-mapped below (38 tokens: 12 neutral · 6 brand · 13 status · 2 per-app ·
+   5 elevation). Geometry/motion/type tokens are intentionally left alone. */
+
+/* 3a. Dark token VALUES — the single source of truth, shared by explicit
+       `dark` and OS-followed `system`. Harmless on a light `system` root:
+       these --dk-* customs simply stay unreferenced until dark applies. */
+[data-theme="dark"],
+[data-theme="system"] {
+  --dk-bg:#0e1116; --dk-bg-2:#12161d;
+  --dk-surface:#171b23; --dk-surface-2:#1e232c; --dk-surface-3:#262c37;
+  --dk-border:#2a303b; --dk-border-2:#3a414e; --dk-hairline:#21262f;
+  --dk-ink:#e8eaf0; --dk-ink-2:#b7bdc9; --dk-ink-3:#8a92a1; --dk-ink-4:#6b7280;
+  --dk-accent:#7c74f0; --dk-accent-2:#8f88f5; --dk-accent-ink:#a5a0ff;
+  --dk-accent-soft:#232544; --dk-accent-soft-2:#2c2f52; --dk-ring:rgba(124,116,240,.45);
+  --dk-ok:#34d399; --dk-ok-soft:#12241c; --dk-ok-ink:#6ee7b0;
+  --dk-warn:#fbbf24; --dk-warn-soft:#2a2113; --dk-warn-ink:#fcd34d;
+  --dk-down:#fb7185; --dk-down-soft:#2a1620; --dk-down-ink:#fda4af;
+  --dk-info:#38bdf8; --dk-info-soft:#0e2530; --dk-info-ink:#7dd3fc;
+  --dk-unknown:#6b7280;
+  --dk-app:#7c74f0; --dk-app-soft:#232544;
+  /* shadows: deeper + black-based so elevation reads on a dark ground */
+  --dk-sh-xs:0 1px 1px rgba(0,0,0,.35);
+  --dk-sh-sm:0 1px 2px rgba(0,0,0,.4), 0 1px 3px rgba(0,0,0,.3);
+  --dk-sh-md:0 4px 12px rgba(0,0,0,.45), 0 2px 4px rgba(0,0,0,.35);
+  --dk-sh-lg:0 12px 32px rgba(0,0,0,.55), 0 4px 8px rgba(0,0,0,.4);
+  --dk-sh-pop:0 8px 28px rgba(0,0,0,.6);
+}
+
+/* 3b. Apply for explicit dark — map each :root token onto its dark value. */
+[data-theme="dark"] {
+  color-scheme:dark;
+  --bg:var(--dk-bg); --bg-2:var(--dk-bg-2);
+  --surface:var(--dk-surface); --surface-2:var(--dk-surface-2); --surface-3:var(--dk-surface-3);
+  --border:var(--dk-border); --border-2:var(--dk-border-2); --hairline:var(--dk-hairline);
+  --ink:var(--dk-ink); --ink-2:var(--dk-ink-2); --ink-3:var(--dk-ink-3); --ink-4:var(--dk-ink-4);
+  --accent:var(--dk-accent); --accent-2:var(--dk-accent-2); --accent-ink:var(--dk-accent-ink);
+  --accent-soft:var(--dk-accent-soft); --accent-soft-2:var(--dk-accent-soft-2); --ring:var(--dk-ring);
+  --ok:var(--dk-ok); --ok-soft:var(--dk-ok-soft); --ok-ink:var(--dk-ok-ink);
+  --warn:var(--dk-warn); --warn-soft:var(--dk-warn-soft); --warn-ink:var(--dk-warn-ink);
+  --down:var(--dk-down); --down-soft:var(--dk-down-soft); --down-ink:var(--dk-down-ink);
+  --info:var(--dk-info); --info-soft:var(--dk-info-soft); --info-ink:var(--dk-info-ink);
+  --unknown:var(--dk-unknown);
+  --app:var(--dk-app); --app-soft:var(--dk-app-soft);
+  --sh-xs:var(--dk-sh-xs); --sh-sm:var(--dk-sh-sm); --sh-md:var(--dk-sh-md);
+  --sh-lg:var(--dk-sh-lg); --sh-pop:var(--dk-sh-pop);
+}
+
+/* 3c. Hard-coded-colour fixups for explicit dark — three spots bypass tokens
+       (translucent light chrome + light-background toast/undo chips) and must
+       be repainted by hand. Inline body images are NOT filtered/inverted. */
+[data-theme="dark"] .appbar               { background:rgba(20,24,31,.86); }
+[data-theme="dark"] .toast                { background:var(--surface-3); color:var(--ink); }
+[data-theme="dark"] .toast--err           { background:var(--down-soft); color:var(--down-ink); }
+[data-theme="dark"] .undo-bar             { background:var(--surface-3); color:var(--ink); }
+[data-theme="dark"] .undo-bar__message    { color:var(--ink); }
+[data-theme="dark"] .undo-bar__countdown  { color:var(--ink-3); }
+[data-theme="dark"] .undo-bar .btn-undo-send        { color:var(--accent-ink); }
+[data-theme="dark"] .undo-bar .btn-undo-send:hover  { color:var(--ink); }
+[data-theme="dark"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
+
+/* 3d. System-followed dark — identical mapping + fixups, gated by the OS
+       preference. Only var() references repeat here; the hex values live once
+       in 3a, so there is no second copy of the palette to keep in sync. */
+@media (prefers-color-scheme:dark) {
+  [data-theme="system"] {
+    color-scheme:dark;
+    --bg:var(--dk-bg); --bg-2:var(--dk-bg-2);
+    --surface:var(--dk-surface); --surface-2:var(--dk-surface-2); --surface-3:var(--dk-surface-3);
+    --border:var(--dk-border); --border-2:var(--dk-border-2); --hairline:var(--dk-hairline);
+    --ink:var(--dk-ink); --ink-2:var(--dk-ink-2); --ink-3:var(--dk-ink-3); --ink-4:var(--dk-ink-4);
+    --accent:var(--dk-accent); --accent-2:var(--dk-accent-2); --accent-ink:var(--dk-accent-ink);
+    --accent-soft:var(--dk-accent-soft); --accent-soft-2:var(--dk-accent-soft-2); --ring:var(--dk-ring);
+    --ok:var(--dk-ok); --ok-soft:var(--dk-ok-soft); --ok-ink:var(--dk-ok-ink);
+    --warn:var(--dk-warn); --warn-soft:var(--dk-warn-soft); --warn-ink:var(--dk-warn-ink);
+    --down:var(--dk-down); --down-soft:var(--dk-down-soft); --down-ink:var(--dk-down-ink);
+    --info:var(--dk-info); --info-soft:var(--dk-info-soft); --info-ink:var(--dk-info-ink);
+    --unknown:var(--dk-unknown);
+    --app:var(--dk-app); --app-soft:var(--dk-app-soft);
+    --sh-xs:var(--dk-sh-xs); --sh-sm:var(--dk-sh-sm); --sh-md:var(--dk-sh-md);
+    --sh-lg:var(--dk-sh-lg); --sh-pop:var(--dk-sh-pop);
+  }
+  [data-theme="system"] .appbar              { background:rgba(20,24,31,.86); }
+  [data-theme="system"] .toast               { background:var(--surface-3); color:var(--ink); }
+  [data-theme="system"] .toast--err          { background:var(--down-soft); color:var(--down-ink); }
+  [data-theme="system"] .undo-bar            { background:var(--surface-3); color:var(--ink); }
+  [data-theme="system"] .undo-bar__message   { color:var(--ink); }
+  [data-theme="system"] .undo-bar__countdown { color:var(--ink-3); }
+  [data-theme="system"] .undo-bar .btn-undo-send       { color:var(--accent-ink); }
+  [data-theme="system"] .undo-bar .btn-undo-send:hover { color:var(--ink); }
+  [data-theme="system"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
+}
