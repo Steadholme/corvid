@@ -743,3 +743,107 @@ mark.search-hit {
   -webkit-mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>");
   mask-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>");
 }
+
+/* ============================================================
+   Scheduled send zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   .send-split (compose action cluster) · .schedule-menu (native
+   <select> preset picker) · .schedule-custom (epoch <input
+   type=number>) · .btn-schedule-send (the "schedule" half) ·
+   .folder-scheduled (tab pill + row wrapper) · row state
+   .mailrow-wrap.is-scheduled · list controls
+   .btn-reschedule-scheduled / .btn-cancel-scheduled.
+   Tokens only — no new fonts/libs/external links. Motion rides
+   --dur/--ease (globally stilled by the prefers-reduced-motion
+   rule above); colour is token-driven so it tracks the theme the
+   same way the snooze/spam zones do. The whole feature lives in
+   the --accent family (its own identity, distinct from snooze's
+   --info and spam's --warn), while the send-now action keeps the
+   plain .btn-primary. */
+
+/* Split send control. Send-now (.btn-primary, left, unchanged) and
+   the scheduling half sit in one inline cluster; a hairline in the
+   gap draws the natural seam between "send now" and "schedule",
+   the classic split-button read. Wraps on narrow layouts. */
+.send-split { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.send-split .btn-primary { position:relative; }
+.send-split .btn-primary::after {
+  content:""; position:absolute; right:-5px; top:50%; transform:translateY(-50%);
+  width:1px; height:22px; background:var(--border-2);
+}
+
+/* The "schedule" half — a .btn.btn-ghost that reads as the dropdown
+   trigger for the picker beside it. Accent-tinted label (same quiet
+   idiom as the snooze buttons: no loud fill) with a small clock glyph
+   to signal "send later". The clock is a token-tinted inline SVG mask
+   so it adapts with theme. .btn already supplies the gap before it. */
+.btn-schedule-send { color:var(--accent-ink); }
+.btn-schedule-send::before {
+  content:""; flex:none; width:15px; height:15px; background:var(--accent-ink);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>") center/contain no-repeat;
+  mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7.5V12l3 1.8'/></svg>") center/contain no-repeat;
+}
+.btn-schedule-send:hover {
+  background:var(--surface-2); border-color:var(--accent-2); color:var(--accent-ink);
+}
+
+/* Preset picker + custom epoch. Same footprint/caret as the snooze
+   controls (which mirror .move-select) so every dropdown in the app
+   stays consistent: width:auto to keep the native <select> from
+   blowing out, compact 32px field, the shared caret glyph, and a
+   focus ring on --accent. Used on both compose and the reschedule
+   form in the Scheduled list. */
+.schedule-menu, .schedule-custom {
+  width:auto; font:inherit; font-size:12px; height:32px; line-height:normal;
+  padding:0 8px; color:var(--ink-2);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs);
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.schedule-menu {
+  appearance:none; -webkit-appearance:none; padding-right:26px;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:right 8px center;
+}
+.schedule-custom { width:120px; min-width:0; }
+.schedule-custom::placeholder { color:var(--ink-4); }
+.schedule-menu:focus, .schedule-custom:focus {
+  border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none;
+}
+
+/* Scheduled folder pill in the tab strip. Already a .btn pill so it
+   stays unified with the other folders; an --accent dot marks it as
+   the outbound queue (distinct from snooze's --info dot). Scoped to
+   .folder-tabs so the .folder-scheduled hook on scheduled rows is
+   untouched. */
+.folder-tabs .folder-scheduled::before {
+  content:""; flex:none; width:6px; height:6px; border-radius:50%; background:var(--accent);
+}
+/* On the active (indigo) pill the dot flips to white so it stays visible. */
+.folder-tabs .btn-primary.folder-scheduled::before { background:#fff; opacity:.85; }
+
+/* Scheduled row — same faint-icon idiom as the snoozed/muted rows, a
+   small calendar glyph in --accent leading the subject (calendar =
+   "scheduled for a date", distinct from snooze's clock). */
+.mailrow-wrap.is-scheduled .mailrow .subject::before {
+  content:""; display:inline-block; flex:none; width:12px; height:12px;
+  margin-right:6px; vertical-align:-2px; background:var(--accent);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='4.5' width='18' height='16.5' rx='2'/><path d='M3 9.5h18'/><path d='M8 2.5v4'/><path d='M16 2.5v4'/></svg>") center/contain no-repeat;
+  mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='4.5' width='18' height='16.5' rx='2'/><path d='M3 9.5h18'/><path d='M8 2.5v4'/><path d='M16 2.5v4'/></svg>") center/contain no-repeat;
+}
+
+/* Scheduled-list controls — reuse .btn.btn-ghost.btn-sm / .btn-danger
+   .btn-sm from the markup and stay restrained. Reschedule = quiet
+   accent (matches the feature hue). Cancel drops the loud danger fill
+   for the same ghost-danger idiom as the spam buttons: a tinted label
+   that only gains a soft --down wash + border on hover. Edit / Move to
+   Drafts keep the plain ghost look. */
+.btn-reschedule-scheduled { color:var(--accent-ink); }
+.btn-reschedule-scheduled:hover {
+  background:var(--surface-2); border-color:var(--accent-2); color:var(--accent-ink);
+}
+.btn-cancel-scheduled {
+  background:transparent; color:var(--down-ink); border-color:transparent; box-shadow:none;
+}
+.btn-cancel-scheduled:hover {
+  background:var(--down-soft); border-color:var(--down); color:var(--down-ink);
+}
