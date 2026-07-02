@@ -11,7 +11,8 @@
 //! ```
 
 use corvid::model::{
-    parse_search_query, FilterRule, Mailbox, Message, OutboundItem, Signature, Template,
+    parse_search_query, Contact, ContactGroup, FilterRule, Mailbox, Message, OutboundItem,
+    Signature, Template,
 };
 use corvid::store::{PgStore, Store, AUTO_REPLY_DEDUPE_SECS};
 use corvid::{new_id, now_secs};
@@ -35,6 +36,8 @@ async fn pg_store_full_integration() {
         "filter_rules",
         "auto_reply_log",
         "send_identities",
+        "contact_group_members",
+        "contact_groups",
         "contacts",
         "labels",
         "message_labels",
@@ -631,9 +634,59 @@ async fn pg_store_full_integration() {
         .await
         .unwrap()
         .is_empty());
+    pg.save_contact(
+        "w33d@w33d.xyz",
+        &Contact {
+            addr: "vip@example.com".into(),
+            name: "VIP".into(),
+            phone: "123".into(),
+            company: "Holdfast".into(),
+            title: "Ops".into(),
+            notes: "manual note".into(),
+            manual: true,
+            seen_count: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let full_contacts = pg.list_contacts("w33d@w33d.xyz", 10).await.unwrap();
+    let vip = full_contacts
+        .iter()
+        .find(|c| c.addr == "vip@example.com")
+        .expect("full contact saved");
+    assert_eq!(vip.phone, "123");
+    assert_eq!(vip.company, "Holdfast");
+    let group = ContactGroup {
+        id: "cg_pg".into(),
+        user: "w33d@w33d.xyz".into(),
+        name: "Friends".into(),
+        created_at: now,
+    };
+    pg.save_contact_group(&group).await.unwrap();
+    pg.add_contact_group_member("w33d@w33d.xyz", &group.id, "vip@example.com")
+        .await
+        .unwrap();
+    let members = pg
+        .list_contact_group_members("w33d@w33d.xyz", &group.id)
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].addr, "vip@example.com");
+    assert_eq!(
+        pg.contacts_for_group_name("w33d@w33d.xyz", "Friends")
+            .await
+            .unwrap()[0]
+            .addr,
+        "vip@example.com"
+    );
     pg.delete_contact("w33d@w33d.xyz", "vip@example.com")
         .await
         .unwrap();
+    assert!(pg
+        .list_contact_group_members("w33d@w33d.xyz", &group.id)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
         pg.suggest_contacts("w33d@w33d.xyz", "example.com", 10)
             .await
@@ -786,6 +839,8 @@ async fn pg_store_full_integration() {
         "filter_rules",
         "auto_reply_log",
         "send_identities",
+        "contact_group_members",
+        "contact_groups",
         "contacts",
         "labels",
         "message_labels",

@@ -483,10 +483,31 @@ pub struct Contact {
     pub addr: String,
     /// Display name (best-effort; empty when only ever seen as a bare address).
     pub name: String,
+    /// Optional phone number, user-managed.
+    pub phone: String,
+    /// Optional company/organization, user-managed.
+    pub company: String,
+    /// Optional job title, user-managed.
+    pub title: String,
+    /// Free-form private notes, user-managed.
+    pub notes: String,
     /// Manually-added contacts sort ahead of harvested ones.
     pub manual: bool,
     /// How many times this address was seen as a correspondent (harvest frequency).
     pub seen_count: i64,
+}
+
+/// A user-defined contact group. Members are stored separately by contact address.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContactGroup {
+    /// Opaque id, primary key.
+    pub id: String,
+    /// The owning mailbox.
+    pub user: String,
+    /// Display name users can type into the recipient field.
+    pub name: String,
+    /// Creation time in epoch seconds.
+    pub created_at: i64,
 }
 
 /// An arbitrary, user-defined label a mailbox can apply to messages (orthogonal to folders).

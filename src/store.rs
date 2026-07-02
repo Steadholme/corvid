@@ -23,6 +23,8 @@
 //! - `filter_rules(id TEXT PK, mailbox TEXT, position BIGINT, field TEXT, op TEXT, needle TEXT,
 //!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
+//! - `contact_groups(id TEXT PK, user TEXT, name TEXT, created_at BIGINT)`
+//! - `contact_group_members(group_id TEXT, contact_id TEXT, PK (group_id, contact_id))`
 //! - `sender_lists(id TEXT PK, user TEXT, address_or_domain TEXT, kind TEXT, created_at BIGINT)`
 //! - `signatures(id TEXT PK, user TEXT, identity TEXT, name TEXT, body_html TEXT, body_text TEXT,
 //!    is_default BOOLEAN, created_at BIGINT)`
@@ -32,16 +34,17 @@
 //! - settings columns on `mailboxes` (signature, undo_send_window_secs, auto_reply_*), added
 //!   idempotently.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::model::{
-    Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
-    OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
-    SearchState, SendIdentity, SenderListEntry, Signature, SpamAnnotation, Template, ThreadSummary,
-    DEFAULT_UNDO_SEND_WINDOW_SECS,
+    Alias, Contact, ContactGroup, FilterRule, Label, Mailbox, MailboxSettings, Message,
+    MessageSummary, OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind,
+    SearchQuery, SearchState, SendIdentity, SenderListEntry, Signature, SpamAnnotation, Template,
+    ThreadSummary, DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -337,6 +340,47 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<Contact>, StoreError>;
     /// Delete a contact, scoped to `mailbox` (used to prune the list from settings).
     async fn delete_contact(&self, mailbox: &str, addr: &str) -> Result<(), StoreError>;
+    /// Full contact list for settings/export, ordered by name/address.
+    async fn list_contacts(&self, mailbox: &str, limit: i64) -> Result<Vec<Contact>, StoreError>;
+    /// Persist a full user-managed contact row. Unlike harvest upsert, blank fields are saved.
+    async fn save_contact(&self, mailbox: &str, contact: &Contact) -> Result<(), StoreError>;
+    /// Contacts that share the same lowercased email address, used by the merge UI.
+    async fn duplicate_contacts(&self, mailbox: &str) -> Result<Vec<Contact>, StoreError>;
+    /// Merge duplicate rows for one lowercased address, preserving non-empty fields.
+    async fn merge_duplicate_contact(&self, mailbox: &str, addr: &str) -> Result<(), StoreError>;
+
+    /// Every contact group owned by a mailbox.
+    async fn list_contact_groups(&self, mailbox: &str) -> Result<Vec<ContactGroup>, StoreError>;
+    /// Create or rename a contact group.
+    async fn save_contact_group(&self, group: &ContactGroup) -> Result<(), StoreError>;
+    /// Delete a contact group and its memberships, scoped to `mailbox`.
+    async fn delete_contact_group(&self, mailbox: &str, group_id: &str) -> Result<(), StoreError>;
+    /// Add a contact address to a group, scoped through the group's owner.
+    async fn add_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError>;
+    /// Remove a contact address from a group, scoped through the group's owner.
+    async fn delete_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError>;
+    /// Contact rows in a group, scoped to `mailbox`.
+    async fn list_contact_group_members(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+    ) -> Result<Vec<Contact>, StoreError>;
+    /// Expand a typed group name into its member contacts for recipient parsing.
+    async fn contacts_for_group_name(
+        &self,
+        mailbox: &str,
+        group_name: &str,
+    ) -> Result<Vec<Contact>, StoreError>;
 
     // --- Labels ---------------------------------------------------------------
     /// Every label defined by a mailbox, ordered by name.
@@ -419,6 +463,9 @@ pub struct InMemoryStore {
     send_identities: Mutex<Vec<SendIdentity>>,
     /// Contacts qualified by their owning mailbox: `(mailbox, contact)`.
     contacts: Mutex<Vec<(String, Contact)>>,
+    contact_groups: Mutex<Vec<ContactGroup>>,
+    /// Contact group members: `(group_id, contact_addr)`.
+    contact_group_members: Mutex<Vec<(String, String)>>,
     labels: Mutex<Vec<Label>>,
     /// Message↔label assignments: `(mailbox, message_id, label_id)`.
     message_labels: Mutex<Vec<(String, String, String)>>,
@@ -456,6 +503,64 @@ fn summary(m: &Message) -> MessageSummary {
 
 fn legacy_signature_id(mailbox: &str) -> String {
     format!("sig_legacy_{mailbox}")
+}
+
+fn blank_contact(addr: String, name: String, manual: bool, seen_count: i64) -> Contact {
+    Contact {
+        addr,
+        name,
+        phone: String::new(),
+        company: String::new(),
+        title: String::new(),
+        notes: String::new(),
+        manual,
+        seen_count,
+    }
+}
+
+fn merge_contact_fields(into: &mut Contact, other: &Contact) {
+    if into.name.trim().is_empty() && !other.name.trim().is_empty() {
+        into.name = other.name.clone();
+    }
+    if into.phone.trim().is_empty() && !other.phone.trim().is_empty() {
+        into.phone = other.phone.clone();
+    }
+    if into.company.trim().is_empty() && !other.company.trim().is_empty() {
+        into.company = other.company.clone();
+    }
+    if into.title.trim().is_empty() && !other.title.trim().is_empty() {
+        into.title = other.title.clone();
+    }
+    if into.notes.trim().is_empty() && !other.notes.trim().is_empty() {
+        into.notes = other.notes.clone();
+    }
+    into.manual = into.manual || other.manual;
+    into.seen_count += other.seen_count;
+}
+
+fn sort_contacts_for_settings(v: &mut [Contact]) {
+    v.sort_by(|a, b| {
+        let an = if a.name.trim().is_empty() {
+            a.addr.to_lowercase()
+        } else {
+            a.name.to_lowercase()
+        };
+        let bn = if b.name.trim().is_empty() {
+            b.addr.to_lowercase()
+        } else {
+            b.name.to_lowercase()
+        };
+        an.cmp(&bn).then_with(|| a.addr.cmp(&b.addr))
+    });
+}
+
+fn sort_contact_groups(v: &mut [ContactGroup]) {
+    v.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn sort_signatures(v: &mut [Signature]) {
@@ -1727,12 +1832,12 @@ impl Store for InMemoryStore {
         } else {
             v.push((
                 mailbox.to_string(),
-                Contact {
-                    addr: addr_l,
-                    name: name.trim().to_string(),
+                blank_contact(
+                    addr_l,
+                    name.trim().to_string(),
                     manual,
-                    seen_count: if manual { 0 } else { 1 },
-                },
+                    if manual { 0 } else { 1 },
+                ),
             ));
         }
         Ok(())
@@ -1774,7 +1879,308 @@ impl Store for InMemoryStore {
             .lock()
             .expect("contacts lock poisoned")
             .retain(|(mb, c)| !(mb == mailbox && c.addr == addr_l));
+        let owned_groups: Vec<String> = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .filter(|g| g.user == mailbox)
+            .map(|g| g.id.clone())
+            .collect();
+        self.contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned")
+            .retain(|(gid, contact_addr)| {
+                contact_addr != &addr_l || !owned_groups.iter().any(|id| id == gid)
+            });
         Ok(())
+    }
+
+    async fn list_contacts(&self, mailbox: &str, limit: i64) -> Result<Vec<Contact>, StoreError> {
+        let mut v: Vec<Contact> = self
+            .contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .iter()
+            .filter(|(mb, _)| mb == mailbox)
+            .map(|(_, c)| c.clone())
+            .collect();
+        sort_contacts_for_settings(&mut v);
+        v.truncate(limit.max(0) as usize);
+        Ok(v)
+    }
+
+    async fn save_contact(&self, mailbox: &str, contact: &Contact) -> Result<(), StoreError> {
+        let addr_l = contact.addr.trim().to_lowercase();
+        if addr_l.is_empty() {
+            return Ok(());
+        }
+        let mut saved = contact.clone();
+        saved.addr = addr_l.clone();
+        saved.name = saved.name.trim().to_string();
+        saved.phone = saved.phone.trim().to_string();
+        saved.company = saved.company.trim().to_string();
+        saved.title = saved.title.trim().to_string();
+        saved.notes = saved.notes.trim().to_string();
+        saved.manual = true;
+        let mut v = self.contacts.lock().expect("contacts lock poisoned");
+        if let Some((_, existing)) = v
+            .iter_mut()
+            .find(|(mb, c)| mb == mailbox && c.addr == addr_l)
+        {
+            let seen_count = existing.seen_count.max(saved.seen_count);
+            *existing = saved;
+            existing.seen_count = seen_count;
+        } else {
+            v.push((mailbox.to_string(), saved));
+        }
+        Ok(())
+    }
+
+    async fn duplicate_contacts(&self, mailbox: &str) -> Result<Vec<Contact>, StoreError> {
+        let mut by_addr: BTreeMap<String, Vec<Contact>> = BTreeMap::new();
+        for (_, contact) in self
+            .contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .iter()
+            .filter(|(mb, _)| mb == mailbox)
+        {
+            by_addr
+                .entry(contact.addr.to_lowercase())
+                .or_default()
+                .push(contact.clone());
+        }
+        let mut dupes: Vec<Contact> = by_addr
+            .into_values()
+            .filter(|rows| rows.len() > 1)
+            .flatten()
+            .collect();
+        sort_contacts_for_settings(&mut dupes);
+        Ok(dupes)
+    }
+
+    async fn merge_duplicate_contact(&self, mailbox: &str, addr: &str) -> Result<(), StoreError> {
+        let target = addr.trim().to_lowercase();
+        if target.is_empty() {
+            return Ok(());
+        }
+        let mut contacts = self.contacts.lock().expect("contacts lock poisoned");
+        let mut merged: Option<Contact> = None;
+        contacts.retain(|(mb, contact)| {
+            if mb == mailbox && contact.addr.to_lowercase() == target {
+                match &mut merged {
+                    Some(m) => merge_contact_fields(m, contact),
+                    None => {
+                        let mut c = contact.clone();
+                        c.addr = target.clone();
+                        merged = Some(c);
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(contact) = merged {
+            contacts.push((mailbox.to_string(), contact));
+            let owned_groups: Vec<String> = self
+                .contact_groups
+                .lock()
+                .expect("contact_groups lock poisoned")
+                .iter()
+                .filter(|g| g.user == mailbox)
+                .map(|g| g.id.clone())
+                .collect();
+            let mut members = self
+                .contact_group_members
+                .lock()
+                .expect("contact_group_members lock poisoned");
+            for (gid, contact_addr) in members.iter_mut() {
+                if owned_groups.iter().any(|id| id == gid) && contact_addr.to_lowercase() == target
+                {
+                    *contact_addr = target.clone();
+                }
+            }
+            members.sort();
+            members.dedup();
+        }
+        Ok(())
+    }
+
+    async fn list_contact_groups(&self, mailbox: &str) -> Result<Vec<ContactGroup>, StoreError> {
+        let mut v: Vec<ContactGroup> = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .filter(|g| g.user == mailbox)
+            .cloned()
+            .collect();
+        sort_contact_groups(&mut v);
+        Ok(v)
+    }
+
+    async fn save_contact_group(&self, group: &ContactGroup) -> Result<(), StoreError> {
+        let mut saved = group.clone();
+        saved.name = saved.name.trim().to_string();
+        if saved.name.is_empty() {
+            return Ok(());
+        }
+        let mut groups = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned");
+        if let Some(existing) = groups
+            .iter_mut()
+            .find(|g| g.user == saved.user && g.id == saved.id)
+        {
+            existing.name = saved.name;
+        } else if let Some(existing) = groups
+            .iter_mut()
+            .find(|g| g.user == saved.user && g.name.eq_ignore_ascii_case(&saved.name))
+        {
+            existing.name = saved.name;
+        } else {
+            groups.push(saved);
+        }
+        Ok(())
+    }
+
+    async fn delete_contact_group(&self, mailbox: &str, group_id: &str) -> Result<(), StoreError> {
+        let mut groups = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned");
+        let before: Vec<String> = groups
+            .iter()
+            .filter(|g| g.user == mailbox && g.id == group_id)
+            .map(|g| g.id.clone())
+            .collect();
+        groups.retain(|g| !(g.user == mailbox && g.id == group_id));
+        drop(groups);
+        self.contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned")
+            .retain(|(gid, _)| !before.iter().any(|id| id == gid));
+        Ok(())
+    }
+
+    async fn add_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError> {
+        let addr_l = contact_addr.trim().to_lowercase();
+        if addr_l.is_empty() {
+            return Ok(());
+        }
+        let group_owned = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .any(|g| g.user == mailbox && g.id == group_id);
+        let contact_owned = self
+            .contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .iter()
+            .any(|(mb, c)| mb == mailbox && c.addr == addr_l);
+        if !group_owned || !contact_owned {
+            return Ok(());
+        }
+        let mut members = self
+            .contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned");
+        if !members
+            .iter()
+            .any(|(gid, addr)| gid == group_id && addr == &addr_l)
+        {
+            members.push((group_id.to_string(), addr_l));
+        }
+        Ok(())
+    }
+
+    async fn delete_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError> {
+        let group_owned = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .any(|g| g.user == mailbox && g.id == group_id);
+        if !group_owned {
+            return Ok(());
+        }
+        let addr_l = contact_addr.trim().to_lowercase();
+        self.contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned")
+            .retain(|(gid, addr)| !(gid == group_id && addr == &addr_l));
+        Ok(())
+    }
+
+    async fn list_contact_group_members(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+    ) -> Result<Vec<Contact>, StoreError> {
+        let group_owned = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .any(|g| g.user == mailbox && g.id == group_id);
+        if !group_owned {
+            return Ok(Vec::new());
+        }
+        let member_addrs: Vec<String> = self
+            .contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned")
+            .iter()
+            .filter(|(gid, _)| gid == group_id)
+            .map(|(_, addr)| addr.clone())
+            .collect();
+        let mut v: Vec<Contact> = self
+            .contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .iter()
+            .filter(|(mb, c)| mb == mailbox && member_addrs.iter().any(|a| a == &c.addr))
+            .map(|(_, c)| c.clone())
+            .collect();
+        sort_contacts_for_settings(&mut v);
+        Ok(v)
+    }
+
+    async fn contacts_for_group_name(
+        &self,
+        mailbox: &str,
+        group_name: &str,
+    ) -> Result<Vec<Contact>, StoreError> {
+        let name = group_name.trim();
+        if name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let group_id = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .find(|g| g.user == mailbox && g.name.eq_ignore_ascii_case(name))
+            .map(|g| g.id.clone());
+        match group_id {
+            Some(id) => self.list_contact_group_members(mailbox, &id).await,
+            None => Ok(Vec::new()),
+        }
     }
 
     async fn list_labels(&self, mailbox: &str) -> Result<Vec<Label>, StoreError> {
@@ -2263,10 +2669,53 @@ impl PgStore {
                  mailbox TEXT NOT NULL, \
                  addr TEXT NOT NULL, \
                  name TEXT NOT NULL DEFAULT '', \
+                 phone TEXT NOT NULL DEFAULT '', \
+                 company TEXT NOT NULL DEFAULT '', \
+                 title TEXT NOT NULL DEFAULT '', \
+                 notes TEXT NOT NULL DEFAULT '', \
                  manual BOOLEAN NOT NULL DEFAULT FALSE, \
                  seen_count BIGINT NOT NULL DEFAULT 0, \
                  PRIMARY KEY (mailbox, addr)\
              )",
+        )
+        .execute(&self.pool)
+        .await?;
+        for stmt in [
+            "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS company TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT ''",
+        ] {
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contact_groups (\
+                 id TEXT PRIMARY KEY, \
+                 \"user\" TEXT NOT NULL, \
+                 name TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_groups_user_name \
+             ON contact_groups (\"user\", name)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contact_group_members (\
+                 group_id TEXT NOT NULL, \
+                 contact_id TEXT NOT NULL, \
+                 PRIMARY KEY (group_id, contact_id)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_contact_group_members_contact \
+             ON contact_group_members (contact_id, group_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -2519,8 +2968,29 @@ impl PgStore {
         Ok(Contact {
             addr: row.try_get("addr")?,
             name: row.try_get("name")?,
+            phone: row
+                .try_get::<Option<String>, _>("phone")?
+                .unwrap_or_default(),
+            company: row
+                .try_get::<Option<String>, _>("company")?
+                .unwrap_or_default(),
+            title: row
+                .try_get::<Option<String>, _>("title")?
+                .unwrap_or_default(),
+            notes: row
+                .try_get::<Option<String>, _>("notes")?
+                .unwrap_or_default(),
             manual: row.try_get("manual")?,
             seen_count: row.try_get("seen_count")?,
+        })
+    }
+
+    fn contact_group_from_row(row: &sqlx::postgres::PgRow) -> Result<ContactGroup, sqlx::Error> {
+        Ok(ContactGroup {
+            id: row.try_get("id")?,
+            user: row.try_get("user")?,
+            name: row.try_get("name")?,
+            created_at: row.try_get("created_at")?,
         })
     }
 
@@ -3912,8 +4382,8 @@ impl Store for PgStore {
         // Harvest bumps seen_count by 1; a manual (re)add sets the flag without inflating frequency.
         let inc: i64 = if manual { 0 } else { 1 };
         sqlx::query(
-            "INSERT INTO contacts (mailbox, addr, name, manual, seen_count) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO contacts (mailbox, addr, name, phone, company, title, notes, manual, seen_count) \
+             VALUES ($1, $2, $3, '', '', '', '', $4, $5) \
              ON CONFLICT (mailbox, addr) DO UPDATE SET \
                name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE contacts.name END, \
                manual = contacts.manual OR EXCLUDED.manual, \
@@ -3939,7 +4409,7 @@ impl Store for PgStore {
     ) -> Result<Vec<Contact>, StoreError> {
         let pattern = format!("%{}%", like_escape(&q.trim().to_lowercase()));
         let rows = sqlx::query(
-            "SELECT addr, name, manual, seen_count FROM contacts \
+            "SELECT addr, name, phone, company, title, notes, manual, seen_count FROM contacts \
              WHERE mailbox = $1 \
                AND (LOWER(addr) LIKE $2 ESCAPE '\\' OR LOWER(name) LIKE $2 ESCAPE '\\') \
              ORDER BY manual DESC, seen_count DESC, addr ASC LIMIT $3",
@@ -3957,13 +4427,330 @@ impl Store for PgStore {
     }
 
     async fn delete_contact(&self, mailbox: &str, addr: &str) -> Result<(), StoreError> {
+        let addr_l = addr.trim().to_lowercase();
+        sqlx::query(
+            "DELETE FROM contact_group_members \
+             WHERE contact_id = $1 \
+               AND group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $2)",
+        )
+        .bind(&addr_l)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
         sqlx::query("DELETE FROM contacts WHERE mailbox = $1 AND addr = $2")
             .bind(mailbox)
-            .bind(addr.trim().to_lowercase())
+            .bind(&addr_l)
             .execute(&self.pool)
             .await
             .map_err(backend)?;
         Ok(())
+    }
+
+    async fn list_contacts(&self, mailbox: &str, limit: i64) -> Result<Vec<Contact>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT addr, name, phone, company, title, notes, manual, seen_count FROM contacts \
+             WHERE mailbox = $1 \
+             ORDER BY LOWER(CASE WHEN name <> '' THEN name ELSE addr END) ASC, addr ASC LIMIT $2",
+        )
+        .bind(mailbox)
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::contact_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn save_contact(&self, mailbox: &str, contact: &Contact) -> Result<(), StoreError> {
+        let addr_l = contact.addr.trim().to_lowercase();
+        if addr_l.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO contacts \
+                 (mailbox, addr, name, phone, company, title, notes, manual, seen_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8) \
+             ON CONFLICT (mailbox, addr) DO UPDATE SET \
+               name = EXCLUDED.name, \
+               phone = EXCLUDED.phone, \
+               company = EXCLUDED.company, \
+               title = EXCLUDED.title, \
+               notes = EXCLUDED.notes, \
+               manual = TRUE, \
+               seen_count = CASE \
+                 WHEN contacts.seen_count > EXCLUDED.seen_count THEN contacts.seen_count \
+                 ELSE EXCLUDED.seen_count \
+               END",
+        )
+        .bind(mailbox)
+        .bind(&addr_l)
+        .bind(contact.name.trim())
+        .bind(contact.phone.trim())
+        .bind(contact.company.trim())
+        .bind(contact.title.trim())
+        .bind(contact.notes.trim())
+        .bind(contact.seen_count)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn duplicate_contacts(&self, mailbox: &str) -> Result<Vec<Contact>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT addr, name, phone, company, title, notes, manual, seen_count FROM contacts \
+             WHERE mailbox = $1 \
+               AND LOWER(addr) IN (\
+                 SELECT LOWER(addr) FROM contacts WHERE mailbox = $1 GROUP BY LOWER(addr) HAVING COUNT(*) > 1\
+               ) \
+             ORDER BY LOWER(addr), addr",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::contact_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn merge_duplicate_contact(&self, mailbox: &str, addr: &str) -> Result<(), StoreError> {
+        let target = addr.trim().to_lowercase();
+        if target.is_empty() {
+            return Ok(());
+        }
+        let rows = sqlx::query(
+            "SELECT addr, name, phone, company, title, notes, manual, seen_count FROM contacts \
+             WHERE mailbox = $1 AND LOWER(addr) = $2 ORDER BY manual DESC, seen_count DESC, addr ASC",
+        )
+        .bind(mailbox)
+        .bind(&target)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let mut merged: Option<Contact> = None;
+        for row in &rows {
+            let contact = Self::contact_from_row(row).map_err(backend)?;
+            match &mut merged {
+                Some(m) => merge_contact_fields(m, &contact),
+                None => {
+                    let mut c = contact;
+                    c.addr = target.clone();
+                    merged = Some(c);
+                }
+            }
+        }
+        let Some(contact) = merged else {
+            return Ok(());
+        };
+        sqlx::query("DELETE FROM contacts WHERE mailbox = $1 AND LOWER(addr) = $2")
+            .bind(mailbox)
+            .bind(&target)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        sqlx::query(
+            "INSERT INTO contacts \
+                 (mailbox, addr, name, phone, company, title, notes, manual, seen_count) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(mailbox)
+        .bind(&contact.addr)
+        .bind(&contact.name)
+        .bind(&contact.phone)
+        .bind(&contact.company)
+        .bind(&contact.title)
+        .bind(&contact.notes)
+        .bind(contact.manual)
+        .bind(contact.seen_count)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        sqlx::query(
+            "INSERT INTO contact_group_members (group_id, contact_id) \
+             SELECT group_id, $1 FROM contact_group_members \
+             WHERE LOWER(contact_id) = $1 \
+               AND group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $2) \
+             ON CONFLICT (group_id, contact_id) DO NOTHING",
+        )
+        .bind(&target)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        sqlx::query(
+            "DELETE FROM contact_group_members \
+             WHERE LOWER(contact_id) = $1 AND contact_id <> $1 \
+               AND group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $2)",
+        )
+        .bind(&target)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn list_contact_groups(&self, mailbox: &str) -> Result<Vec<ContactGroup>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, \"user\", name, created_at FROM contact_groups \
+             WHERE \"user\" = $1 ORDER BY LOWER(name) ASC, id ASC",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::contact_group_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn save_contact_group(&self, group: &ContactGroup) -> Result<(), StoreError> {
+        let name = group.name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        let updated =
+            sqlx::query("UPDATE contact_groups SET name = $3 WHERE id = $1 AND \"user\" = $2")
+                .bind(&group.id)
+                .bind(&group.user)
+                .bind(name)
+                .execute(&self.pool)
+                .await
+                .map_err(backend)?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO contact_groups (id, \"user\", name, created_at) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (\"user\", name) DO NOTHING",
+            )
+            .bind(&group.id)
+            .bind(&group.user)
+            .bind(name)
+            .bind(group.created_at)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    async fn delete_contact_group(&self, mailbox: &str, group_id: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM contact_group_members \
+             WHERE group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $1 AND id = $2)",
+        )
+        .bind(mailbox)
+        .bind(group_id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        sqlx::query("DELETE FROM contact_groups WHERE \"user\" = $1 AND id = $2")
+            .bind(mailbox)
+            .bind(group_id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn add_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError> {
+        let addr_l = contact_addr.trim().to_lowercase();
+        if addr_l.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO contact_group_members (group_id, contact_id) \
+             SELECT $1, $2 \
+             WHERE EXISTS (SELECT 1 FROM contact_groups WHERE \"user\" = $3 AND id = $1) \
+               AND EXISTS (SELECT 1 FROM contacts WHERE mailbox = $3 AND addr = $2) \
+             ON CONFLICT (group_id, contact_id) DO NOTHING",
+        )
+        .bind(group_id)
+        .bind(&addr_l)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_contact_group_member(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+        contact_addr: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM contact_group_members \
+             WHERE group_id = $1 AND contact_id = $2 \
+               AND group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $3)",
+        )
+        .bind(group_id)
+        .bind(contact_addr.trim().to_lowercase())
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn list_contact_group_members(
+        &self,
+        mailbox: &str,
+        group_id: &str,
+    ) -> Result<Vec<Contact>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT c.addr, c.name, c.phone, c.company, c.title, c.notes, c.manual, c.seen_count \
+             FROM contacts c \
+             JOIN contact_group_members m ON m.contact_id = c.addr \
+             JOIN contact_groups g ON g.id = m.group_id \
+             WHERE c.mailbox = $1 AND g.\"user\" = $1 AND g.id = $2 \
+             ORDER BY LOWER(CASE WHEN c.name <> '' THEN c.name ELSE c.addr END) ASC, c.addr ASC",
+        )
+        .bind(mailbox)
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::contact_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn contacts_for_group_name(
+        &self,
+        mailbox: &str,
+        group_name: &str,
+    ) -> Result<Vec<Contact>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT c.addr, c.name, c.phone, c.company, c.title, c.notes, c.manual, c.seen_count \
+             FROM contacts c \
+             JOIN contact_group_members m ON m.contact_id = c.addr \
+             JOIN contact_groups g ON g.id = m.group_id \
+             WHERE c.mailbox = $1 AND g.\"user\" = $1 AND LOWER(g.name) = LOWER($2) \
+             ORDER BY LOWER(CASE WHEN c.name <> '' THEN c.name ELSE c.addr END) ASC, c.addr ASC",
+        )
+        .bind(mailbox)
+        .bind(group_name.trim())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::contact_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
     }
 
     async fn list_labels(&self, mailbox: &str) -> Result<Vec<Label>, StoreError> {

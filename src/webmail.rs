@@ -35,9 +35,9 @@ use std::collections::HashMap;
 use time::{Date, Month, OffsetDateTime};
 
 use crate::model::{
-    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
-    SearchPredicateKind, SearchQuery, SenderListEntry, Signature, SpamAnnotation, Template,
-    DEFAULT_UNDO_SEND_WINDOW_SECS,
+    parse_search_query, Alias, Contact, ContactGroup, FilterRule, Label, Mailbox, Message,
+    ScheduledOutbound, SearchPredicateKind, SearchQuery, SenderListEntry, Signature,
+    SpamAnnotation, Template, DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -765,6 +765,12 @@ pub fn app(state: AppState) -> Router {
         .route("/settings/identities", post(settings_identities_post))
         .route("/settings/labels", post(settings_labels_post))
         .route("/settings/contacts", post(settings_contacts_post))
+        .route(
+            "/settings/contact-groups",
+            post(settings_contact_groups_post),
+        )
+        .route("/settings/contacts/import", post(settings_contacts_import))
+        .route("/settings/contacts/export", get(settings_contacts_export))
         .route("/settings/senders", post(settings_senders_post))
         .merge(admin)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
@@ -4228,21 +4234,20 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         attachments = referenced_attachments;
     }
 
-    let raw = build_rfc822(
-        &from_header,
-        &form.to,
-        &form.cc,
-        &form.subject,
-        &body_text,
-        &body_html,
-        &form.in_reply_to,
-        &form.references,
-        &state.config.mail_domain,
-        &attachments,
-    );
-
     // "Save draft": persist without sending, and allow an incomplete recipient list.
     if form.action == "draft" {
+        let raw = build_rfc822(
+            &from_header,
+            &form.to,
+            &form.cc,
+            &form.subject,
+            &body_text,
+            &body_html,
+            &form.in_reply_to,
+            &form.references,
+            &state.config.mail_domain,
+            &attachments,
+        );
         match upsert_draft_copy(
             &state,
             &mb.addr,
@@ -4269,15 +4274,32 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         return Redirect::to("/?folder=Drafts").into_response();
     }
 
+    let (expanded_to, expanded_cc) =
+        match expand_recipient_fields(&state, &mb.addr, &form.to, &form.cc).await {
+            Ok(v) => v,
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                );
+            }
+        };
+    let raw = build_rfc822(
+        &from_header,
+        &expanded_to,
+        &expanded_cc,
+        &form.subject,
+        &body_text,
+        &body_html,
+        &form.in_reply_to,
+        &form.references,
+        &state.config.mail_domain,
+        &attachments,
+    );
+
     // To + Cc are both relayed.
-    let rcpts: Vec<String> = form
-        .to
-        .split([',', ';'])
-        .chain(form.cc.split([',', ';']))
-        .map(str::trim)
-        .filter(|s| s.contains('@') && domain_of(s).is_some())
-        .map(str::to_string)
-        .collect();
+    let rcpts = recipient_rcpts(&expanded_to, &expanded_cc);
     if rcpts.is_empty() {
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -4358,7 +4380,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
                 &state,
                 &mb.addr,
                 &from_header,
-                &form.to,
+                &expanded_to,
                 &form.subject,
                 &body_text,
                 &body_html,
@@ -4459,6 +4481,71 @@ fn compose_body_parts(body: &str, body_html: &str) -> (String, String) {
         html_text
     };
     (plain, clean_html)
+}
+
+async fn expand_recipient_fields(
+    state: &AppState,
+    mailbox: &str,
+    to: &str,
+    cc: &str,
+) -> Result<(String, String), crate::store::StoreError> {
+    let expanded_to = expand_recipient_field(state, mailbox, to).await?;
+    let expanded_cc = expand_recipient_field(state, mailbox, cc).await?;
+    Ok((expanded_to, expanded_cc))
+}
+
+async fn expand_recipient_field(
+    state: &AppState,
+    mailbox: &str,
+    raw: &str,
+) -> Result<String, crate::store::StoreError> {
+    let mut expanded = Vec::new();
+    for token in recipient_tokens(raw) {
+        let addr = extract_addr(&token).to_lowercase();
+        if is_valid_recipient_addr(&addr) {
+            push_unique_addr(&mut expanded, addr);
+            continue;
+        }
+        for contact in state.store.contacts_for_group_name(mailbox, &token).await? {
+            push_unique_addr(&mut expanded, contact.addr);
+        }
+    }
+    Ok(expanded.join(", "))
+}
+
+fn recipient_tokens(raw: &str) -> Vec<String> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_valid_recipient_addr(addr: &str) -> bool {
+    addr.contains('@') && domain_of(addr).is_some()
+}
+
+fn push_unique_addr(out: &mut Vec<String>, addr: String) {
+    if !out
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&addr))
+    {
+        out.push(addr);
+    }
+}
+
+fn recipient_rcpts(to: &str, cc: &str) -> Vec<String> {
+    let mut rcpts = Vec::new();
+    for token in recipient_tokens(to)
+        .into_iter()
+        .chain(recipient_tokens(cc).into_iter())
+    {
+        let addr = extract_addr(&token).to_lowercase();
+        if is_valid_recipient_addr(&addr) {
+            push_unique_addr(&mut rcpts, addr);
+        }
+    }
+    rcpts
 }
 
 /// Persist a locally-authored message (a Sent copy or a Draft) into `mailbox`'s `folder`, from the
@@ -4838,7 +4925,31 @@ async fn contacts_suggest(
         .suggest_contacts(&mb.addr, &q.q, SUGGEST_LIMIT)
         .await
     {
-        Ok(list) => Json(list).into_response(),
+        Ok(mut list) => {
+            let needle = q.q.trim().to_lowercase();
+            if (list.len() as i64) < SUGGEST_LIMIT {
+                if let Ok(groups) = state.store.list_contact_groups(&mb.addr).await {
+                    for group in groups {
+                        if (list.len() as i64) >= SUGGEST_LIMIT {
+                            break;
+                        }
+                        if needle.is_empty() || group.name.to_lowercase().contains(&needle) {
+                            list.push(Contact {
+                                addr: group.name,
+                                name: "Group".to_string(),
+                                phone: String::new(),
+                                company: String::new(),
+                                title: String::new(),
+                                notes: String::new(),
+                                manual: true,
+                                seen_count: 0,
+                            });
+                        }
+                    }
+                }
+            }
+            Json(list).into_response()
+        }
         Err(_) => Json(Vec::<crate::model::Contact>::new()).into_response(),
     }
 }
@@ -5306,11 +5417,53 @@ async fn settings_page(
             );
         }
     };
-    let contacts = state
-        .store
-        .suggest_contacts(&mb.addr, "", 200)
-        .await
-        .unwrap_or_default();
+    let contacts = match state.store.list_contacts(&mb.addr, 500).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
+    let contact_groups = match state.store.list_contact_groups(&mb.addr).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
+    let mut contact_group_members = Vec::new();
+    for group in &contact_groups {
+        match state
+            .store
+            .list_contact_group_members(&mb.addr, &group.id)
+            .await
+        {
+            Ok(members) => contact_group_members.push((group.clone(), members)),
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+    let duplicate_contacts = match state.store.duplicate_contacts(&mb.addr).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
     let sender_lists = match state.store.list_sender_lists(&mb.addr).await {
         Ok(list) => list,
         Err(e) => {
@@ -5434,7 +5587,12 @@ async fn settings_page(
         senders_section = render_sender_lists_section(&sender_lists, &token),
         identities_section = render_identities_section(&identities, &mb.addr, &token),
         signatures_section = render_signatures_section(&signatures, &identities, &mb.addr, &token),
-        contacts_section = render_contacts_section(&contacts, &token),
+        contacts_section = render_contacts_section(
+            &contacts,
+            &contact_group_members,
+            &duplicate_contacts,
+            &token
+        ),
     );
     let html = render_page("Settings", &email, &content, "settings");
     match set_cookie {
@@ -6710,45 +6868,200 @@ fn render_identities_section(
     )
 }
 
-/// The Contacts settings card: the mailbox's contacts (auto-harvested + manual, with delete) and a
-/// manual add form.
-fn render_contacts_section(contacts: &[Contact], token: &str) -> String {
-    let mut rows = String::new();
+/// The Contacts settings card: rich contact cards, group management, import/export, and duplicate
+/// merge. The class hooks are intentionally SSR-only; visual styling stays in the stylesheet owner.
+fn render_contacts_section(
+    contacts: &[Contact],
+    groups: &[(ContactGroup, Vec<Contact>)],
+    duplicate_contacts: &[Contact],
+    token: &str,
+) -> String {
+    let mut cards = String::new();
     if contacts.is_empty() {
-        rows.push_str(r#"<tr><td colspan="4" class="muted">No contacts yet — they build up as you send and receive mail.</td></tr>"#);
+        cards.push_str(
+            r#"<p class="muted contact-empty">No contacts yet - they build up as you send and receive mail.</p>"#,
+        );
     }
     for c in contacts {
-        let kind = if c.manual { "manual" } else { "auto" };
-        rows.push_str(&format!(
-            r#"<tr><td>{addr}</td><td>{name}</td><td class="muted">{kind}</td><td>
-<form class="row-actions" method="post" action="/settings/contacts">
+        cards.push_str(&render_contact_card(c, token));
+    }
+
+    let mut duplicates = String::new();
+    if !duplicate_contacts.is_empty() {
+        for c in duplicate_contacts {
+            duplicates.push_str(&format!(
+                r#"<form class="row-actions contact-duplicate" method="post" action="/settings/contacts">
   <input type="hidden" name="csrf" value="{token}">
   <input type="hidden" name="addr" value="{addr}">
-  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
-</form></td></tr>"#,
-            addr = esc(&c.addr),
-            name = esc(&c.name),
-            kind = kind,
-            token = esc(token),
-        ));
+  <span>{label}</span>
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="merge">Merge</button>
+</form>"#,
+                token = esc(token),
+                addr = esc(&c.addr),
+                label = esc(&contact_label(c)),
+            ));
+        }
+        duplicates =
+            format!(r#"<div class="contact-duplicates"><h3>Duplicates</h3>{duplicates}</div>"#);
     }
+
+    let mut group_cards = String::new();
+    if groups.is_empty() {
+        group_cards.push_str(r#"<p class="muted contact-group-empty">No groups yet.</p>"#);
+    }
+    for (group, members) in groups {
+        group_cards.push_str(&render_contact_group_card(group, members, contacts, token));
+    }
+
     format!(
-        r#"<section class="card pad">
+        r#"<section class="contacts-settings" id="contacts">
   <h2>Contacts</h2>
-  <p class="muted">Correspondents power the To/Cc autocomplete. Addresses are harvested automatically; you can add your own here.</p>
-  <table class="data admin-table">
-    <thead><tr><th>Address</th><th>Name</th><th>Source</th><th></th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-  <form method="post" action="/settings/contacts">
+  <p class="muted">Correspondents power autocomplete and contact groups expand in the To/Cc fields.</p>
+  <div class="contact-actions">
+    <a class="btn btn-ghost btn-sm btn-export-vcard" href="/settings/contacts/export?format=vcf">Export vCard</a>
+    <a class="btn btn-ghost btn-sm btn-export-csv" href="/settings/contacts/export?format=csv">Export CSV</a>
+  </div>
+  <div class="contact-grid">{cards}</div>
+  {duplicates}
+  <form class="contact-card contact-create" method="post" action="/settings/contacts">
     <input type="hidden" name="csrf" value="{token}">
     <div class="field"><label for="ct_addr">Address</label><input id="ct_addr" name="addr" placeholder="friend@example.com"></div>
     <div class="field"><label for="ct_name">Name</label><input id="ct_name" name="name" placeholder="Friend"></div>
+    <div class="field"><label for="ct_phone">Phone</label><input id="ct_phone" name="phone"></div>
+    <div class="field"><label for="ct_company">Company</label><input id="ct_company" name="company"></div>
+    <div class="field"><label for="ct_title">Title</label><input id="ct_title" name="title"></div>
+    <div class="field"><label for="ct_notes">Notes</label><textarea id="ct_notes" name="notes"></textarea></div>
     <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add contact</button></div>
   </form>
+  <div class="contact-groups">
+    <h3>Groups</h3>
+    {group_cards}
+    <form class="contact-group contact-group-create" method="post" action="/settings/contact-groups">
+      <input type="hidden" name="csrf" value="{token}">
+      <div class="field"><label for="cg_name">Group name</label><input id="cg_name" name="name" placeholder="Team"></div>
+      <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add group</button></div>
+    </form>
+  </div>
+  <form class="contact-import" method="post" action="/settings/contacts/import" enctype="multipart/form-data">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="ct_import_format">Format</label><select id="ct_import_format" name="format"><option value="auto">Auto</option><option value="vcf">vCard</option><option value="csv">CSV</option></select></div>
+    <div class="field"><label for="ct_import_file">File</label><input id="ct_import_file" name="file" type="file" accept=".vcf,.vcard,.csv,text/vcard,text/csv"></div>
+    <div class="field"><label for="ct_import_data">Paste</label><textarea id="ct_import_data" name="data"></textarea></div>
+    <div class="form-actions"><button class="btn btn-primary btn-import-vcard" type="submit">Import</button></div>
+  </form>
 </section>"#,
+        cards = cards,
+        duplicates = duplicates,
+        group_cards = group_cards,
         token = esc(token),
     )
+}
+
+fn render_contact_card(c: &Contact, token: &str) -> String {
+    let kind = if c.manual { "manual" } else { "auto" };
+    format!(
+        r#"<article class="contact-card" data-contact="{addr}">
+  <form method="post" action="/settings/contacts">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="addr" value="{addr}">
+    <header><h3>{label}</h3><span class="muted">{kind}</span></header>
+    <div class="field"><label>Name</label><input name="name" value="{name}"></div>
+    <div class="field"><label>Phone</label><input name="phone" value="{phone}"></div>
+    <div class="field"><label>Company</label><input name="company" value="{company}"></div>
+    <div class="field"><label>Title</label><input name="title" value="{title}"></div>
+    <div class="field"><label>Notes</label><textarea name="notes">{notes}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-primary btn-sm" type="submit" name="cmd" value="update">Save</button>
+      <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+    </div>
+  </form>
+</article>"#,
+        token = esc(token),
+        addr = esc(&c.addr),
+        label = esc(&contact_label(c)),
+        kind = kind,
+        name = esc(&c.name),
+        phone = esc(&c.phone),
+        company = esc(&c.company),
+        title = esc(&c.title),
+        notes = esc(&c.notes),
+    )
+}
+
+fn render_contact_group_card(
+    group: &ContactGroup,
+    members: &[Contact],
+    contacts: &[Contact],
+    token: &str,
+) -> String {
+    let mut member_rows = String::new();
+    if members.is_empty() {
+        member_rows.push_str(r#"<li class="muted">No members.</li>"#);
+    }
+    for member in members {
+        member_rows.push_str(&format!(
+            r#"<li>
+  <form class="row-actions" method="post" action="/settings/contact-groups">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="id" value="{id}">
+    <input type="hidden" name="addr" value="{addr}">
+    <span>{label}</span>
+    <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="remove-member">Remove</button>
+  </form>
+</li>"#,
+            token = esc(token),
+            id = esc(&group.id),
+            addr = esc(&member.addr),
+            label = esc(&contact_label(member)),
+        ));
+    }
+    format!(
+        r#"<article class="contact-group" data-group="{id}">
+  <form method="post" action="/settings/contact-groups">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="id" value="{id}">
+    <div class="field"><label>Group name</label><input name="name" value="{name}"></div>
+    <div class="form-actions">
+      <button class="btn btn-primary btn-sm" type="submit" name="cmd" value="update">Save</button>
+      <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+    </div>
+  </form>
+  <ul class="contact-group-members">{member_rows}</ul>
+  <form class="row-actions" method="post" action="/settings/contact-groups">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="id" value="{id}">
+    <select name="addr" aria-label="Contact">{options}</select>
+    <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="add-member">Add member</button>
+  </form>
+</article>"#,
+        token = esc(token),
+        id = esc(&group.id),
+        name = esc(&group.name),
+        member_rows = member_rows,
+        options = render_contact_options(contacts, ""),
+    )
+}
+
+fn render_contact_options(contacts: &[Contact], selected: &str) -> String {
+    let mut options = String::new();
+    for c in contacts {
+        let sel = if c.addr == selected { " selected" } else { "" };
+        options.push_str(&format!(
+            r#"<option value="{addr}"{sel}>{label}</option>"#,
+            addr = esc(&c.addr),
+            label = esc(&contact_label(c)),
+            sel = sel,
+        ));
+    }
+    options
+}
+
+fn contact_label(c: &Contact) -> String {
+    if c.name.trim().is_empty() {
+        c.addr.clone()
+    } else {
+        format!("{} <{}>", c.name.trim(), c.addr)
+    }
 }
 
 /// Form body for `POST /settings/labels`: CSRF, `cmd` (`add`|`delete`), and the label `name` (add)
@@ -6908,6 +7221,14 @@ struct ContactForm {
     addr: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    phone: String,
+    #[serde(default)]
+    company: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    notes: String,
 }
 
 /// `POST /settings/contacts` — add a manual contact or delete one, scoped to the signed-in mailbox.
@@ -6930,6 +7251,7 @@ async fn settings_contacts_post(
     let addr = extract_addr(&form.addr).to_lowercase();
     let result = match form.cmd.as_str() {
         "delete" => state.store.delete_contact(&mb.addr, &addr).await,
+        "merge" => state.store.merge_duplicate_contact(&mb.addr, &addr).await,
         _ => {
             if !addr.contains('@') {
                 return error_page(
@@ -6938,10 +7260,17 @@ async fn settings_contacts_post(
                     "A valid contact address is required.",
                 );
             }
-            state
-                .store
-                .upsert_contact(&mb.addr, &addr, form.name.trim(), true)
-                .await
+            let contact = Contact {
+                addr: addr.clone(),
+                name: form.name.trim().to_string(),
+                phone: form.phone.trim().to_string(),
+                company: form.company.trim().to_string(),
+                title: form.title.trim().to_string(),
+                notes: form.notes.trim().to_string(),
+                manual: true,
+                seen_count: 0,
+            };
+            state.store.save_contact(&mb.addr, &contact).await
         }
     };
     if let Err(e) = result {
@@ -6959,6 +7288,600 @@ async fn settings_contacts_post(
         "contact change",
     );
     Redirect::to("/settings").into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct ContactGroupForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    addr: String,
+}
+
+async fn settings_contact_groups_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ContactGroupForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let result = match form.cmd.as_str() {
+        "delete" => {
+            state
+                .store
+                .delete_contact_group(&mb.addr, form.id.trim())
+                .await
+        }
+        "add-member" => {
+            let addr = extract_addr(&form.addr).to_lowercase();
+            state
+                .store
+                .add_contact_group_member(&mb.addr, form.id.trim(), &addr)
+                .await
+        }
+        "remove-member" => {
+            let addr = extract_addr(&form.addr).to_lowercase();
+            state
+                .store
+                .delete_contact_group_member(&mb.addr, form.id.trim(), &addr)
+                .await
+        }
+        _ => {
+            let name = form.name.trim();
+            if name.is_empty() || name.contains(',') || name.contains(';') {
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "A group name is required and cannot contain recipient separators.",
+                );
+            }
+            let id = if form.id.trim().is_empty() {
+                new_id("cg")
+            } else {
+                form.id.trim().to_string()
+            };
+            let group = ContactGroup {
+                id,
+                user: mb.addr.clone(),
+                name: name.to_string(),
+                created_at: now_secs(),
+            };
+            state.store.save_contact_group(&group).await
+        }
+    };
+    if let Err(e) = result {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        "contact group change",
+    );
+    Redirect::to("/settings#contacts").into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct ContactExportQuery {
+    #[serde(default)]
+    format: String,
+}
+
+async fn settings_contacts_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ContactExportQuery>,
+) -> Response {
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let contacts = match state.store.list_contacts(&mb.addr, 10_000).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
+    if q.format.eq_ignore_ascii_case("csv") {
+        (
+            [
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"contacts.csv\"".to_string(),
+                ),
+            ],
+            export_contacts_csv(&contacts),
+        )
+            .into_response()
+    } else {
+        (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "text/vcard; charset=utf-8".to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"contacts.vcf\"".to_string(),
+                ),
+            ],
+            export_contacts_vcard(&contacts),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Default)]
+struct ContactImportPayload {
+    csrf: String,
+    format: String,
+    data: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ContactImportForm {
+    csrf: String,
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    data: String,
+}
+
+async fn settings_contacts_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    let payload = match parse_contact_import(req, &state, &headers).await {
+        Ok(payload) => payload,
+        Err(resp) => return resp,
+    };
+    if !verify_csrf(&headers, &payload.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let mut parsed = parse_imported_contacts(&payload.data, &payload.format);
+    let existing = match state.store.list_contacts(&mb.addr, 10_000).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+    };
+    let mut by_addr: HashMap<String, Contact> = existing
+        .into_iter()
+        .map(|c| (c.addr.to_lowercase(), c))
+        .collect();
+    let mut imported = 0_i64;
+    for mut contact in parsed.contacts.drain(..) {
+        contact.addr = extract_addr(&contact.addr).to_lowercase();
+        if !is_valid_recipient_addr(&contact.addr) {
+            parsed.skipped += 1;
+            continue;
+        }
+        contact.manual = true;
+        let merged = if let Some(existing) = by_addr.get(&contact.addr) {
+            merge_import_contact(existing, &contact)
+        } else {
+            contact
+        };
+        if let Err(e) = state.store.save_contact(&mb.addr, &merged).await {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            );
+        }
+        by_addr.insert(merged.addr.clone(), merged);
+        imported += 1;
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        imported,
+        skipped = parsed.skipped,
+        "contacts import",
+    );
+    Redirect::to("/settings#contacts").into_response()
+}
+
+async fn parse_contact_import(
+    req: Request,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ContactImportPayload, Response> {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.starts_with("multipart/form-data") {
+        let mut mp = Multipart::from_request(req, state)
+            .await
+            .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid request", &e.to_string()))?;
+        let mut payload = ContactImportPayload::default();
+        loop {
+            let field = match mp.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(error_page(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid upload",
+                        &e.to_string(),
+                    ));
+                }
+            };
+            let name = field.name().unwrap_or("").to_string();
+            if name == "file" {
+                let filename = field.file_name().map(str::to_string).unwrap_or_default();
+                let bytes = field.bytes().await.map_err(|e| {
+                    error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string())
+                })?;
+                if !bytes.is_empty() {
+                    payload.data = String::from_utf8_lossy(&bytes).into_owned();
+                    if payload.format.trim().is_empty() || payload.format == "auto" {
+                        payload.format = contact_format_from_filename(&filename);
+                    }
+                }
+            } else {
+                let text = field.text().await.unwrap_or_default();
+                match name.as_str() {
+                    "csrf" => payload.csrf = text,
+                    "format" => payload.format = text,
+                    "data" if !text.trim().is_empty() && payload.data.trim().is_empty() => {
+                        payload.data = text
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(payload)
+    } else {
+        let Form(form) = Form::<ContactImportForm>::from_request(req, state)
+            .await
+            .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid request", &e.to_string()))?;
+        Ok(ContactImportPayload {
+            csrf: form.csrf,
+            format: form.format,
+            data: form.data,
+        })
+    }
+}
+
+struct ContactImportResult {
+    contacts: Vec<Contact>,
+    skipped: i64,
+}
+
+fn parse_imported_contacts(data: &str, format: &str) -> ContactImportResult {
+    let fmt = format.trim().to_lowercase();
+    if fmt == "csv" {
+        return parse_contacts_csv(data);
+    }
+    if fmt == "vcf" || fmt == "vcard" {
+        return parse_contacts_vcard(data);
+    }
+    if data.to_ascii_uppercase().contains("BEGIN:VCARD") {
+        parse_contacts_vcard(data)
+    } else {
+        parse_contacts_csv(data)
+    }
+}
+
+fn contact_format_from_filename(filename: &str) -> String {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".csv") {
+        "csv".to_string()
+    } else if lower.ends_with(".vcf") || lower.ends_with(".vcard") {
+        "vcf".to_string()
+    } else {
+        "auto".to_string()
+    }
+}
+
+fn parse_contacts_csv(data: &str) -> ContactImportResult {
+    let mut contacts = Vec::new();
+    let mut skipped = 0_i64;
+    let mut rows = data
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty());
+    let Some(first) = rows.next() else {
+        return ContactImportResult { contacts, skipped };
+    };
+    let first_fields = parse_csv_line(first);
+    let lower: Vec<String> = first_fields.iter().map(|f| f.to_lowercase()).collect();
+    let has_header = lower
+        .iter()
+        .any(|f| matches!(f.as_str(), "email" | "addr" | "address"));
+    let header = if has_header {
+        lower
+    } else {
+        vec![
+            "name".to_string(),
+            "email".to_string(),
+            "phone".to_string(),
+            "company".to_string(),
+            "title".to_string(),
+            "notes".to_string(),
+        ]
+    };
+    if !has_header {
+        match contact_from_csv_fields(&header, &first_fields) {
+            Some(contact) => contacts.push(contact),
+            None => skipped += 1,
+        }
+    }
+    for line in rows {
+        let fields = parse_csv_line(line);
+        match contact_from_csv_fields(&header, &fields) {
+            Some(contact) => contacts.push(contact),
+            None => skipped += 1,
+        }
+    }
+    ContactImportResult { contacts, skipped }
+}
+
+fn contact_from_csv_fields(header: &[String], fields: &[String]) -> Option<Contact> {
+    let get = |names: &[&str]| -> String {
+        for name in names {
+            if let Some(idx) = header.iter().position(|h| h == name) {
+                return fields.get(idx).cloned().unwrap_or_default();
+            }
+        }
+        String::new()
+    };
+    let addr = get(&["email", "addr", "address"]).trim().to_lowercase();
+    if !is_valid_recipient_addr(&addr) {
+        return None;
+    }
+    Some(Contact {
+        addr,
+        name: get(&["name", "full name", "fn"]).trim().to_string(),
+        phone: get(&["phone", "tel", "telephone"]).trim().to_string(),
+        company: get(&["company", "org", "organization"]).trim().to_string(),
+        title: get(&["title", "job title"]).trim().to_string(),
+        notes: get(&["notes", "note"]).trim().to_string(),
+        manual: true,
+        seen_count: 0,
+    })
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                out.push(field.trim().to_string());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    out.push(field.trim().to_string());
+    out
+}
+
+fn parse_contacts_vcard(data: &str) -> ContactImportResult {
+    let mut contacts = Vec::new();
+    let mut skipped = 0_i64;
+    let lines = unfold_vcard_lines(data);
+    let mut current: HashMap<String, String> = HashMap::new();
+    let mut in_card = false;
+    for line in lines {
+        let upper = line.to_ascii_uppercase();
+        if upper == "BEGIN:VCARD" {
+            current.clear();
+            in_card = true;
+            continue;
+        }
+        if upper == "END:VCARD" {
+            if let Some(contact) = contact_from_vcard_map(&current) {
+                contacts.push(contact);
+            } else {
+                skipped += 1;
+            }
+            in_card = false;
+            continue;
+        }
+        if !in_card {
+            continue;
+        }
+        let Some((raw_key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = raw_key
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_uppercase();
+        if matches!(
+            key.as_str(),
+            "FN" | "N" | "EMAIL" | "TEL" | "ORG" | "TITLE" | "NOTE"
+        ) && !current.contains_key(&key)
+        {
+            current.insert(key, vcard_unescape(value.trim()));
+        }
+    }
+    ContactImportResult { contacts, skipped }
+}
+
+fn unfold_vcard_lines(data: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in data.lines() {
+        let line = raw.trim_end_matches('\r');
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = out.last_mut() {
+                last.push_str(line.trim_start());
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+fn contact_from_vcard_map(values: &HashMap<String, String>) -> Option<Contact> {
+    let addr = values.get("EMAIL")?.trim().to_lowercase();
+    if !is_valid_recipient_addr(&addr) {
+        return None;
+    }
+    let name = values
+        .get("FN")
+        .cloned()
+        .or_else(|| values.get("N").map(|n| vcard_n_to_name(n)))
+        .unwrap_or_default();
+    Some(Contact {
+        addr,
+        name: name.trim().to_string(),
+        phone: values.get("TEL").cloned().unwrap_or_default(),
+        company: values.get("ORG").cloned().unwrap_or_default(),
+        title: values.get("TITLE").cloned().unwrap_or_default(),
+        notes: values.get("NOTE").cloned().unwrap_or_default(),
+        manual: true,
+        seen_count: 0,
+    })
+}
+
+fn vcard_n_to_name(n: &str) -> String {
+    let parts: Vec<&str> = n.split(';').collect();
+    let family = parts.first().copied().unwrap_or("");
+    let given = parts.get(1).copied().unwrap_or("");
+    format!("{given} {family}").trim().to_string()
+}
+
+fn vcard_unescape(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+}
+
+fn merge_import_contact(existing: &Contact, imported: &Contact) -> Contact {
+    let mut merged = existing.clone();
+    if merged.name.trim().is_empty() && !imported.name.trim().is_empty() {
+        merged.name = imported.name.clone();
+    }
+    if merged.phone.trim().is_empty() && !imported.phone.trim().is_empty() {
+        merged.phone = imported.phone.clone();
+    }
+    if merged.company.trim().is_empty() && !imported.company.trim().is_empty() {
+        merged.company = imported.company.clone();
+    }
+    if merged.title.trim().is_empty() && !imported.title.trim().is_empty() {
+        merged.title = imported.title.clone();
+    }
+    if merged.notes.trim().is_empty() && !imported.notes.trim().is_empty() {
+        merged.notes = imported.notes.clone();
+    }
+    merged.manual = true;
+    merged
+}
+
+fn export_contacts_csv(contacts: &[Contact]) -> String {
+    let mut out = String::from("name,email,phone,company,title,notes\n");
+    for c in contacts {
+        out.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            csv_escape(&c.name),
+            csv_escape(&c.addr),
+            csv_escape(&c.phone),
+            csv_escape(&c.company),
+            csv_escape(&c.title),
+            csv_escape(&c.notes),
+        ));
+    }
+    out
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn export_contacts_vcard(contacts: &[Contact]) -> String {
+    let mut out = String::new();
+    for c in contacts {
+        out.push_str("BEGIN:VCARD\r\nVERSION:3.0\r\n");
+        out.push_str(&format!(
+            "FN:{}\r\nEMAIL;TYPE=INTERNET:{}\r\n",
+            vcard_escape(if c.name.trim().is_empty() {
+                &c.addr
+            } else {
+                &c.name
+            }),
+            vcard_escape(&c.addr)
+        ));
+        if !c.phone.trim().is_empty() {
+            out.push_str(&format!("TEL:{}\r\n", vcard_escape(&c.phone)));
+        }
+        if !c.company.trim().is_empty() {
+            out.push_str(&format!("ORG:{}\r\n", vcard_escape(&c.company)));
+        }
+        if !c.title.trim().is_empty() {
+            out.push_str(&format!("TITLE:{}\r\n", vcard_escape(&c.title)));
+        }
+        if !c.notes.trim().is_empty() {
+            out.push_str(&format!("NOTE:{}\r\n", vcard_escape(&c.notes)));
+        }
+        out.push_str("END:VCARD\r\n");
+    }
+    out
+}
+
+fn vcard_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "")
+        .replace(';', "\\;")
+        .replace(',', "\\,")
 }
 
 // ---------------------------------------------------------------------------

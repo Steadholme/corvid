@@ -490,6 +490,116 @@ async fn contacts_suggest_endpoint_is_scoped_json() {
     assert_eq!(body.trim(), "[]");
 }
 
+#[tokio::test]
+async fn contacts_crud_groups_import_export_and_group_send() {
+    let state = build_dev_state().await;
+    state.store.set_undo_send_window(MAILBOX, 0).await.unwrap();
+    let (token, cookie) = mint_csrf(&state).await;
+
+    let form = format!(
+        "csrf={token}&cmd=add&addr=alice%40example.com&name=Alice&phone=123&company=Holdfast&title=Ops&notes=Primary"
+    );
+    let resp = app(state.clone())
+        .oneshot(post("/settings/contacts", &cookie, form))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let contacts = state.store.list_contacts(MAILBOX, 10).await.unwrap();
+    assert_eq!(contacts.len(), 1);
+    assert_eq!(contacts[0].phone, "123");
+    assert_eq!(contacts[0].company, "Holdfast");
+
+    let req = Request::builder()
+        .uri("/settings")
+        .header("x-auth-subject", "w33d")
+        .header(header::COOKIE, cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains("contact-card"));
+    assert!(html.contains("contact-group"));
+    assert!(html.contains("btn-import-vcard"));
+    assert!(html.contains("Alice &lt;alice@example.com&gt;"));
+
+    let form = format!("csrf={token}&cmd=add&name=Friends");
+    let resp = app(state.clone())
+        .oneshot(post("/settings/contact-groups", &cookie, form))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let groups = state.store.list_contact_groups(MAILBOX).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    let group_id = groups[0].id.clone();
+
+    let form = format!("csrf={token}&cmd=add-member&id={group_id}&addr=alice%40example.com");
+    let resp = app(state.clone())
+        .oneshot(post("/settings/contact-groups", &cookie, form))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let members = state
+        .store
+        .list_contact_group_members(MAILBOX, &group_id)
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].addr, "alice@example.com");
+
+    let csv = "name,email,phone,company,title,notes\nBob,bob@example.com,456,Example,Sales,Imported\nbad,row\n";
+    let form = format!("csrf={token}&format=csv&data={}", urlencode(csv));
+    let resp = app(state.clone())
+        .oneshot(post("/settings/contacts/import", &cookie, form))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let contacts = state.store.list_contacts(MAILBOX, 10).await.unwrap();
+    assert_eq!(contacts.len(), 2);
+    assert!(contacts
+        .iter()
+        .any(|c| c.addr == "bob@example.com" && c.phone == "456"));
+
+    let req = Request::builder()
+        .uri("/settings/contacts/export?format=csv")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let csv_body = body_string(resp).await;
+    assert!(csv_body.contains("name,email,phone,company,title,notes"));
+    assert!(csv_body.contains("alice@example.com"));
+
+    let req = Request::builder()
+        .uri("/settings/contacts/export?format=vcf")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let vcf = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(vcf.contains("BEGIN:VCARD"));
+    assert!(vcf.contains("EMAIL;TYPE=INTERNET:alice@example.com"));
+    assert!(vcf.contains("TEL:123"));
+
+    let req = Request::builder()
+        .uri("/contacts/suggest?q=Friends")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let suggest = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(suggest.contains(r#""addr":"Friends""#));
+    assert!(suggest.contains(r#""name":"Group""#));
+
+    let form = format!("csrf={token}&action=send&to=Friends&subject=Hi&body=x");
+    let resp = app(state.clone())
+        .oneshot(post("/send", &cookie, form))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].rcpts, vec!["alice@example.com".to_string()]);
+    assert!(due[0].raw.contains("To: alice@example.com"));
+}
+
 // ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------
