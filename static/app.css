@@ -600,3 +600,60 @@ mark.search-hit {
   color:var(--ink-4);
   pointer-events:none;
 }
+
+/* ============================================================
+   Spam / junk zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   .folder-spam · .btn-report-spam / .btn-not-spam · .spam-banner
+   · .sender-list-safe / .sender-list-blocked. Tokens only — no
+   new fonts/libs/links. Motion is covered by the global
+   prefers-reduced-motion rule above; colour adapts via tokens.
+   ============================================================ */
+
+/* Spam folder pill in the tab strip. It is already a .btn pill so
+   it stays unified with the other folders; a restrained --warn dot
+   marks it as the junk folder. Scoped to .folder-tabs so the same
+   .folder-spam hook on spam mail rows (.mailrow-wrap) is untouched. */
+.folder-tabs .folder-spam::before {
+  content:""; flex:none; width:6px; height:6px;
+  border-radius:50%; background:var(--warn);
+}
+/* On the active (indigo) pill the dot flips to white so it stays visible. */
+.folder-tabs .btn-primary.folder-spam::before { background:#fff; opacity:.85; }
+
+/* Report spam — weak warning: keeps the ghost body, tints only the
+   label (--warn-ink, 5.0:1 on --surface) and reveals a --warn border
+   on hover (4.7:1 on --surface-2). No loud fill, never over-saturated. */
+.btn-report-spam { color:var(--warn-ink); }
+.btn-report-spam:hover {
+  background:var(--surface-2); border-color:var(--warn); color:var(--warn-ink);
+}
+
+/* Not spam — neutral / positive: subtle --ok-ink label (5.0:1 on
+   --surface) with an --ok border on hover (4.7:1). Deliberately quiet
+   so it never competes with primary actions. */
+.btn-not-spam { color:var(--ok-ink); }
+.btn-not-spam:hover {
+  background:var(--surface-2); border-color:var(--ok); color:var(--ok-ink);
+}
+
+/* Spam warning banner on the read view. Soft --down tint + left accent
+   (same left-rule idiom as .compose-rich blockquote). --down-ink text
+   on --down-soft is 5.3:1 (>= AA 4.5) so the hit reason stays legible;
+   restrained via the pale tint rather than a saturated fill. */
+.spam-banner {
+  display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;
+  margin:0 0 16px; padding:11px 14px 11px 13px;
+  background:var(--down-soft); color:var(--down-ink);
+  border-left:3px solid var(--down); border-radius:var(--r-xs);
+  font-size:13px; line-height:1.45;
+}
+.spam-banner b { font-weight:700; letter-spacing:.01em; }
+.spam-banner span { color:var(--down-ink); font-weight:500; }
+
+/* Safe / blocked sender lists in settings. Layout reuses the shared
+   .card.pad + .data.admin-table; only the per-row .pill is recoloured
+   by list kind — safe = --ok (matches .pill-ok), blocked = --down
+   (5.3:1, matches .pill-down). */
+.sender-list-safe .pill { background:var(--ok-soft); color:var(--ok-ink); }
+.sender-list-blocked .pill { background:var(--down-soft); color:var(--down-ink); }
