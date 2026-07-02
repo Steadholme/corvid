@@ -1,6 +1,7 @@
 //! Domain types persisted by the [`crate::store::Store`].
 
 use serde::Serialize;
+use time::{Date, Month};
 
 /// A mailbox: an address that receives mail, owned by a HOLDFAST identity (`owner_sub`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -126,6 +127,243 @@ pub struct MessageSummary {
     pub starred: bool,
 }
 
+/// Parsed search input: free text terms plus structured predicates. Positive clauses are ANDed by
+/// default; when `or_mode` is true, positive clauses are ORed. Negated clauses always exclude.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub text_terms: Vec<SearchTextTerm>,
+    pub predicates: Vec<SearchPredicate>,
+    pub or_mode: bool,
+}
+
+impl SearchQuery {
+    pub fn positive_text_terms(&self) -> impl Iterator<Item = &str> {
+        self.text_terms
+            .iter()
+            .filter(|term| !term.negated)
+            .map(|term| term.value.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchTextTerm {
+    pub value: String,
+    pub negated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchPredicate {
+    pub kind: SearchPredicateKind,
+    pub negated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchPredicateKind {
+    From(String),
+    To(String),
+    Cc(String),
+    Subject(String),
+    Label(String),
+    Is(SearchState),
+    HasAttachment,
+    InFolder(String),
+    Before(i64),
+    After(i64),
+    Larger(i64),
+    Smaller(i64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchState {
+    Read,
+    Unread,
+    Starred,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchToken {
+    text: String,
+    quoted: bool,
+}
+
+/// Parse a Gmail-style search string. Invalid or unknown operators degrade to ordinary text terms,
+/// so user input never becomes a request error.
+pub fn parse_search_query(raw: &str) -> SearchQuery {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return SearchQuery::default();
+    }
+
+    let tokens = tokenize_search(raw);
+    let has_or = tokens
+        .iter()
+        .any(|token| !token.quoted && token.text.eq_ignore_ascii_case("OR"));
+    let has_negation = tokens.iter().any(|token| {
+        token
+            .text
+            .strip_prefix('-')
+            .is_some_and(|rest| !rest.is_empty())
+    });
+    let has_operator = tokens.iter().any(|token| {
+        let text = token.text.strip_prefix('-').unwrap_or(&token.text);
+        text.split_once(':')
+            .is_some_and(|(op, _)| is_search_operator(op))
+    });
+    let has_quotes = tokens.iter().any(|token| token.quoted);
+
+    if !has_or && !has_negation && !has_operator && !has_quotes {
+        return SearchQuery {
+            text_terms: vec![SearchTextTerm {
+                value: raw.to_string(),
+                negated: false,
+            }],
+            predicates: Vec::new(),
+            or_mode: false,
+        };
+    }
+
+    let mut query = SearchQuery {
+        text_terms: Vec::new(),
+        predicates: Vec::new(),
+        or_mode: has_or,
+    };
+    for token in tokens {
+        if !token.quoted && token.text.eq_ignore_ascii_case("OR") {
+            continue;
+        }
+        let text = token.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (negated, clause) = match text.strip_prefix('-') {
+            Some(rest) if !rest.is_empty() => (true, rest.trim()),
+            _ => (false, text),
+        };
+        if clause.is_empty() {
+            continue;
+        }
+        if let Some(predicate) = parse_search_predicate(clause, negated) {
+            query.predicates.push(predicate);
+        } else {
+            query.text_terms.push(SearchTextTerm {
+                value: clause.to_string(),
+                negated,
+            });
+        }
+    }
+    query
+}
+
+fn tokenize_search(raw: &str) -> Vec<SearchToken> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    let mut quoted = false;
+
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                quoted = true;
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() {
+                    out.push(SearchToken {
+                        text: std::mem::take(&mut cur),
+                        quoted,
+                    });
+                    quoted = false;
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+
+    if !cur.is_empty() {
+        out.push(SearchToken { text: cur, quoted });
+    }
+    out
+}
+
+fn parse_search_predicate(token: &str, negated: bool) -> Option<SearchPredicate> {
+    let (op, value) = token.split_once(':')?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let kind = match op.to_ascii_lowercase().as_str() {
+        "from" => SearchPredicateKind::From(value.to_string()),
+        "to" => SearchPredicateKind::To(value.to_string()),
+        "cc" => SearchPredicateKind::Cc(value.to_string()),
+        "subject" => SearchPredicateKind::Subject(value.to_string()),
+        "label" => SearchPredicateKind::Label(value.to_string()),
+        "is" => match value.to_ascii_lowercase().as_str() {
+            "read" => SearchPredicateKind::Is(SearchState::Read),
+            "unread" => SearchPredicateKind::Is(SearchState::Unread),
+            "starred" => SearchPredicateKind::Is(SearchState::Starred),
+            _ => return None,
+        },
+        "has" => match value.to_ascii_lowercase().as_str() {
+            "attachment" => SearchPredicateKind::HasAttachment,
+            _ => return None,
+        },
+        "in" => SearchPredicateKind::InFolder(value.to_string()),
+        "before" => SearchPredicateKind::Before(parse_search_date(value)?),
+        "after" => SearchPredicateKind::After(parse_search_date(value)?),
+        "larger" => SearchPredicateKind::Larger(parse_search_size(value)?),
+        "smaller" => SearchPredicateKind::Smaller(parse_search_size(value)?),
+        _ => return None,
+    };
+    Some(SearchPredicate { kind, negated })
+}
+
+fn is_search_operator(op: &str) -> bool {
+    matches!(
+        op.to_ascii_lowercase().as_str(),
+        "from"
+            | "to"
+            | "cc"
+            | "subject"
+            | "label"
+            | "is"
+            | "has"
+            | "in"
+            | "before"
+            | "after"
+            | "larger"
+            | "smaller"
+    )
+}
+
+fn parse_search_date(value: &str) -> Option<i64> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let month = Month::try_from(month).ok()?;
+    let date = Date::from_calendar_date(year, month, day).ok()?;
+    Some(date.midnight().assume_utc().unix_timestamp())
+}
+
+fn parse_search_size(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024_i64),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_i64 * 1024),
+        _ => (value, 1),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
 /// A collapsed conversation row for the threaded folder view: the newest message in the thread
 /// (the `latest` summary shown as the snippet) plus the thread's message `count` and how many are
 /// still `unseen`.
@@ -203,4 +441,153 @@ pub struct OutboundItem {
     pub next_at: i64,
     /// `queued` | `sent` | `failed`.
     pub status: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_search_query_preserves_bare_substring_search() {
+        let q = parse_search_query("quarterly report");
+        assert!(!q.or_mode);
+        assert!(q.predicates.is_empty());
+        assert_eq!(
+            q.text_terms,
+            vec![SearchTextTerm {
+                value: "quarterly report".to_string(),
+                negated: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_search_query_handles_field_predicates_and_quotes() {
+        let q = parse_search_query(r#"from:alice subject:"quarterly report" "exact phrase""#);
+        assert_eq!(
+            q.predicates,
+            vec![
+                SearchPredicate {
+                    kind: SearchPredicateKind::From("alice".to_string()),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Subject("quarterly report".to_string()),
+                    negated: false,
+                },
+            ]
+        );
+        assert_eq!(
+            q.text_terms,
+            vec![SearchTextTerm {
+                value: "exact phrase".to_string(),
+                negated: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_search_query_handles_states_attachment_folder_and_label() {
+        let q = parse_search_query(
+            "to:bob cc:team label:Finance is:unread has:attachment in:Sent -is:starred",
+        );
+        assert_eq!(
+            q.predicates,
+            vec![
+                SearchPredicate {
+                    kind: SearchPredicateKind::To("bob".to_string()),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Cc("team".to_string()),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Label("Finance".to_string()),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Is(SearchState::Unread),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::HasAttachment,
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::InFolder("Sent".to_string()),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Is(SearchState::Starred),
+                    negated: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_search_query_handles_dates_sizes_negation_and_or() {
+        let q = parse_search_query(
+            "after:1970-01-01 before:1970-01-02 larger:10k smaller:2M alpha OR -beta",
+        );
+        assert!(q.or_mode);
+        assert_eq!(
+            q.predicates,
+            vec![
+                SearchPredicate {
+                    kind: SearchPredicateKind::After(0),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Before(86_400),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Larger(10 * 1024),
+                    negated: false,
+                },
+                SearchPredicate {
+                    kind: SearchPredicateKind::Smaller(2 * 1024 * 1024),
+                    negated: false,
+                },
+            ]
+        );
+        assert_eq!(
+            q.text_terms,
+            vec![
+                SearchTextTerm {
+                    value: "alpha".to_string(),
+                    negated: false,
+                },
+                SearchTextTerm {
+                    value: "beta".to_string(),
+                    negated: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_search_query_degrades_invalid_operators_to_text() {
+        let q = parse_search_query("before:not-a-date larger:many is:unknown");
+        assert!(q.predicates.is_empty());
+        assert_eq!(
+            q.text_terms,
+            vec![
+                SearchTextTerm {
+                    value: "before:not-a-date".to_string(),
+                    negated: false,
+                },
+                SearchTextTerm {
+                    value: "larger:many".to_string(),
+                    negated: false,
+                },
+                SearchTextTerm {
+                    value: "is:unknown".to_string(),
+                    negated: false,
+                },
+            ]
+        );
+    }
 }

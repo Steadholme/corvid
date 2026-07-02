@@ -29,7 +29,9 @@ use rand::RngCore;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::model::{Alias, Contact, FilterRule, Label, Mailbox, Message};
+use crate::model::{
+    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, SearchQuery,
+};
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
@@ -423,7 +425,10 @@ pub fn app(state: AppState) -> Router {
         .route("/assets/webmail.js", get(asset_webmail_js))
         .route("/assets/compose.js", get(asset_compose_js))
         .route("/settings", get(settings_page))
-        .route("/settings/rules", get(settings_rules_redirect).post(settings_rules_post))
+        .route(
+            "/settings/rules",
+            get(settings_rules_redirect).post(settings_rules_post),
+        )
         .route("/settings/signature", post(settings_signature))
         .route("/settings/autoreply", post(settings_autoreply))
         .route("/settings/identities", post(settings_identities_post))
@@ -439,10 +444,7 @@ pub fn app(state: AppState) -> Router {
 
 /// Middleware enforcing [`require_admin`] on the /admin subtree — renders a 403 page for any
 /// signed-in user who is not in an [`ADMIN_GROUPS`] group.
-async fn require_admin_mw(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
+async fn require_admin_mw(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     match require_admin(req.headers()) {
         Ok(()) => next.run(req).await,
         Err(resp) => resp,
@@ -490,7 +492,10 @@ async fn asset_compose_js() -> Response {
 fn js_asset(body: &str) -> Response {
     (
         [
-            (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         body.to_string(),
@@ -533,6 +538,7 @@ async fn inbox(
     let (token, set_cookie) = ensure_csrf(&headers);
 
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let parsed_search = search.map(parse_search_query);
     let limit = clamp_limit(q.limit);
     let cursor = parse_cursor(q.before.as_deref());
     // The mailbox's labels drive both the tab strip and the label-filter view.
@@ -543,9 +549,19 @@ async fn inbox(
         let Some(label) = labels.iter().find(|l| l.id == label_id) else {
             return error_page(StatusCode::NOT_FOUND, "Not found", "No such label.");
         };
-        let msgs = match state.store.list_by_label(&mb.addr, label_id, cursor, limit).await {
+        let msgs = match state
+            .store
+            .list_by_label(&mb.addr, label_id, cursor, limit)
+            .await
+        {
             Ok(m) => m,
-            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                )
+            }
         };
         let base = format!("/?label={}&limit={limit}", url_encode(label_id));
         let next_link = next_page_link(&msgs, limit, &base);
@@ -566,7 +582,14 @@ async fn inbox(
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
 <script src="/assets/webmail.js"></script>"#,
-            tabs = folder_tabs(&FolderTabs { active: "", search_q: "", scope: None, labels: &labels, active_label: label_id, threads_on: false }),
+            tabs = folder_tabs(&FolderTabs {
+                active: "",
+                search_q: "",
+                scope: None,
+                labels: &labels,
+                active_label: label_id,
+                threads_on: false
+            }),
             bulk = bulk_toolbar(&token),
         );
         let html = render_page(&label.name, &email, &content, "inbox");
@@ -581,9 +604,19 @@ async fn inbox(
     if threads_on {
         let folder = canonical_folder(q.folder.as_deref());
         if folder != STARRED_VIEW {
-            let threads = match state.store.list_folder_threads(&mb.addr, folder, cursor, limit).await {
+            let threads = match state
+                .store
+                .list_folder_threads(&mb.addr, folder, cursor, limit)
+                .await
+            {
                 Ok(t) => t,
-                Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+                Err(e) => {
+                    return error_page(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Storage error",
+                        &e.to_string(),
+                    )
+                }
             };
             let mut rows = String::new();
             if threads.is_empty() {
@@ -597,13 +630,24 @@ async fn inbox(
             }
             let base = format!("/?folder={folder}&view=threads&limit={limit}");
             let next_link = next_thread_link(&threads, limit, &base);
-            let heading = if folder == "INBOX" { "Inbox".to_string() } else { esc(folder) };
+            let heading = if folder == "INBOX" {
+                "Inbox".to_string()
+            } else {
+                esc(folder)
+            };
             let content = format!(
                 r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
 <script src="/assets/webmail.js"></script>"#,
-                tabs = folder_tabs(&FolderTabs { active: folder, search_q: "", scope: real_folder(folder).filter(|f| *f != "INBOX"), labels: &labels, active_label: "", threads_on: true }),
+                tabs = folder_tabs(&FolderTabs {
+                    active: folder,
+                    search_q: "",
+                    scope: real_folder(folder).filter(|f| *f != "INBOX"),
+                    labels: &labels,
+                    active_label: "",
+                    threads_on: true
+                }),
             );
             let html = render_page(folder, &email, &content, "inbox");
             return match set_cookie {
@@ -617,19 +661,36 @@ async fn inbox(
     // `next` keyset link to the older page (only when this page is full), and the folder the
     // search box scopes to.
     let (folder, heading, msgs, next_link, scope) = if let Some(query) = search {
+        let parsed = parsed_search
+            .as_ref()
+            .expect("parsed search exists when raw search exists");
         // Optional folder scope: only a real folder narrows the search; anything else (absent,
         // unknown, the virtual Starred view) searches the whole mailbox.
         let scope = q.folder.as_deref().and_then(real_folder);
-        let msgs = match state.store.search_messages(&mb.addr, query, scope, cursor, limit).await {
+        let msgs = match state
+            .store
+            .search_messages(&mb.addr, parsed, scope, cursor, limit)
+            .await
+        {
             Ok(m) => m,
-            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                )
+            }
         };
         let mut base = format!("/?q={}&limit={limit}", url_encode(query));
         if let Some(f) = scope {
             base.push_str(&format!("&folder={f}"));
         }
         let heading = match scope {
-            Some(f) => format!(r#"Search results for &ldquo;{}&rdquo; in {}"#, esc(query), esc(f)),
+            Some(f) => format!(
+                r#"Search results for &ldquo;{}&rdquo; in {}"#,
+                esc(query),
+                esc(f)
+            ),
             None => format!(r#"Search results for &ldquo;{}&rdquo;"#, esc(query)),
         };
         let next = next_page_link(&msgs, limit, &base);
@@ -640,11 +701,20 @@ async fn inbox(
         let listed = if folder == STARRED_VIEW {
             state.store.list_starred(&mb.addr, cursor, limit).await
         } else {
-            state.store.list_folder(&mb.addr, folder, cursor, limit).await
+            state
+                .store
+                .list_folder(&mb.addr, folder, cursor, limit)
+                .await
         };
         let msgs = match listed {
             Ok(m) => m,
-            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                )
+            }
         };
         let heading = if folder == "INBOX" {
             let unseen = state.store.unseen_count(&mb.addr).await.unwrap_or(0);
@@ -659,7 +729,11 @@ async fn inbox(
     };
 
     // Row actions redirect back to the folder/view they were invoked from (search → inbox).
-    let return_to = if folder.is_empty() { "/".to_string() } else { format!("/?folder={folder}") };
+    let return_to = if folder.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?folder={folder}")
+    };
 
     let mut rows = String::new();
     if msgs.is_empty() {
@@ -671,7 +745,10 @@ async fn inbox(
         rows.push_str(&empty_row("No messages here.", subtext));
     }
     for m in &msgs {
-        rows.push_str(&render_row(m, &token, &return_to));
+        match parsed_search.as_ref() {
+            Some(query) => rows.push_str(&render_search_row(m, &token, &return_to, query)),
+            None => rows.push_str(&render_row(m, &token, &return_to)),
+        }
     }
 
     let content = format!(
@@ -701,24 +778,114 @@ async fn inbox(
 /// archive, delete, move-to-folder). `token` is the CSRF token; `return_to` is where each action
 /// redirects back to.
 fn render_row(m: &crate::model::MessageSummary, token: &str, return_to: &str) -> String {
+    render_row_inner(m, token, return_to, None)
+}
+
+fn render_search_row(
+    m: &crate::model::MessageSummary,
+    token: &str,
+    return_to: &str,
+    query: &SearchQuery,
+) -> String {
+    render_row_inner(m, token, return_to, Some(query))
+}
+
+fn render_row_inner(
+    m: &crate::model::MessageSummary,
+    token: &str,
+    return_to: &str,
+    query: Option<&SearchQuery>,
+) -> String {
     let cls = if m.seen { "mailrow" } else { "mailrow unseen" };
     let dot = if m.seen { "dot seen" } else { "dot" };
-    let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
+    let subject_text = if m.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        m.subject.clone()
+    };
+    let subject = query
+        .map(|q| highlight_search_hits(&subject_text, q))
+        .unwrap_or_else(|| esc(&subject_text));
+    let from_display = display_from(&m.msg_from);
+    let from = query
+        .map(|q| highlight_search_hits(&from_display, q))
+        .unwrap_or_else(|| esc(&from_display));
     let star = star_mark(m.starred);
     format!(
         r#"<li class="mailrow-wrap" data-id="{id}" data-starred="{starred}" data-seen="{seen}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         starred = m.starred,
         seen = m.seen,
-        from = esc(&display_from(&m.msg_from)),
+        from = from,
         date = fmt_date(m.received_at),
         actions = row_actions(&m.id, m.starred, m.seen, token, return_to),
     )
 }
 
+fn highlight_search_hits(text: &str, query: &SearchQuery) -> String {
+    let terms: Vec<&str> = query
+        .positive_text_terms()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() || text.is_empty() {
+        return esc(text);
+    }
+
+    let mut out = String::new();
+    let mut pos = 0_usize;
+    while pos < text.len() {
+        let mut best: Option<(usize, usize)> = None;
+        for term in &terms {
+            if let Some((start, end)) = find_term_ascii_ci(&text[pos..], term) {
+                let start = pos + start;
+                let end = pos + end;
+                match best {
+                    Some((best_start, best_end))
+                        if best_start < start
+                            || (best_start == start && best_end - best_start >= end - start) => {}
+                    _ => best = Some((start, end)),
+                }
+            }
+        }
+        let Some((start, end)) = best else {
+            out.push_str(&esc(&text[pos..]));
+            break;
+        };
+        out.push_str(&esc(&text[pos..start]));
+        out.push_str(r#"<mark class="search-hit">"#);
+        out.push_str(&esc(&text[start..end]));
+        out.push_str("</mark>");
+        pos = end;
+    }
+    out
+}
+
+fn find_term_ascii_ci(text: &str, term: &str) -> Option<(usize, usize)> {
+    if term.is_empty() || term.len() > text.len() {
+        return None;
+    }
+    for (start, _) in text.char_indices() {
+        let end = start + term.len();
+        if end > text.len() {
+            return None;
+        }
+        if let Some(candidate) = text.get(start..end) {
+            if candidate.eq_ignore_ascii_case(term) {
+                return Some((start, end));
+            }
+        }
+    }
+    None
+}
+
 /// A leading star glyph for a row's subject (filled when starred, nothing otherwise).
 fn star_mark(starred: bool) -> &'static str {
-    if starred { r#"<span class="star on" aria-label="starred">★</span> "# } else { "" }
+    if starred {
+        r#"<span class="star on" aria-label="starred">★</span> "#
+    } else {
+        ""
+    }
 }
 
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
@@ -731,7 +898,11 @@ fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str
     } else {
         ("star", "Star", "☆")
     };
-    let (seen_op, seen_label) = if seen { ("unread", "Unread") } else { ("read", "Read") };
+    let (seen_op, seen_label) = if seen {
+        ("unread", "Unread")
+    } else {
+        ("read", "Read")
+    };
     let mut opts = String::new();
     for f in FOLDERS {
         opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
@@ -823,7 +994,9 @@ fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -835,7 +1008,10 @@ fn url_encode(s: &str) -> String {
 fn canonical_folder(requested: Option<&str>) -> &'static str {
     match requested.map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case(STARRED_VIEW) => STARRED_VIEW,
-        Some(f) => FOLDERS.into_iter().find(|c| c.eq_ignore_ascii_case(f)).unwrap_or("INBOX"),
+        Some(f) => FOLDERS
+            .into_iter()
+            .find(|c| c.eq_ignore_ascii_case(f))
+            .unwrap_or("INBOX"),
         None => "INBOX",
     }
 }
@@ -865,7 +1041,9 @@ fn folder_tabs(t: &FolderTabs) -> String {
             "btn btn-ghost btn-sm"
         };
         let label = if f == "INBOX" { "Inbox" } else { f };
-        out.push_str(&format!(r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#));
+        out.push_str(&format!(
+            r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#
+        ));
     }
     // Threads/Messages toggle — meaningful for a real folder view (never the Starred/search view).
     if t.active_label.is_empty() && !t.active.is_empty() && t.active != STARRED_VIEW {
@@ -883,7 +1061,11 @@ fn folder_tabs(t: &FolderTabs) -> String {
     }
     // Label pills.
     for l in t.labels {
-        let cls = if l.id == t.active_label { "btn btn-primary btn-sm label-pill" } else { "btn btn-ghost btn-sm label-pill" };
+        let cls = if l.id == t.active_label {
+            "btn btn-primary btn-sm label-pill"
+        } else {
+            "btn btn-ghost btn-sm label-pill"
+        };
         out.push_str(&format!(
             r#"<a class="{cls}" href="/?label={id}">{name}</a>"#,
             id = url_encode(&l.id),
@@ -895,7 +1077,7 @@ fn folder_tabs(t: &FolderTabs) -> String {
         .map(|f| format!(r#"<input type="hidden" name="folder" value="{}">"#, esc(f)))
         .unwrap_or_default();
     out.push_str(&format!(
-        r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button></form>"#,
+        r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button><div class="search-hint">from: to: cc: subject: label: is:unread is:read is:starred has:attachment in: before: after: larger: smaller: "exact phrase" -exclude OR</div></form>"#,
         q = esc(t.search_q),
     ));
     out.push_str("</nav>");
@@ -906,9 +1088,17 @@ fn folder_tabs(t: &FolderTabs) -> String {
 /// from/subject/date, a message count, and the unread indicator, linking to the conversation view.
 fn render_thread_row(t: &crate::model::ThreadSummary) -> String {
     let m = &t.latest;
-    let cls = if t.unseen > 0 { "mailrow unseen" } else { "mailrow" };
+    let cls = if t.unseen > 0 {
+        "mailrow unseen"
+    } else {
+        "mailrow"
+    };
     let dot = if t.unseen > 0 { "dot" } else { "dot seen" };
-    let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
+    let subject = if m.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        esc(&m.subject)
+    };
     let count_badge = if t.count > 1 {
         format!(r#"<span class="pill thread-count">{}</span> "#, t.count)
     } else {
@@ -948,7 +1138,13 @@ async fn read_message(
     let msg = match state.store.get_message(&id).await {
         Ok(Some(m)) => m,
         Ok(None) => return error_page(StatusCode::NOT_FOUND, "Not found", "No such message."),
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     // Authorisation: a message is only viewable from its own mailbox.
     if msg.mailbox != mb.addr {
@@ -960,9 +1156,15 @@ async fn read_message(
 
     let body = if !msg.body_html.is_empty() {
         // Already sanitised at store time; re-sanitise defensively on render.
-        format!(r#"<div class="msg-body">{}</div>"#, crate::sanitize::sanitize_html(&msg.body_html))
+        format!(
+            r#"<div class="msg-body">{}</div>"#,
+            crate::sanitize::sanitize_html(&msg.body_html)
+        )
     } else {
-        format!(r#"<div class="msg-body"><pre>{}</pre></div>"#, esc(&msg.body_text))
+        format!(
+            r#"<div class="msg-body"><pre>{}</pre></div>"#,
+            esc(&msg.body_text)
+        )
     };
 
     // Enumerate the stored raw source's MIME parts and offer a download link per attachment.
@@ -970,12 +1172,21 @@ async fn read_message(
 
     // Label strip + assign/remove control (scoped to this mailbox's labels).
     let all_labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
-    let msg_labels = state.store.labels_for_message(&mb.addr, &id).await.unwrap_or_default();
+    let msg_labels = state
+        .store
+        .labels_for_message(&mb.addr, &id)
+        .await
+        .unwrap_or_default();
     let labels_html = render_message_labels(&msg.id, &all_labels, &msg_labels, &token);
 
     // "View conversation" link when this message is part of a multi-message thread.
     let convo_html = if !msg.thread_id.is_empty() {
-        let count = state.store.list_thread(&mb.addr, &msg.thread_id, 200).await.map(|v| v.len()).unwrap_or(0);
+        let count = state
+            .store
+            .list_thread(&mb.addr, &msg.thread_id, 200)
+            .await
+            .map(|v| v.len())
+            .unwrap_or(0);
         if count > 1 {
             format!(
                 r#"<a class="btn btn-ghost btn-sm" href="/t?id={tid}">View conversation ({count})</a>"#,
@@ -988,7 +1199,11 @@ async fn read_message(
         String::new()
     };
 
-    let subject = if msg.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&msg.subject) };
+    let subject = if msg.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        esc(&msg.subject)
+    };
     let content = format!(
         r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
 <section class="card pad">
@@ -1015,12 +1230,22 @@ async fn read_message(
         to = esc(&msg.msg_to),
         date = fmt_date(msg.received_at),
         folder = esc(&msg.folder),
-        folder_label = if msg.folder == "INBOX" { "Inbox".to_string() } else { esc(&msg.folder) },
+        folder_label = if msg.folder == "INBOX" {
+            "Inbox".to_string()
+        } else {
+            esc(&msg.folder)
+        },
         id = esc(&msg.id),
         convo = convo_html,
         labels = labels_html,
         // Read-view actions return to the message so a star/unread toggle stays in context.
-        actions = row_actions(&msg.id, msg.starred, msg.seen, &token, &format!("/m/{}", esc(&msg.id))),
+        actions = row_actions(
+            &msg.id,
+            msg.starred,
+            msg.seen,
+            &token,
+            &format!("/m/{}", esc(&msg.id))
+        ),
     );
     let content = format!("{content}\n<script src=\"/assets/webmail.js\"></script>");
     let html = render_page(&msg.subject, &email, &content, "inbox");
@@ -1043,13 +1268,20 @@ fn render_message_labels(id: &str, all: &[Label], applied: &[Label], token: &str
             name = esc(&l.name),
         ));
     }
-    let available: Vec<&Label> = all.iter().filter(|l| !applied.iter().any(|a| a.id == l.id)).collect();
+    let available: Vec<&Label> = all
+        .iter()
+        .filter(|l| !applied.iter().any(|a| a.id == l.id))
+        .collect();
     let add_form = if available.is_empty() {
         String::new()
     } else {
         let mut opts = String::from(r#"<option value="" selected disabled>Add label…</option>"#);
         for l in &available {
-            opts.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = esc(&l.id), name = esc(&l.name)));
+            opts.push_str(&format!(
+                r#"<option value="{id}">{name}</option>"#,
+                id = esc(&l.id),
+                name = esc(&l.name)
+            ));
         }
         format!(
             r#"<form class="row-actions" method="post" action="/m/{id}/labels"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="op" value="add"><select class="move-select" name="label" aria-label="Add label">{opts}</select><button class="btn btn-ghost btn-sm" type="submit">Add</button></form>"#,
@@ -1079,7 +1311,13 @@ async fn conversation(
     };
     let msgs = match state.store.list_thread(&mb.addr, &q.id, PAGE_MAX).await {
         Ok(m) => m,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     if msgs.is_empty() {
         return error_page(StatusCode::NOT_FOUND, "Not found", "No such conversation.");
@@ -1088,7 +1326,13 @@ async fn conversation(
     // The subject of the conversation = the earliest message's subject.
     let subject = msgs
         .first()
-        .map(|m| if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) })
+        .map(|m| {
+            if m.subject.trim().is_empty() {
+                "(no subject)".to_string()
+            } else {
+                esc(&m.subject)
+            }
+        })
         .unwrap_or_else(|| "(no subject)".to_string());
     let latest_id = msgs.last().map(|m| m.id.clone()).unwrap_or_default();
 
@@ -1096,9 +1340,15 @@ async fn conversation(
     for m in &msgs {
         let _ = state.store.mark_seen(&m.id).await;
         let body = if !m.body_html.is_empty() {
-            format!(r#"<div class="msg-body">{}</div>"#, crate::sanitize::sanitize_html(&m.body_html))
+            format!(
+                r#"<div class="msg-body">{}</div>"#,
+                crate::sanitize::sanitize_html(&m.body_html)
+            )
         } else {
-            format!(r#"<div class="msg-body"><pre>{}</pre></div>"#, esc(&m.body_text))
+            format!(
+                r#"<div class="msg-body"><pre>{}</pre></div>"#,
+                esc(&m.body_text)
+            )
         };
         let attachments = render_attachment_list(m);
         blocks.push_str(&format!(
@@ -1157,7 +1407,11 @@ async fn message_labels_post(
     Form(form): Form<MessageLabelForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
@@ -1166,16 +1420,32 @@ async fn message_labels_post(
     match state.store.get_message(&id).await {
         Ok(Some(m)) if m.mailbox == mb.addr => {}
         Ok(_) => return error_page(StatusCode::NOT_FOUND, "Not found", "No such message."),
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     }
     let label_id = form.label.trim();
     let result = match form.op.as_str() {
         "add" => state.store.assign_label(&mb.addr, &id, label_id).await,
         "remove" => state.store.remove_label(&mb.addr, &id, label_id).await,
-        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown label action."),
+        _ => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid request",
+                "Unknown label action.",
+            )
+        }
     };
     if let Err(e) = result {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -1214,7 +1484,11 @@ async fn message_action(
     Form(form): Form<ActionForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
@@ -1222,7 +1496,13 @@ async fn message_action(
     let msg = match state.store.get_message(&id).await {
         Ok(Some(m)) => m,
         Ok(None) => return error_page(StatusCode::NOT_FOUND, "Not found", "No such message."),
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     if msg.mailbox != mb.addr {
         return error_page(StatusCode::NOT_FOUND, "Not found", "No such message.");
@@ -1233,7 +1513,11 @@ async fn message_action(
         "archive" => state.store.set_folder(&id, "Archive").await,
         "move" => {
             let Some(folder) = real_folder(&form.folder) else {
-                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown target folder.");
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "Unknown target folder.",
+                );
             };
             state.store.set_folder(&id, folder).await
         }
@@ -1241,10 +1525,20 @@ async fn message_action(
         "read" => state.store.mark_seen(&id).await,
         "star" => state.store.set_starred(&id, true).await,
         "unstar" => state.store.set_starred(&id, false).await,
-        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown action."),
+        _ => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid request",
+                "Unknown action.",
+            )
+        }
     };
     if let Err(e) = result {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -1271,18 +1565,53 @@ async fn apply_message_op(
     use serde_json::json;
     let err500 = |e: crate::store::StoreError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     match op {
-        "delete" => state.store.set_folder(id, "Trash").await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Trash"})).map_err(err500),
-        "archive" => state.store.set_folder(id, "Archive").await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Archive"})).map_err(err500),
+        "delete" => state
+            .store
+            .set_folder(id, "Trash")
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Trash"}))
+            .map_err(err500),
+        "archive" => state
+            .store
+            .set_folder(id, "Archive")
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "folder": "Archive"}))
+            .map_err(err500),
         "move" => {
             let Some(f) = real_folder(folder) else {
                 return Err((StatusCode::BAD_REQUEST, "unknown target folder".to_string()));
             };
-            state.store.set_folder(id, f).await.map(|_| json!({"ok": true, "id": id, "op": op, "folder": f})).map_err(err500)
+            state
+                .store
+                .set_folder(id, f)
+                .await
+                .map(|_| json!({"ok": true, "id": id, "op": op, "folder": f}))
+                .map_err(err500)
         }
-        "unread" => state.store.mark_unseen(id).await.map(|_| json!({"ok": true, "id": id, "op": op, "seen": false})).map_err(err500),
-        "read" => state.store.mark_seen(id).await.map(|_| json!({"ok": true, "id": id, "op": op, "seen": true})).map_err(err500),
-        "star" => state.store.set_starred(id, true).await.map(|_| json!({"ok": true, "id": id, "op": op, "starred": true})).map_err(err500),
-        "unstar" => state.store.set_starred(id, false).await.map(|_| json!({"ok": true, "id": id, "op": op, "starred": false})).map_err(err500),
+        "unread" => state
+            .store
+            .mark_unseen(id)
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "seen": false}))
+            .map_err(err500),
+        "read" => state
+            .store
+            .mark_seen(id)
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "seen": true}))
+            .map_err(err500),
+        "star" => state
+            .store
+            .set_starred(id, true)
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "starred": true}))
+            .map_err(err500),
+        "unstar" => state
+            .store
+            .set_starred(id, false)
+            .await
+            .map(|_| json!({"ok": true, "id": id, "op": op, "starred": false}))
+            .map_err(err500),
         _ => Err((StatusCode::BAD_REQUEST, "unknown action".to_string())),
     }
 }
@@ -1358,13 +1687,21 @@ async fn api_bulk_action(
         return json_status(StatusCode::FORBIDDEN, "no mailbox for this identity");
     };
     // A deliberately narrow (non-star) bulk op set; `move` still needs a real target folder.
-    if !matches!(form.op.as_str(), "read" | "unread" | "archive" | "delete" | "move") {
+    if !matches!(
+        form.op.as_str(),
+        "read" | "unread" | "archive" | "delete" | "move"
+    ) {
         return json_status(StatusCode::BAD_REQUEST, "unknown bulk action");
     }
     if form.op == "move" && real_folder(&form.folder).is_none() {
         return json_status(StatusCode::BAD_REQUEST, "unknown target folder");
     }
-    let ids: Vec<&str> = form.ids.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let ids: Vec<&str> = form
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut applied = 0i64;
     for id in ids {
         // Cross-mailbox safety: only act on ids this mailbox actually owns.
@@ -1372,7 +1709,10 @@ async fn api_bulk_action(
             Ok(Some(m)) if m.mailbox == mb.addr => {}
             _ => continue,
         }
-        if apply_message_op(&state, id, &form.op, &form.folder).await.is_ok() {
+        if apply_message_op(&state, id, &form.op, &form.folder)
+            .await
+            .is_ok()
+        {
             applied += 1;
         }
     }
@@ -1385,7 +1725,11 @@ async fn api_bulk_action(
         applied,
         "bulk message action (api)",
     );
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "op": form.op, "applied": applied }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "op": form.op, "applied": applied })),
+    )
+        .into_response()
 }
 
 /// Clamp a requested folder to a real [`FOLDERS`] value (never [`STARRED_VIEW`], which is
@@ -1402,7 +1746,11 @@ fn safe_return(path: &str) -> String {
     let ok = p.starts_with('/')
         && !p.starts_with("//")
         && !p.chars().any(|c| c.is_whitespace() || c.is_control());
-    if ok { p.to_string() } else { "/".to_string() }
+    if ok {
+        p.to_string()
+    } else {
+        "/".to_string()
+    }
 }
 
 /// Render the read-view attachment strip: one download link per MIME attachment part enumerated
@@ -1422,7 +1770,9 @@ fn render_attachment_list(msg: &Message) -> String {
             size = human_size(a.size),
         ));
     }
-    format!(r#"<div class="attachments"><b class="attach-head">Attachments</b><ul class="attach-list">{items}</ul></div>"#)
+    format!(
+        r#"<div class="attachments"><b class="attach-head">Attachments</b><ul class="attach-list">{items}</ul></div>"#
+    )
 }
 
 /// A compact human-readable byte size (`820 B`, `4.2 KB`, `1.5 MB`).
@@ -1518,7 +1868,11 @@ async fn compose_form(
     }
 
     // The "From" selector: the mailbox's own address (implicit default) plus any owned identities.
-    let identities = state.store.list_send_identities(&mb.addr).await.unwrap_or_default();
+    let identities = state
+        .store
+        .list_send_identities(&mb.addr)
+        .await
+        .unwrap_or_default();
     let default_selected = !identities.iter().any(|i| i.is_default);
     let mut from_options = format!(
         r#"<option value=""{sel}>{addr}</option>"#,
@@ -1688,11 +2042,7 @@ fn reply_all_to(msg: &Message, self_addr: &str) -> String {
 
 /// A quoted reply body: an attribution line followed by the original text, `> `-prefixed.
 fn quote_body(msg: &Message) -> String {
-    let quoted: String = msg
-        .body_text
-        .lines()
-        .map(|l| format!("> {l}\n"))
-        .collect();
+    let quoted: String = msg.body_text.lines().map(|l| format!("> {l}\n")).collect();
     format!(
         "\n\nOn {}, {} wrote:\n{}",
         fmt_date(msg.received_at),
@@ -1752,7 +2102,11 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
     };
 
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
@@ -1760,10 +2114,11 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
 
     // Resolve the outbound "From": the mailbox's own address (default), or a send identity the
     // mailbox OWNS. A submitted-but-unowned identity is rejected (never silently sent as the mailbox).
-    let (from_header, env_from) = match resolve_from_identity(&state, &mb.addr, &form.identity).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let (from_header, env_from) =
+        match resolve_from_identity(&state, &mb.addr, &form.identity).await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
 
     let raw = build_rfc822(
         &from_header,
@@ -1779,7 +2134,17 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
 
     // "Save draft": persist without sending, and allow an incomplete recipient list.
     if form.action == "draft" {
-        store_local_copy(&state, &mb.addr, &from_header, &form.to, &form.subject, &form.body, &raw, "Drafts").await;
+        store_local_copy(
+            &state,
+            &mb.addr,
+            &from_header,
+            &form.to,
+            &form.subject,
+            &form.body,
+            &raw,
+            "Drafts",
+        )
+        .await;
         return Redirect::to("/?folder=Drafts").into_response();
     }
 
@@ -1793,14 +2158,30 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         .map(str::to_string)
         .collect();
     if rcpts.is_empty() {
-        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "At least one valid recipient is required.");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "At least one valid recipient is required.",
+        );
     }
 
     let signer = state.signer.as_deref();
-    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &env_from, &rcpts).await {
+    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &env_from, &rcpts)
+        .await
+    {
         Ok(signed) => {
             // File a copy of the sent message into the sender's Sent folder.
-            store_local_copy(&state, &mb.addr, &from_header, &form.to, &form.subject, &form.body, &signed, "Sent").await;
+            store_local_copy(
+                &state,
+                &mb.addr,
+                &from_header,
+                &form.to,
+                &form.subject,
+                &form.body,
+                &signed,
+                "Sent",
+            )
+            .await;
             Redirect::to("/?folder=Sent").into_response()
         }
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
@@ -1835,7 +2216,11 @@ async fn resolve_from_identity(
             "Invalid request",
             "That send identity is not available for this mailbox.",
         ))),
-        Err(e) => Err(Box::new(error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()))),
+        Err(e) => Err(Box::new(error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        ))),
     }
 }
 
@@ -1859,9 +2244,10 @@ async fn store_local_copy(
     raw: &str,
     folder: &str,
 ) {
-    let (message_id, thread_id) = crate::delivery::resolve_thread(state.store.as_ref(), mailbox, raw, subject)
-        .await
-        .unwrap_or_default();
+    let (message_id, thread_id) =
+        crate::delivery::resolve_thread(state.store.as_ref(), mailbox, raw, subject)
+            .await
+            .unwrap_or_default();
     let msg = Message {
         id: new_id("m"),
         mailbox: mailbox.to_string(),
@@ -1907,7 +2293,13 @@ async fn parse_send(
             let field = match mp.next_field().await {
                 Ok(Some(f)) => f,
                 Ok(None) => break,
-                Err(e) => return Err(error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string())),
+                Err(e) => {
+                    return Err(error_page(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid upload",
+                        &e.to_string(),
+                    ))
+                }
             };
             let name = field.name().unwrap_or("").to_string();
             if name == "attachments" {
@@ -1919,7 +2311,9 @@ async fn parse_send(
                 let data = field
                     .bytes()
                     .await
-                    .map_err(|e| error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string()))?
+                    .map_err(|e| {
+                        error_page(StatusCode::BAD_REQUEST, "Invalid upload", &e.to_string())
+                    })?
                     .to_vec();
                 // Skip the empty file input a user leaves untouched.
                 if !data.is_empty() && !filename.trim().is_empty() {
@@ -1981,7 +2375,10 @@ async fn api_send(
     // Guard: token configured, and a matching Bearer presented (constant-time).
     let expected = state.config.mail_send_token.as_str();
     if expected.is_empty() {
-        return json_status(StatusCode::SERVICE_UNAVAILABLE, "send API disabled (MAIL_SEND_TOKEN unset)");
+        return json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "send API disabled (MAIL_SEND_TOKEN unset)",
+        );
     }
     let presented = bearer_token(&headers).unwrap_or_default();
     if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
@@ -2005,18 +2402,46 @@ async fn api_send(
         .map(str::to_string)
         .collect();
     if rcpts.is_empty() {
-        return json_status(StatusCode::BAD_REQUEST, "at least one valid recipient is required");
+        return json_status(
+            StatusCode::BAD_REQUEST,
+            "at least one valid recipient is required",
+        );
     }
 
-    let raw = build_rfc822(&from_addr, &req.to, "", &req.subject, &req.body, "", "", &state.config.mail_domain, &[]);
+    let raw = build_rfc822(
+        &from_addr,
+        &req.to,
+        "",
+        &req.subject,
+        &req.body,
+        "",
+        "",
+        &state.config.mail_domain,
+        &[],
+    );
     let signer = state.signer.as_deref();
-    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts).await {
+    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts)
+        .await
+    {
         Ok(signed) => {
             // File a Sent copy for the sending address (parity with the webmail /send path).
-            store_local_copy(&state, &from_addr, &from_addr, &req.to, &req.subject, &req.body, &signed, "Sent").await;
+            store_local_copy(
+                &state,
+                &from_addr,
+                &from_addr,
+                &req.to,
+                &req.subject,
+                &req.body,
+                &signed,
+                "Sent",
+            )
+            .await;
             json_status(StatusCode::ACCEPTED, "queued")
         }
-        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("enqueue failed: {e}")),
+        Err(e) => json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("enqueue failed: {e}"),
+        ),
     }
 }
 
@@ -2041,7 +2466,11 @@ async fn contacts_suggest(
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return Json(Vec::<crate::model::Contact>::new()).into_response();
     };
-    match state.store.suggest_contacts(&mb.addr, &q.q, SUGGEST_LIMIT).await {
+    match state
+        .store
+        .suggest_contacts(&mb.addr, &q.q, SUGGEST_LIMIT)
+        .await
+    {
         Ok(list) => Json(list).into_response(),
         Err(_) => Json(Vec::<crate::model::Contact>::new()).into_response(),
     }
@@ -2050,7 +2479,9 @@ async fn contacts_suggest(
 /// Extract the `Authorization: Bearer <token>` value, if present.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let raw = header_value(headers, "authorization")?;
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let token = token.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
@@ -2178,16 +2609,29 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
     let mailboxes = match state.store.list_mailboxes().await {
         Ok(m) => m,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     let aliases = match state.store.list_aliases().await {
         Ok(a) => a,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
 
     let mut mb_rows = String::new();
     if mailboxes.is_empty() {
-        mb_rows.push_str(r#"<tr><td colspan="3" class="muted">No mailboxes provisioned.</td></tr>"#);
+        mb_rows
+            .push_str(r#"<tr><td colspan="3" class="muted">No mailboxes provisioned.</td></tr>"#);
     }
     for mb in &mailboxes {
         let count = state.store.message_count(&mb.addr).await.unwrap_or(0);
@@ -2265,24 +2709,55 @@ async fn admin_create_mailbox(
     Form(form): Form<CreateMailboxForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let addr = form.addr.trim().to_lowercase();
     let owner_sub = form.owner_sub.trim().to_string();
     if addr.is_empty() || !addr.contains('@') || domain_of(&addr).is_none() {
-        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A valid mailbox address (local@domain) is required.");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "A valid mailbox address (local@domain) is required.",
+        );
     }
     if owner_sub.is_empty() {
-        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "An owner sub is required.");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "An owner sub is required.",
+        );
     }
     match state.store.get_mailbox(&addr).await {
-        Ok(Some(_)) => return error_page(StatusCode::CONFLICT, "Already exists", "A mailbox with that address already exists."),
+        Ok(Some(_)) => {
+            return error_page(
+                StatusCode::CONFLICT,
+                "Already exists",
+                "A mailbox with that address already exists.",
+            )
+        }
         Ok(None) => {}
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     }
-    let mb = Mailbox { addr: addr.clone(), owner_sub: owner_sub.clone() };
+    let mb = Mailbox {
+        addr: addr.clone(),
+        owner_sub: owner_sub.clone(),
+    };
     if let Err(e) = state.store.upsert_mailbox(&mb).await {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -2312,21 +2787,48 @@ async fn admin_add_alias(
     Form(form): Form<AddAliasForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let local_part = form.local_part.trim().to_lowercase();
     let mailbox = form.mailbox.trim().to_lowercase();
     if local_part.is_empty() || local_part.contains('@') {
-        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A bare alias local-part (no @) is required.");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "A bare alias local-part (no @) is required.",
+        );
     }
     match state.store.get_mailbox(&mailbox).await {
         Ok(Some(_)) => {}
-        Ok(None) => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "The target mailbox does not exist."),
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Ok(None) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid request",
+                "The target mailbox does not exist.",
+            )
+        }
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     }
-    let alias = Alias { local_part: local_part.clone(), mailbox: mailbox.clone() };
+    let alias = Alias {
+        local_part: local_part.clone(),
+        mailbox: mailbox.clone(),
+    };
     if let Err(e) = state.store.add_alias(&alias).await {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -2358,15 +2860,35 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
 
     let rules = match state.store.list_rules(&mb.addr).await {
         Ok(r) => r,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     let settings = match state.store.get_settings(&mb.addr).await {
         Ok(s) => s,
-        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
     };
     let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
-    let identities = state.store.list_send_identities(&mb.addr).await.unwrap_or_default();
-    let contacts = state.store.suggest_contacts(&mb.addr, "", 200).await.unwrap_or_default();
+    let identities = state
+        .store
+        .list_send_identities(&mb.addr)
+        .await
+        .unwrap_or_default();
+    let contacts = state
+        .store
+        .suggest_contacts(&mb.addr, "", 200)
+        .await
+        .unwrap_or_default();
 
     let mut rule_rows = String::new();
     if rules.is_empty() {
@@ -2386,10 +2908,18 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     // Label select for the `label` rule action (empty when the mailbox has none yet).
     let mut rule_label_opts = String::new();
     for l in &labels {
-        rule_label_opts.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = esc(&l.id), name = esc(&l.name)));
+        rule_label_opts.push_str(&format!(
+            r#"<option value="{id}">{name}</option>"#,
+            id = esc(&l.id),
+            name = esc(&l.name)
+        ));
     }
 
-    let ar_checked = if settings.auto_reply_enabled { " checked" } else { "" };
+    let ar_checked = if settings.auto_reply_enabled {
+        " checked"
+    } else {
+        ""
+    };
     let content = format!(
         r#"<div class="page-head"><h1>Settings</h1></div>
 <section class="card pad">
@@ -2451,13 +2981,23 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
 /// One filter-rule table row: the match/action summary plus its inline control form
 /// (up/down/enable-disable/delete), all POSTing back to `/settings/rules` with the CSRF token.
 /// `labels` resolves an `Add label` rule's target id to its display name.
-fn render_rule_row(index: usize, total: usize, r: &FilterRule, labels: &[Label], token: &str) -> String {
+fn render_rule_row(
+    index: usize,
+    total: usize,
+    r: &FilterRule,
+    labels: &[Label],
+    token: &str,
+) -> String {
     let status = if r.enabled {
         r#"<span class="pill pill-ok">Enabled</span>"#
     } else {
         r#"<span class="pill">Disabled</span>"#
     };
-    let toggle = if r.enabled { ("disable", "Disable") } else { ("enable", "Enable") };
+    let toggle = if r.enabled {
+        ("disable", "Disable")
+    } else {
+        ("enable", "Enable")
+    };
     let action = match r.action.as_str() {
         "move" => format!("Move to {}", esc(r.target_folder.as_deref().unwrap_or("?"))),
         "label" => {
@@ -2568,7 +3108,11 @@ async fn settings_rules_post(
     Form(form): Form<RuleForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
@@ -2577,10 +3121,28 @@ async fn settings_rules_post(
     let result = match form.cmd.as_str() {
         "" | "add" => add_rule_from_form(&state, &mb.addr, &form).await,
         "up" | "down" => reorder_rule(&state, &mb.addr, &form.id, form.cmd == "up").await,
-        "enable" => state.store.set_rule_enabled(&mb.addr, &form.id, true).await.map_err(|e| e.to_string()),
-        "disable" => state.store.set_rule_enabled(&mb.addr, &form.id, false).await.map_err(|e| e.to_string()),
-        "delete" => state.store.delete_rule(&mb.addr, &form.id).await.map_err(|e| e.to_string()),
-        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown rule command."),
+        "enable" => state
+            .store
+            .set_rule_enabled(&mb.addr, &form.id, true)
+            .await
+            .map_err(|e| e.to_string()),
+        "disable" => state
+            .store
+            .set_rule_enabled(&mb.addr, &form.id, false)
+            .await
+            .map_err(|e| e.to_string()),
+        "delete" => state
+            .store
+            .delete_rule(&mb.addr, &form.id)
+            .await
+            .map_err(|e| e.to_string()),
+        _ => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid request",
+                "Unknown rule command.",
+            )
+        }
     };
     if let Err(e) = result {
         return error_page(StatusCode::BAD_REQUEST, "Invalid request", &e);
@@ -2597,7 +3159,11 @@ async fn settings_rules_post(
 }
 
 /// Validate + persist a new rule from the add form (appended at the end of the order).
-async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) -> Result<(), String> {
+async fn add_rule_from_form(
+    state: &AppState,
+    mailbox: &str,
+    form: &RuleForm,
+) -> Result<(), String> {
     let field = form.field.trim().to_lowercase();
     let op = form.op.trim().to_lowercase();
     let action = form.action.trim().to_lowercase();
@@ -2639,7 +3205,11 @@ async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) ->
     } else {
         None
     };
-    let existing = state.store.list_rules(mailbox).await.map_err(|e| e.to_string())?;
+    let existing = state
+        .store
+        .list_rules(mailbox)
+        .await
+        .map_err(|e| e.to_string())?;
     let position = existing.iter().map(|r| r.position).max().unwrap_or(0) + 1;
     let rule = FilterRule {
         id: new_id("fr"),
@@ -2660,7 +3230,11 @@ async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) ->
 /// Move a rule one slot up/down: renumber the whole order with the two neighbours swapped
 /// (robust against legacy position ties). A no-op at either edge.
 async fn reorder_rule(state: &AppState, mailbox: &str, id: &str, up: bool) -> Result<(), String> {
-    let rules = state.store.list_rules(mailbox).await.map_err(|e| e.to_string())?;
+    let rules = state
+        .store
+        .list_rules(mailbox)
+        .await
+        .map_err(|e| e.to_string())?;
     let Some(idx) = rules.iter().position(|r| r.id == id) else {
         return Err("No such rule.".to_string());
     };
@@ -2700,13 +3274,25 @@ async fn settings_signature(
     Form(form): Form<SignatureForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
     };
-    if let Err(e) = state.store.set_signature(&mb.addr, form.signature.trim()).await {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    if let Err(e) = state
+        .store
+        .set_signature(&mb.addr, form.signature.trim())
+        .await
+    {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -2741,13 +3327,21 @@ async fn settings_autoreply(
     Form(form): Form<AutoReplyForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
     };
     let Some(until) = parse_until(&form.until) else {
-        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "The end date must be YYYY-MM-DD (or empty).");
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "The end date must be YYYY-MM-DD (or empty).",
+        );
     };
     let enabled = !form.enabled.trim().is_empty();
     if let Err(e) = state
@@ -2755,7 +3349,11 @@ async fn settings_autoreply(
         .set_auto_reply(&mb.addr, enabled, form.subject.trim(), &form.body, until)
         .await
     {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -2840,7 +3438,11 @@ fn render_labels_section(labels: &[Label], token: &str) -> String {
 
 /// The Send identities settings card: the mailbox's own address (implicit), each configured
 /// identity (with delete), and an add form.
-fn render_identities_section(identities: &[crate::model::SendIdentity], mailbox: &str, token: &str) -> String {
+fn render_identities_section(
+    identities: &[crate::model::SendIdentity],
+    mailbox: &str,
+    token: &str,
+) -> String {
     let mut rows = format!(
         r#"<tr><td>{addr}</td><td class="muted">mailbox default</td><td></td></tr>"#,
         addr = esc(mailbox),
@@ -2851,7 +3453,11 @@ fn render_identities_section(identities: &[crate::model::SendIdentity], mailbox:
         } else {
             esc(&i.display_name)
         };
-        let def = if i.is_default { r#"<span class="pill pill-ok">default</span>"# } else { "" };
+        let def = if i.is_default {
+            r#"<span class="pill pill-ok">default</span>"#
+        } else {
+            ""
+        };
         rows.push_str(&format!(
             r#"<tr><td>{addr}</td><td>{display} {def}</td><td>
 <form class="row-actions" method="post" action="/settings/identities">
@@ -2945,7 +3551,11 @@ async fn settings_labels_post(
     Form(form): Form<LabelForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
@@ -2955,7 +3565,11 @@ async fn settings_labels_post(
         _ => {
             let name = form.name.trim();
             if name.is_empty() {
-                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A label name is required.");
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "A label name is required.",
+                );
             }
             let label = Label {
                 id: new_id("lbl"),
@@ -2967,7 +3581,11 @@ async fn settings_labels_post(
         }
     };
     if let Err(e) = result {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -3005,16 +3623,28 @@ async fn settings_identities_post(
     Form(form): Form<IdentityForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
     };
     let result = match form.cmd.as_str() {
-        "delete" => state.store.delete_send_identity(&mb.addr, form.id.trim()).await,
+        "delete" => {
+            state
+                .store
+                .delete_send_identity(&mb.addr, form.id.trim())
+                .await
+        }
         _ => {
             let from_addr = extract_addr(&form.from_addr).to_lowercase();
-            if from_addr.is_empty() || domain_of(&from_addr).as_deref() != Some(state.config.mail_domain.to_lowercase().as_str()) {
+            if from_addr.is_empty()
+                || domain_of(&from_addr).as_deref()
+                    != Some(state.config.mail_domain.to_lowercase().as_str())
+            {
                 return error_page(
                     StatusCode::BAD_REQUEST,
                     "Invalid request",
@@ -3032,7 +3662,11 @@ async fn settings_identities_post(
         }
     };
     if let Err(e) = result {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -3064,7 +3698,11 @@ async fn settings_contacts_post(
     Form(form): Form<ContactForm>,
 ) -> Response {
     if !verify_csrf(&headers, &form.csrf) {
-        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
     }
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email_display(&headers));
@@ -3074,13 +3712,24 @@ async fn settings_contacts_post(
         "delete" => state.store.delete_contact(&mb.addr, &addr).await,
         _ => {
             if !addr.contains('@') {
-                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A valid contact address is required.");
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "A valid contact address is required.",
+                );
             }
-            state.store.upsert_contact(&mb.addr, &addr, form.name.trim(), true).await
+            state
+                .store
+                .upsert_contact(&mb.addr, &addr, form.name.trim(), true)
+                .await
         }
     };
     if let Err(e) = result {
-        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
     }
     tracing::info!(
         target: "corvid::audit",
@@ -3200,7 +3849,8 @@ fn ensure_csrf(headers: &HeaderMap) -> (String, Option<String>) {
         Some(t) if !t.is_empty() => (t, None),
         _ => {
             let token = new_csrf_token();
-            let cookie = format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax; Max-Age=3600");
+            let cookie =
+                format!("{CSRF_COOKIE}={token}; Path=/; Secure; SameSite=Lax; Max-Age=3600");
             (token, Some(cookie))
         }
     }
@@ -3262,9 +3912,12 @@ pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
     };
     let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1]
-        .iter()
-        .any(|&w| ct_eq(sig.as_bytes(), sign_identity(key, &subject, &groups, w).as_bytes()))
+    [win, win - 1].iter().any(|&w| {
+        ct_eq(
+            sig.as_bytes(),
+            sign_identity(key, &subject, &groups, w).as_bytes(),
+        )
+    })
 }
 
 /// Recompute the gateway signature — byte-identical to Sluice's `auth.SignIdentity` (Go).
@@ -3320,7 +3973,11 @@ fn render_page(title: &str, email_display: &str, content: &str, nav_active: &str
 /// `.appnav` links, marking `active` (`"inbox"`/`"compose"`) with `.is-active`.
 fn nav_bar(active: &str) -> String {
     let link = |key: &str, href: &str, label: &str, icon: &str| {
-        let cls = if key == active { "appnav is-active" } else { "appnav" };
+        let cls = if key == active {
+            "appnav is-active"
+        } else {
+            "appnav"
+        };
         format!(r#"<a class="{cls}" href="{href}">{icon}{label}</a>"#)
     };
     format!(
@@ -3460,7 +4117,10 @@ mod tests {
 
         // Comma-separated groups, with whitespace, parse and match by exact name.
         let mut admins = HeaderMap::new();
-        admins.insert(HEADER_GROUPS, HeaderValue::from_static("dev, infra-admins ,x"));
+        admins.insert(
+            HEADER_GROUPS,
+            HeaderValue::from_static("dev, infra-admins ,x"),
+        );
         assert!(has_group(&admins, "infra-admins"));
         assert!(has_group(&admins, "dev"));
         assert!(!has_group(&admins, "admins"));
@@ -3491,8 +4151,26 @@ mod tests {
 
     #[test]
     fn build_rfc822_has_signed_headers() {
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "", "Hi", "Body line", "", "", "w33d.xyz", &[]);
-        for h in ["From:", "To:", "Subject:", "Date:", "Message-ID:", "MIME-Version:", "Content-Type:"] {
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "",
+            "Hi",
+            "Body line",
+            "",
+            "",
+            "w33d.xyz",
+            &[],
+        );
+        for h in [
+            "From:",
+            "To:",
+            "Subject:",
+            "Date:",
+            "Message-ID:",
+            "MIME-Version:",
+            "Content-Type:",
+        ] {
             assert!(raw.contains(h), "missing {h}");
         }
         assert!(raw.contains("\r\n\r\nBody line\r\n"));
@@ -3521,7 +4199,17 @@ mod tests {
 
     #[test]
     fn build_rfc822_includes_cc_when_present() {
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "cc@z.com", "Hi", "Body", "", "", "w33d.xyz", &[]);
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "cc@z.com",
+            "Hi",
+            "Body",
+            "",
+            "",
+            "w33d.xyz",
+            &[],
+        );
         assert!(raw.contains("Cc: cc@z.com\r\n"), "Cc header emitted");
     }
 
@@ -3532,9 +4220,22 @@ mod tests {
             content_type: "text/plain".to_string(),
             data: b"hello attachment".to_vec(),
         };
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "", "Files", "See attached", "", "", "w33d.xyz", &[att]);
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "",
+            "Files",
+            "See attached",
+            "",
+            "",
+            "w33d.xyz",
+            &[att],
+        );
 
-        assert!(raw.contains("Content-Type: multipart/mixed; boundary="), "top-level is multipart/mixed");
+        assert!(
+            raw.contains("Content-Type: multipart/mixed; boundary="),
+            "top-level is multipart/mixed"
+        );
         assert!(raw.contains("Content-Disposition: attachment; filename=\"report.txt\""));
         assert!(raw.contains("Content-Transfer-Encoding: base64"));
 
@@ -3594,7 +4295,11 @@ mod tests {
     fn real_folder_accepts_only_real_folders() {
         assert_eq!(real_folder("sent"), Some("Sent"));
         assert_eq!(real_folder(" Trash "), Some("Trash"));
-        assert_eq!(real_folder("Starred"), None, "the virtual view is not a folder");
+        assert_eq!(
+            real_folder("Starred"),
+            None,
+            "the virtual view is not a folder"
+        );
         assert_eq!(real_folder("bogus"), None);
     }
 
@@ -3609,7 +4314,11 @@ mod tests {
 
     #[test]
     fn parse_cursor_accepts_ts_id_and_rejects_junk() {
-        assert_eq!(parse_cursor(Some("100_m_abc")), Some((100, "m_abc".to_string())), "id keeps its own underscores");
+        assert_eq!(
+            parse_cursor(Some("100_m_abc")),
+            Some((100, "m_abc".to_string())),
+            "id keeps its own underscores"
+        );
         assert_eq!(parse_cursor(Some("junk")), None);
         assert_eq!(parse_cursor(Some("notanum_m1")), None);
         assert_eq!(parse_cursor(None), None);
@@ -3627,16 +4336,25 @@ mod tests {
         };
         // Short page (or empty) -> nothing older -> no link.
         assert_eq!(next_page_link(&[], 2, "/?folder=Sent&limit=2"), "");
-        assert_eq!(next_page_link(&[row("m_1", 9)], 2, "/?folder=Sent&limit=2"), "");
+        assert_eq!(
+            next_page_link(&[row("m_1", 9)], 2, "/?folder=Sent&limit=2"),
+            ""
+        );
         // Full page -> link carrying the last row's (received_at, id) cursor.
         let link = next_page_link(&[row("m_2", 9), row("m_1", 8)], 2, "/?folder=Sent&limit=2");
-        assert!(link.contains("/?folder=Sent&limit=2&before=8_m_1"), "cursor appended: {link}");
+        assert!(
+            link.contains("/?folder=Sent&limit=2&before=8_m_1"),
+            "cursor appended: {link}"
+        );
     }
 
     #[test]
     fn extract_addr_handles_angle_and_bare() {
         assert_eq!(extract_addr("no-reply@w33d.xyz"), "no-reply@w33d.xyz");
-        assert_eq!(extract_addr("HOLDFAST <no-reply@w33d.xyz>"), "no-reply@w33d.xyz");
+        assert_eq!(
+            extract_addr("HOLDFAST <no-reply@w33d.xyz>"),
+            "no-reply@w33d.xyz"
+        );
         assert_eq!(extract_addr("  bare@x.com  "), "bare@x.com");
     }
 
@@ -3646,7 +4364,11 @@ mod tests {
         assert_eq!(parse_until("  "), Some(0));
         let ts = parse_until("2026-07-15").expect("valid date");
         assert!(ts > 0);
-        assert_eq!(fmt_until(ts), "2026-07-15", "round-trips through the date input");
+        assert_eq!(
+            fmt_until(ts),
+            "2026-07-15",
+            "round-trips through the date input"
+        );
         assert_eq!(fmt_until(0), "");
         assert_eq!(parse_until("2026-13-01"), None, "no month 13");
         assert_eq!(parse_until("soon"), None);

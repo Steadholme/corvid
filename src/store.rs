@@ -30,7 +30,8 @@ use thiserror::Error;
 
 use crate::model::{
     Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
-    OutboundItem, SendIdentity, ThreadSummary,
+    OutboundItem, SearchPredicate, SearchPredicateKind, SearchQuery, SearchState, SendIdentity,
+    ThreadSummary,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -88,14 +89,14 @@ pub trait Store: Send + Sync {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
-    /// Search a mailbox over `From`/`To`/`Subject`/body (case-insensitive substring), newest
-    /// first, optionally scoped to one `folder` (`None` searches the whole mailbox),
-    /// keyset-paginated: `before` is the `(received_at, id)` of the last row of the previous page
-    /// (`None` for the first page). `query` is matched lowercased.
+    /// Search a mailbox with a parsed query, newest first, optionally scoped to one `folder`
+    /// (`None` searches the whole mailbox), keyset-paginated: `before` is the `(received_at, id)`
+    /// of the last row of the previous page (`None` for the first page). A query containing only
+    /// free text preserves the old `From`/`To`/`Subject`/body substring search.
     async fn search_messages(
         &self,
         mailbox: &str,
-        query: &str,
+        query: &SearchQuery,
         folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
@@ -121,11 +122,19 @@ pub trait Store: Send + Sync {
     /// Delete a rule by id, scoped to `mailbox` (a user only ever touches their own rules).
     async fn delete_rule(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
     /// Enable/disable a rule, scoped to `mailbox`.
-    async fn set_rule_enabled(&self, mailbox: &str, id: &str, enabled: bool)
-        -> Result<(), StoreError>;
+    async fn set_rule_enabled(
+        &self,
+        mailbox: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError>;
     /// Reposition a rule, scoped to `mailbox` (the settings reorder renumbers via these).
-    async fn set_rule_position(&self, mailbox: &str, id: &str, position: i64)
-        -> Result<(), StoreError>;
+    async fn set_rule_position(
+        &self,
+        mailbox: &str,
+        id: &str,
+        position: i64,
+    ) -> Result<(), StoreError>;
 
     /// Per-mailbox settings (signature + auto-reply). All-defaults when never saved.
     async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError>;
@@ -142,8 +151,12 @@ pub trait Store: Send + Sync {
     ) -> Result<(), StoreError>;
     /// Auto-reply dedupe check-and-record: returns `true` (and records `now`) when NO auto-reply
     /// went to `sender` within [`AUTO_REPLY_DEDUPE_SECS`]; `false` means the caller must not send.
-    async fn mark_auto_replied(&self, mailbox: &str, sender: &str, now: i64)
-        -> Result<bool, StoreError>;
+    async fn mark_auto_replied(
+        &self,
+        mailbox: &str,
+        sender: &str,
+        now: i64,
+    ) -> Result<bool, StoreError>;
 
     /// Enqueue an outbound message for relay.
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError>;
@@ -310,6 +323,128 @@ fn summary(m: &Message) -> MessageSummary {
     }
 }
 
+fn message_matches_search(
+    m: &Message,
+    query: &SearchQuery,
+    labels: &[Label],
+    message_labels: &[(String, String, String)],
+) -> bool {
+    let mut positive_count = 0_usize;
+    let mut any_positive_matches = false;
+    let mut all_positives_match = true;
+
+    for term in query.text_terms.iter().filter(|term| !term.negated) {
+        positive_count += 1;
+        let matched = message_matches_text(m, &term.value);
+        any_positive_matches |= matched;
+        all_positives_match &= matched;
+    }
+    for predicate in query
+        .predicates
+        .iter()
+        .filter(|predicate| !predicate.negated)
+    {
+        positive_count += 1;
+        let matched = message_matches_predicate(m, predicate, labels, message_labels);
+        any_positive_matches |= matched;
+        all_positives_match &= matched;
+    }
+
+    let positives_match = if positive_count == 0 {
+        true
+    } else if query.or_mode {
+        any_positive_matches
+    } else {
+        all_positives_match
+    };
+
+    positives_match
+        && query
+            .text_terms
+            .iter()
+            .filter(|term| term.negated)
+            .all(|term| !message_matches_text(m, &term.value))
+        && query
+            .predicates
+            .iter()
+            .filter(|predicate| predicate.negated)
+            .all(|predicate| !message_matches_predicate(m, predicate, labels, message_labels))
+}
+
+fn message_matches_text(m: &Message, value: &str) -> bool {
+    let needle = value.to_lowercase();
+    contains_lower(&m.msg_from, &needle)
+        || contains_lower(&m.msg_to, &needle)
+        || contains_lower(&m.subject, &needle)
+        || contains_lower(&m.body_text, &needle)
+}
+
+fn message_matches_predicate(
+    m: &Message,
+    predicate: &SearchPredicate,
+    labels: &[Label],
+    message_labels: &[(String, String, String)],
+) -> bool {
+    match &predicate.kind {
+        SearchPredicateKind::From(value) => contains_ci(&m.msg_from, value),
+        SearchPredicateKind::To(value) => contains_ci(&m.msg_to, value),
+        SearchPredicateKind::Cc(value) => raw_cc_contains(&m.raw_rfc822, value),
+        SearchPredicateKind::Subject(value) => contains_ci(&m.subject, value),
+        SearchPredicateKind::Label(value) => message_has_label(m, value, labels, message_labels),
+        SearchPredicateKind::Is(SearchState::Read) => m.seen,
+        SearchPredicateKind::Is(SearchState::Unread) => !m.seen,
+        SearchPredicateKind::Is(SearchState::Starred) => m.starred,
+        SearchPredicateKind::HasAttachment => raw_has_attachment(&m.raw_rfc822),
+        SearchPredicateKind::InFolder(value) => m.folder.eq_ignore_ascii_case(value),
+        SearchPredicateKind::Before(ts) => m.received_at < *ts,
+        SearchPredicateKind::After(ts) => m.received_at >= *ts,
+        SearchPredicateKind::Larger(bytes) => (m.raw_rfc822.as_bytes().len() as i64) > *bytes,
+        SearchPredicateKind::Smaller(bytes) => (m.raw_rfc822.as_bytes().len() as i64) < *bytes,
+    }
+}
+
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    contains_lower(haystack, &needle)
+}
+
+fn contains_lower(haystack: &str, needle: &str) -> bool {
+    haystack.to_lowercase().contains(needle)
+}
+
+fn raw_cc_contains(raw: &str, value: &str) -> bool {
+    let raw = raw.to_lowercase();
+    let needle = value.to_lowercase();
+    raw.split("cc:").skip(1).any(|rest| rest.contains(&needle))
+}
+
+fn raw_has_attachment(raw: &str) -> bool {
+    let raw = raw.to_ascii_lowercase();
+    raw.contains("content-disposition: attachment")
+        || raw.contains("filename=")
+        || raw.contains("name=")
+}
+
+fn message_has_label(
+    m: &Message,
+    value: &str,
+    labels: &[Label],
+    message_labels: &[(String, String, String)],
+) -> bool {
+    let value = value.to_lowercase();
+    message_labels
+        .iter()
+        .any(|(mailbox, message_id, label_id)| {
+            mailbox == &m.mailbox
+                && message_id == &m.id
+                && labels.iter().any(|label| {
+                    label.mailbox == m.mailbox
+                        && label.id == label_id.as_str()
+                        && label.name.to_lowercase() == value
+                })
+        })
+}
+
 #[async_trait]
 impl Store for InMemoryStore {
     // The std `Mutex` is fine throughout: each critical section is fully synchronous (no
@@ -401,7 +536,11 @@ impl Store for InMemoryStore {
             .filter(|m| m.mailbox == mailbox)
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
     }
@@ -421,7 +560,11 @@ impl Store for InMemoryStore {
             .filter(|m| m.mailbox == mailbox && m.folder == folder)
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
@@ -441,7 +584,11 @@ impl Store for InMemoryStore {
             .filter(|m| m.mailbox == mailbox && m.starred)
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
@@ -450,12 +597,17 @@ impl Store for InMemoryStore {
     async fn search_messages(
         &self,
         mailbox: &str,
-        query: &str,
+        query: &SearchQuery,
         folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
-        let needle = query.to_lowercase();
+        let labels = self.labels.lock().expect("labels lock poisoned").clone();
+        let message_labels = self
+            .message_labels
+            .lock()
+            .expect("message_labels lock poisoned")
+            .clone();
         let mut v: Vec<Message> = self
             .messages
             .lock()
@@ -464,14 +616,15 @@ impl Store for InMemoryStore {
             .filter(|m| {
                 m.mailbox == mailbox
                     && folder.map_or(true, |f| m.folder == f)
-                    && (m.msg_from.to_lowercase().contains(&needle)
-                        || m.msg_to.to_lowercase().contains(&needle)
-                        || m.subject.to_lowercase().contains(&needle)
-                        || m.body_text.to_lowercase().contains(&needle))
+                    && message_matches_search(m, query, &labels, &message_labels)
             })
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
@@ -636,10 +789,11 @@ impl Store for InMemoryStore {
         sender: &str,
         now: i64,
     ) -> Result<bool, StoreError> {
-        let mut v = self.auto_replies.lock().expect("auto_replies lock poisoned");
-        if let Some((_, _, sent_at)) =
-            v.iter_mut().find(|(m, s, _)| m == mailbox && s == sender)
-        {
+        let mut v = self
+            .auto_replies
+            .lock()
+            .expect("auto_replies lock poisoned");
+        if let Some((_, _, sent_at)) = v.iter_mut().find(|(m, s, _)| m == mailbox && s == sender) {
             if now - *sent_at < AUTO_REPLY_DEDUPE_SECS {
                 return Ok(false);
             }
@@ -717,13 +871,21 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| {
                 m.mailbox == mailbox
-                    && (refs.iter().any(|r| r == &m.message_id && !m.message_id.is_empty())
-                        || refs.iter().any(|r| r == &m.thread_id && !m.thread_id.is_empty()))
+                    && (refs
+                        .iter()
+                        .any(|r| r == &m.message_id && !m.message_id.is_empty())
+                        || refs
+                            .iter()
+                            .any(|r| r == &m.thread_id && !m.thread_id.is_empty()))
             })
             .cloned()
             .collect();
         // Earliest existing message wins (stable thread root).
-        candidates.sort_by(|a, b| a.received_at.cmp(&b.received_at).then_with(|| a.id.cmp(&b.id)));
+        candidates.sort_by(|a, b| {
+            a.received_at
+                .cmp(&b.received_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(candidates
             .into_iter()
             .map(|m| m.thread_id)
@@ -746,21 +908,32 @@ impl Store for InMemoryStore {
             .cloned()
             .collect();
         // Group by thread_id (empty thread_id => the message is its own singleton, keyed by id).
-        let mut groups: std::collections::HashMap<String, Vec<Message>> = std::collections::HashMap::new();
+        let mut groups: std::collections::HashMap<String, Vec<Message>> =
+            std::collections::HashMap::new();
         for m in msgs {
-            let key = if m.thread_id.is_empty() { format!("m:{}", m.id) } else { m.thread_id.clone() };
+            let key = if m.thread_id.is_empty() {
+                format!("m:{}", m.id)
+            } else {
+                m.thread_id.clone()
+            };
             groups.entry(key).or_default().push(m);
         }
         let mut threads: Vec<ThreadSummary> = groups
             .into_iter()
             .map(|(key, mut group)| {
                 group.sort_by(|a, b| {
-                    b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id))
+                    b.received_at
+                        .cmp(&a.received_at)
+                        .then_with(|| b.id.cmp(&a.id))
                 });
                 let latest = &group[0];
                 let unseen = group.iter().filter(|m| !m.seen).count() as i64;
                 ThreadSummary {
-                    thread_id: if latest.thread_id.is_empty() { key } else { latest.thread_id.clone() },
+                    thread_id: if latest.thread_id.is_empty() {
+                        key
+                    } else {
+                        latest.thread_id.clone()
+                    },
                     latest: summary(latest),
                     count: group.len() as i64,
                     unseen,
@@ -796,7 +969,11 @@ impl Store for InMemoryStore {
             .filter(|m| m.mailbox == mailbox && m.thread_id == thread_id)
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.received_at.cmp(&b.received_at).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.received_at
+                .cmp(&b.received_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         v.truncate(limit.max(0) as usize);
         Ok(v)
     }
@@ -860,7 +1037,10 @@ impl Store for InMemoryStore {
             return Ok(());
         }
         let mut v = self.contacts.lock().expect("contacts lock poisoned");
-        if let Some((_, c)) = v.iter_mut().find(|(mb, c)| mb == mailbox && c.addr == addr_l) {
+        if let Some((_, c)) = v
+            .iter_mut()
+            .find(|(mb, c)| mb == mailbox && c.addr == addr_l)
+        {
             if !name.trim().is_empty() {
                 c.name = name.trim().to_string();
             }
@@ -931,12 +1111,20 @@ impl Store for InMemoryStore {
             .filter(|l| l.mailbox == mailbox)
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(v)
     }
 
     async fn add_label(&self, label: &Label) -> Result<(), StoreError> {
-        self.labels.lock().expect("labels lock poisoned").push(label.clone());
+        self.labels
+            .lock()
+            .expect("labels lock poisoned")
+            .push(label.clone());
         Ok(())
     }
 
@@ -974,9 +1162,19 @@ impl Store for InMemoryStore {
         if !(owns_msg && owns_label) {
             return Ok(());
         }
-        let mut v = self.message_labels.lock().expect("message_labels lock poisoned");
-        if !v.iter().any(|(mb, m, l)| mb == mailbox && m == message_id && l == label_id) {
-            v.push((mailbox.to_string(), message_id.to_string(), label_id.to_string()));
+        let mut v = self
+            .message_labels
+            .lock()
+            .expect("message_labels lock poisoned");
+        if !v
+            .iter()
+            .any(|(mb, m, l)| mb == mailbox && m == message_id && l == label_id)
+        {
+            v.push((
+                mailbox.to_string(),
+                message_id.to_string(),
+                label_id.to_string(),
+            ));
         }
         Ok(())
     }
@@ -1015,7 +1213,12 @@ impl Store for InMemoryStore {
             .filter(|l| l.mailbox == mailbox && ids.iter().any(|id| id == &l.id))
             .cloned()
             .collect();
-        v.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.id.cmp(&b.id)));
+        v.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(v)
     }
 
@@ -1042,7 +1245,11 @@ impl Store for InMemoryStore {
             .filter(|m| m.mailbox == mailbox && msg_ids.iter().any(|id| id == &m.id))
             .cloned()
             .collect();
-        v.sort_by(|a, b| b.received_at.cmp(&a.received_at).then_with(|| b.id.cmp(&a.id)));
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
         apply_before(&mut v, before);
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
@@ -1121,12 +1328,16 @@ impl PgStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages (mailbox, thread_id, received_at)")
             .execute(&self.pool)
             .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages (mailbox, message_id)")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages (mailbox, received_at)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages (mailbox, message_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_mailbox ON messages (mailbox, received_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_starred ON messages (mailbox, starred, received_at)")
             .execute(&self.pool)
             .await?;
@@ -1149,9 +1360,11 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_outbound_due ON outbound_queue (status, next_at)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_due ON outbound_queue (status, next_at)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS aliases (\
                  local_part TEXT PRIMARY KEY, \
@@ -1218,9 +1431,11 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_send_identities_mailbox ON send_identities (mailbox)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_send_identities_mailbox ON send_identities (mailbox)",
+        )
+        .execute(&self.pool)
+        .await?;
         // Contacts (harvested correspondents + manual), keyed `(mailbox, addr)` for upsert.
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS contacts (\
@@ -1301,7 +1516,9 @@ impl PgStore {
     ) -> Result<MailboxSettings, sqlx::Error> {
         Ok(MailboxSettings {
             mailbox: mailbox.to_string(),
-            signature: row.try_get::<Option<String>, _>("signature")?.unwrap_or_default(),
+            signature: row
+                .try_get::<Option<String>, _>("signature")?
+                .unwrap_or_default(),
             auto_reply_enabled: row
                 .try_get::<Option<bool>, _>("auto_reply_enabled")?
                 .unwrap_or(false),
@@ -1332,8 +1549,12 @@ impl PgStore {
             folder: row.try_get("folder")?,
             // Nullable column (pre-migration rows are NULL) — read as Option, default unset.
             starred: row.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
-            thread_id: row.try_get::<Option<String>, _>("thread_id")?.unwrap_or_default(),
-            message_id: row.try_get::<Option<String>, _>("message_id")?.unwrap_or_default(),
+            thread_id: row
+                .try_get::<Option<String>, _>("thread_id")?
+                .unwrap_or_default(),
+            message_id: row
+                .try_get::<Option<String>, _>("message_id")?
+                .unwrap_or_default(),
         })
     }
 
@@ -1350,7 +1571,11 @@ impl PgStore {
             id: row.try_get("id")?,
             raw: row.try_get("raw")?,
             env_from: row.try_get("env_from")?,
-            rcpts: rcpts.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+            rcpts: rcpts
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
             to_domain: row.try_get("to_domain")?,
             attempts: row.try_get("attempts")?,
             next_at: row.try_get("next_at")?,
@@ -1408,7 +1633,10 @@ impl Store for PgStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(backend)?;
-        row.as_ref().map(Self::mailbox_from_row).transpose().map_err(backend)
+        row.as_ref()
+            .map(Self::mailbox_from_row)
+            .transpose()
+            .map_err(backend)
     }
 
     async fn mailbox_for_owner(&self, owner_sub: &str) -> Result<Option<Mailbox>, StoreError> {
@@ -1419,7 +1647,10 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(backend)?;
-        row.as_ref().map(Self::mailbox_from_row).transpose().map_err(backend)
+        row.as_ref()
+            .map(Self::mailbox_from_row)
+            .transpose()
+            .map_err(backend)
     }
 
     async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError> {
@@ -1570,36 +1801,75 @@ impl Store for PgStore {
     async fn search_messages(
         &self,
         mailbox: &str,
-        query: &str,
+        query: &SearchQuery,
         folder: Option<&str>,
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
-        // `%needle%` with LIKE special chars escaped; matched case-insensitively via LOWER().
-        let pattern = format!("%{}%", like_escape(&query.to_lowercase()));
-        // Optional folder scope: the empty string means "whole mailbox" ('' is never a folder).
-        let scope = folder.unwrap_or("");
         let (cur_ts, cur_id) = Self::cursor(before);
-        let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
-             WHERE mailbox = $1 \
-               AND (LOWER(msg_from) LIKE $2 ESCAPE '\\' \
-                    OR LOWER(msg_to) LIKE $2 ESCAPE '\\' \
-                    OR LOWER(subject) LIKE $2 ESCAPE '\\' \
-                    OR LOWER(body_text) LIKE $2 ESCAPE '\\') \
-               AND ($3 = '' OR folder = $3) \
-               AND (received_at < $4 OR (received_at = $4 AND id < $5)) \
-             ORDER BY received_at DESC, id DESC LIMIT $6",
-        )
-        .bind(mailbox)
-        .bind(&pattern)
-        .bind(scope)
-        .bind(cur_ts)
-        .bind(&cur_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(backend)?;
+        let mut sql =
+            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred FROM messages m WHERE m.mailbox = $1");
+        let mut binds = Vec::new();
+        let mut next_param = 2_usize;
+
+        if let Some(folder) = folder {
+            let param = push_text_param(&mut binds, &mut next_param, folder.to_string());
+            sql.push_str(&format!(" AND m.folder = {param}"));
+        }
+
+        let mut positives = Vec::new();
+        let mut negatives = Vec::new();
+        for term in &query.text_terms {
+            let condition = search_text_condition(&term.value, &mut binds, &mut next_param);
+            if term.negated {
+                negatives.push(condition);
+            } else {
+                positives.push(condition);
+            }
+        }
+        for predicate in &query.predicates {
+            let condition = search_predicate_condition(predicate, &mut binds, &mut next_param);
+            if predicate.negated {
+                negatives.push(condition);
+            } else {
+                positives.push(condition);
+            }
+        }
+
+        if !positives.is_empty() {
+            if query.or_mode {
+                sql.push_str(" AND (");
+                sql.push_str(&positives.join(" OR "));
+                sql.push(')');
+            } else {
+                for condition in positives {
+                    sql.push_str(" AND ");
+                    sql.push_str(&condition);
+                }
+            }
+        }
+        for condition in negatives {
+            sql.push_str(" AND NOT (");
+            sql.push_str(&condition);
+            sql.push(')');
+        }
+
+        let cur_ts_param = push_int_param(&mut binds, &mut next_param, cur_ts);
+        let cur_id_param = push_text_param(&mut binds, &mut next_param, cur_id);
+        let limit_param = push_int_param(&mut binds, &mut next_param, limit);
+        sql.push_str(&format!(
+            " AND (m.received_at < {cur_ts_param} OR (m.received_at = {cur_ts_param} AND m.id < {cur_id_param})) \
+             ORDER BY m.received_at DESC, m.id DESC LIMIT {limit_param}",
+        ));
+
+        let mut q = sqlx::query(&sql).bind(mailbox);
+        for bind in &binds {
+            q = match bind {
+                SearchSqlBind::Text(value) => q.bind(value),
+                SearchSqlBind::Int(value) => q.bind(*value),
+            };
+        }
+        let rows = q.fetch_all(&self.pool).await.map_err(backend)?;
         rows.iter()
             .map(summary_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -1616,7 +1886,10 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(backend)?;
-        row.as_ref().map(Self::message_from_row).transpose().map_err(backend)
+        row.as_ref()
+            .map(Self::message_from_row)
+            .transpose()
+            .map_err(backend)
     }
 
     async fn mark_seen(&self, id: &str) -> Result<(), StoreError> {
@@ -1658,11 +1931,12 @@ impl Store for PgStore {
     }
 
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError> {
-        let row = sqlx::query("SELECT COUNT(*) AS n FROM messages WHERE mailbox = $1 AND seen = FALSE")
-            .bind(mailbox)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(backend)?;
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM messages WHERE mailbox = $1 AND seen = FALSE")
+                .bind(mailbox)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(backend)?;
         row.try_get("n").map_err(backend)
     }
 
@@ -1916,7 +2190,10 @@ impl Store for PgStore {
             q = q.bind(r);
         }
         let row = q.fetch_optional(&self.pool).await.map_err(backend)?;
-        Ok(row.map(|r| r.try_get::<String, _>("thread_id")).transpose().map_err(backend)?)
+        Ok(row
+            .map(|r| r.try_get::<String, _>("thread_id"))
+            .transpose()
+            .map_err(backend)?)
     }
 
     async fn list_folder_threads(
@@ -2053,7 +2330,10 @@ impl Store for PgStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(backend)?;
-        row.as_ref().map(Self::identity_from_row).transpose().map_err(backend)
+        row.as_ref()
+            .map(Self::identity_from_row)
+            .transpose()
+            .map_err(backend)
     }
 
     async fn upsert_contact(
@@ -2271,6 +2551,110 @@ fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::E
     })
 }
 
+enum SearchSqlBind {
+    Text(String),
+    Int(i64),
+}
+
+fn push_text_param(
+    binds: &mut Vec<SearchSqlBind>,
+    next_param: &mut usize,
+    value: String,
+) -> String {
+    let param = format!("${}", *next_param);
+    *next_param += 1;
+    binds.push(SearchSqlBind::Text(value));
+    param
+}
+
+fn push_int_param(binds: &mut Vec<SearchSqlBind>, next_param: &mut usize, value: i64) -> String {
+    let param = format!("${}", *next_param);
+    *next_param += 1;
+    binds.push(SearchSqlBind::Int(value));
+    param
+}
+
+fn search_like_pattern(value: &str) -> String {
+    format!("%{}%", like_escape(&value.to_lowercase()))
+}
+
+fn search_text_condition(
+    value: &str,
+    binds: &mut Vec<SearchSqlBind>,
+    next_param: &mut usize,
+) -> String {
+    let param = push_text_param(binds, next_param, search_like_pattern(value));
+    format!(
+        "(LOWER(m.msg_from) LIKE {param} ESCAPE '\\' \
+          OR LOWER(m.msg_to) LIKE {param} ESCAPE '\\' \
+          OR LOWER(m.subject) LIKE {param} ESCAPE '\\' \
+          OR LOWER(m.body_text) LIKE {param} ESCAPE '\\')"
+    )
+}
+
+fn search_predicate_condition(
+    predicate: &SearchPredicate,
+    binds: &mut Vec<SearchSqlBind>,
+    next_param: &mut usize,
+) -> String {
+    match &predicate.kind {
+        SearchPredicateKind::From(value) => {
+            let param = push_text_param(binds, next_param, search_like_pattern(value));
+            format!("LOWER(m.msg_from) LIKE {param} ESCAPE '\\'")
+        }
+        SearchPredicateKind::To(value) => {
+            let param = push_text_param(binds, next_param, search_like_pattern(value));
+            format!("LOWER(m.msg_to) LIKE {param} ESCAPE '\\'")
+        }
+        SearchPredicateKind::Cc(value) => {
+            let pattern = format!("%cc:%{}%", like_escape(&value.to_lowercase()));
+            let param = push_text_param(binds, next_param, pattern);
+            format!("LOWER(m.raw_rfc822) LIKE {param} ESCAPE '\\'")
+        }
+        SearchPredicateKind::Subject(value) => {
+            let param = push_text_param(binds, next_param, search_like_pattern(value));
+            format!("LOWER(m.subject) LIKE {param} ESCAPE '\\'")
+        }
+        SearchPredicateKind::Label(value) => {
+            let param = push_text_param(binds, next_param, value.to_lowercase());
+            format!(
+                "EXISTS (SELECT 1 FROM message_labels ml \
+                 JOIN labels l ON l.id = ml.label_id AND l.mailbox = ml.mailbox \
+                 WHERE ml.mailbox = m.mailbox AND ml.message_id = m.id AND LOWER(l.name) = {param})"
+            )
+        }
+        SearchPredicateKind::Is(SearchState::Read) => "m.seen = TRUE".to_string(),
+        SearchPredicateKind::Is(SearchState::Unread) => "m.seen = FALSE".to_string(),
+        SearchPredicateKind::Is(SearchState::Starred) => "m.starred = TRUE".to_string(),
+        SearchPredicateKind::HasAttachment => {
+            "(LOWER(m.raw_rfc822) LIKE '%content-disposition:%attachment%' \
+              OR LOWER(m.raw_rfc822) LIKE '%filename=%' \
+              OR LOWER(m.raw_rfc822) LIKE '%name=%')"
+                .to_string()
+        }
+        SearchPredicateKind::InFolder(value) => {
+            let param = push_text_param(binds, next_param, value.to_lowercase());
+            format!("LOWER(m.folder) = {param}")
+        }
+        SearchPredicateKind::Before(ts) => {
+            let param = push_int_param(binds, next_param, *ts);
+            format!("m.received_at < {param}")
+        }
+        SearchPredicateKind::After(ts) => {
+            let param = push_int_param(binds, next_param, *ts);
+            format!("m.received_at >= {param}")
+        }
+        SearchPredicateKind::Larger(bytes) => {
+            let param = push_int_param(binds, next_param, *bytes);
+            format!("OCTET_LENGTH(m.raw_rfc822) > {param}")
+        }
+        SearchPredicateKind::Smaller(bytes) => {
+            let param = push_int_param(binds, next_param, *bytes);
+            format!("OCTET_LENGTH(m.raw_rfc822) < {param}")
+        }
+    }
+}
+
 /// Escape the LIKE metacharacters (`\`, `%`, `_`) in a search needle so it matches literally under
 /// `LIKE ... ESCAPE '\'`.
 fn like_escape(s: &str) -> String {
@@ -2321,7 +2705,12 @@ mod tests {
     #[test]
     fn apply_before_keeps_strictly_older_rows() {
         // Ordering is (received_at, id) descending; the cursor row itself is excluded.
-        let all = vec![msg("m_c", 200), msg("m_b", 100), msg("m_a", 100), msg("m_z", 50)];
+        let all = vec![
+            msg("m_c", 200),
+            msg("m_b", 100),
+            msg("m_a", 100),
+            msg("m_z", 50),
+        ];
 
         let mut v = all.clone();
         apply_before(&mut v, None);
@@ -2330,6 +2719,10 @@ mod tests {
         let mut v = all.clone();
         apply_before(&mut v, Some((100, "m_b".to_string())));
         let ids: Vec<&str> = v.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["m_a", "m_z"], "same-ts rows tie-break on id, older ts always kept");
+        assert_eq!(
+            ids,
+            ["m_a", "m_z"],
+            "same-ts rows tie-break on id, older ts always kept"
+        );
     }
 }
