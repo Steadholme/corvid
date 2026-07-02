@@ -18,8 +18,10 @@
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue behind the undo-send window;
 //!                   `action=draft`: persist/upsert into the Drafts folder without sending
 //! - `POST /send/undo` move a still-held send back to Drafts
-//! - `GET /settings` mailbox settings: filter rules / undo send / signature / auto-reply sections
-//! - `POST /settings/rules|undo-send|signature|autoreply` settings mutations (CSRF-guarded)
+//! - `GET /settings` mailbox settings: filter rules / undo send / display / signature / auto-reply
+//!   sections
+//! - `POST /settings/rules|undo-send|preferences|signature|autoreply` settings mutations
+//!   (CSRF-guarded)
 
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -35,9 +37,10 @@ use std::collections::HashMap;
 use time::{Date, Month, OffsetDateTime};
 
 use crate::model::{
-    parse_search_query, Alias, Contact, ContactGroup, FilterRule, Label, Mailbox, Message,
-    ScheduledOutbound, SearchPredicateKind, SearchQuery, SenderListEntry, Signature,
-    SpamAnnotation, Template, DEFAULT_UNDO_SEND_WINDOW_SECS,
+    parse_search_query, Alias, Contact, ContactGroup, FilterRule, Label, Mailbox, MailboxSettings,
+    Message, ScheduledOutbound, SearchPredicateKind, SearchQuery, SenderListEntry, Signature,
+    SpamAnnotation, Template, DEFAULT_DENSITY, DEFAULT_READING_PANE, DEFAULT_THEME,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -66,6 +69,26 @@ const SCHEDULED_VIEW: &str = "Scheduled";
 
 const UNDO_SEND_WINDOW_CHOICES: [i64; 4] = [5, 10, 20, 30];
 const UNDO_SEND_MAX_WINDOW_SECS: i64 = 30;
+const DENSITY_CHOICES: [&str; 3] = ["comfortable", "normal", "compact"];
+const READING_PANE_CHOICES: [&str; 3] = ["off", "right", "bottom"];
+const THEME_CHOICES: [&str; 3] = ["system", "light", "dark"];
+
+#[derive(Clone, Copy)]
+struct PagePrefs {
+    density: &'static str,
+    reading_pane: &'static str,
+    theme: &'static str,
+}
+
+impl Default for PagePrefs {
+    fn default() -> Self {
+        Self {
+            density: DEFAULT_DENSITY,
+            reading_pane: DEFAULT_READING_PANE,
+            theme: DEFAULT_THEME,
+        }
+    }
+}
 
 /// Default rows per folder/search page when `?limit=` is absent.
 const PAGE_DEFAULT: i64 = 50;
@@ -757,6 +780,7 @@ pub fn app(state: AppState) -> Router {
             get(settings_signatures_redirect).post(settings_signatures_post),
         )
         .route("/settings/undo-send", post(settings_undo_send))
+        .route("/settings/preferences", post(settings_preferences))
         .route("/settings/autoreply", post(settings_autoreply))
         .route(
             "/settings/templates",
@@ -922,9 +946,11 @@ async fn advanced_search(
     Query(q): Query<AdvancedSearchQuery>,
 ) -> Response {
     let email = email_display(&headers);
-    let Some(_mb) = resolve_mailbox(&state, &headers).await else {
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
     };
+    let settings = settings_for_page(&state, &mb.addr).await;
+    let prefs = page_prefs(&settings);
 
     if q.has_input() {
         if let Some(search) = build_advanced_search_query(&q) {
@@ -938,7 +964,14 @@ async fn advanced_search(
     }
 
     let content = render_advanced_search_form(&q);
-    Html(render_page("Advanced search", &email, &content, "inbox")).into_response()
+    Html(render_page_with_prefs(
+        "Advanced search",
+        &email,
+        &content,
+        "inbox",
+        prefs,
+    ))
+    .into_response()
 }
 
 async fn inbox(
@@ -960,6 +993,8 @@ async fn inbox(
     let cursor = parse_cursor(q.before.as_deref());
     // The mailbox's labels drive both the tab strip and the label-filter view.
     let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let settings = settings_for_page(&state, &mb.addr).await;
+    let prefs = page_prefs(&settings);
 
     // Label-filter view: a flat, cross-folder listing of one label's messages.
     if let Some(label_id) = q.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -991,13 +1026,14 @@ async fn inbox(
             ));
         }
         for m in &msgs {
-            rows.push_str(&render_row(m, &token, &return_to));
+            rows.push_str(&render_row(m, &token, &return_to, prefs));
         }
+        let list = render_list_with_optional_read_pane(&rows, prefs);
         let heading = format!(r#"Label: <span class="pill">{}</span>"#, esc(&label.name));
         let content = format!(
             r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+{list}{bulk}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
             tabs = folder_tabs(&FolderTabs {
@@ -1008,10 +1044,11 @@ async fn inbox(
                 active_label: label_id,
                 threads_on: false
             }),
+            list = list,
             bulk = bulk_toolbar(&token),
             undo_bar = undo_bar,
         );
-        let html = render_page(&label.name, &email, &content, "inbox");
+        let html = render_page_with_prefs(&label.name, &email, &content, "inbox", prefs);
         return match set_cookie {
             Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
             None => Html(html).into_response(),
@@ -1045,7 +1082,7 @@ async fn inbox(
                 ));
             }
             for t in &threads {
-                rows.push_str(&render_thread_row(t));
+                rows.push_str(&render_thread_row(t, prefs));
             }
             let base = format!("/?folder={folder}&view=threads&limit={limit}");
             let next_link = next_thread_link(&threads, limit, &base);
@@ -1054,10 +1091,11 @@ async fn inbox(
             } else {
                 esc(folder)
             };
+            let list = render_list_with_optional_read_pane(&rows, prefs);
             let content = format!(
                 r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+{list}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
                 tabs = folder_tabs(&FolderTabs {
@@ -1068,9 +1106,10 @@ async fn inbox(
                     active_label: "",
                     threads_on: true
                 }),
+                list = list,
                 undo_bar = undo_bar,
             );
-            let html = render_page(folder, &email, &content, "inbox");
+            let html = render_page_with_prefs(folder, &email, &content, "inbox", prefs);
             return match set_cookie {
                 Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
                 None => Html(html).into_response(),
@@ -1106,14 +1145,15 @@ async fn inbox(
             ));
         }
         for item in &scheduled {
-            rows.push_str(&render_scheduled_row(item, &token));
+            rows.push_str(&render_scheduled_row(item, &token, prefs));
         }
         let base = format!("/?folder=Scheduled&limit={limit}");
         let next_link = next_scheduled_link(&scheduled, limit, &base);
+        let list = render_list_with_optional_read_pane(&rows, prefs);
         let content = format!(
             r#"<div class="page-head"><h1>Scheduled</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
-<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+{list}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
             tabs = folder_tabs(&FolderTabs {
@@ -1124,9 +1164,10 @@ async fn inbox(
                 active_label: "",
                 threads_on: false,
             }),
+            list = list,
             undo_bar = undo_bar,
         );
-        let html = render_page(SCHEDULED_VIEW, &email, &content, "inbox");
+        let html = render_page_with_prefs(SCHEDULED_VIEW, &email, &content, "inbox", prefs);
         return match set_cookie {
             Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
             None => Html(html).into_response(),
@@ -1227,17 +1268,18 @@ async fn inbox(
     }
     for m in &msgs {
         match parsed_search.as_ref() {
-            Some(query) => rows.push_str(&render_search_row(m, &token, &return_to, query)),
-            None => rows.push_str(&render_row(m, &token, &return_to)),
+            Some(query) => rows.push_str(&render_search_row(m, &token, &return_to, query, prefs)),
+            None => rows.push_str(&render_row(m, &token, &return_to, prefs)),
         }
     }
 
     let search_actions = search.map(render_search_actions).unwrap_or_default();
+    let list = render_list_with_optional_read_pane(&rows, prefs);
     let content = format!(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 {search_actions}
-<section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+{list}{bulk}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
         tabs = folder_tabs(&FolderTabs {
@@ -1248,11 +1290,12 @@ async fn inbox(
             active_label: "",
             threads_on: false,
         }),
+        list = list,
         bulk = bulk_toolbar(&token),
         undo_bar = undo_bar,
     );
     let title = if folder.is_empty() { "Search" } else { folder };
-    let html = render_page(title, &email, &content, "inbox");
+    let html = render_page_with_prefs(title, &email, &content, "inbox", prefs);
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -1457,8 +1500,42 @@ fn render_undo_bar(batch_id: Option<&str>, undo_until: Option<&str>, token: &str
 /// Render one inbox/search row: the message link plus a per-row action form (star, mark-unread,
 /// archive, spam/not-spam, delete, move-to-folder). `token` is the CSRF token; `return_to` is where
 /// each action redirects back to.
-fn render_row(m: &crate::model::MessageSummary, token: &str, return_to: &str) -> String {
-    render_row_inner(m, token, return_to, None)
+fn render_message_list(rows: &str, prefs: PagePrefs) -> String {
+    format!(
+        r#"<section class="card mail-list-pane mail-list-pane--{density}" data-density="{density}"><ul class="maillist maillist--{density}" data-density="{density}">{rows}</ul></section>"#,
+        density = esc(prefs.density),
+    )
+}
+
+fn render_list_with_optional_read_pane(rows: &str, prefs: PagePrefs) -> String {
+    let list = render_message_list(rows, prefs);
+    if prefs.reading_pane == "off" {
+        return list;
+    }
+    format!(
+        r#"<div class="mailbox-layout mailbox-layout--{pane}" data-pane="{pane}">{list}<section class="card pad read-pane read-pane--empty" data-read-pane aria-label="Reading pane"></section></div>"#,
+        pane = esc(prefs.reading_pane),
+    )
+}
+
+fn render_split_reader(rows: &str, read_html: &str, prefs: PagePrefs) -> String {
+    if prefs.reading_pane == "off" {
+        return read_html.to_string();
+    }
+    let list = render_message_list(rows, prefs);
+    format!(
+        r#"<div class="mailbox-layout mailbox-layout--{pane}" data-pane="{pane}">{list}{read_html}</div>"#,
+        pane = esc(prefs.reading_pane),
+    )
+}
+
+fn render_row(
+    m: &crate::model::MessageSummary,
+    token: &str,
+    return_to: &str,
+    prefs: PagePrefs,
+) -> String {
+    render_row_inner(m, token, return_to, None, prefs)
 }
 
 fn render_search_row(
@@ -1466,8 +1543,9 @@ fn render_search_row(
     token: &str,
     return_to: &str,
     query: &SearchQuery,
+    prefs: PagePrefs,
 ) -> String {
-    render_row_inner(m, token, return_to, Some(query))
+    render_row_inner(m, token, return_to, Some(query), prefs)
 }
 
 fn render_row_inner(
@@ -1475,6 +1553,7 @@ fn render_row_inner(
     token: &str,
     return_to: &str,
     query: Option<&SearchQuery>,
+    prefs: PagePrefs,
 ) -> String {
     let cls = if m.seen { "mailrow" } else { "mailrow unseen" };
     let dot = if m.seen { "dot seen" } else { "dot" };
@@ -1492,7 +1571,8 @@ fn render_row_inner(
         .unwrap_or_else(|| esc(&from_display));
     let star = star_mark(m.starred);
     let state_cls = format!(
-        "{}{}{}",
+        "mailrow-wrap--{}{}{}{}",
+        prefs.density,
         folder_class(&m.folder),
         if m.snooze_until > now_secs() {
             " is-snoozed"
@@ -1507,9 +1587,10 @@ fn render_row_inner(
         format!("/m/{}", url_encode(&m.id))
     };
     format!(
-        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="{href}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls} mailrow--{density}" href="{href}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         href = esc(&href),
+        density = esc(prefs.density),
         starred = m.starred,
         seen = m.seen,
         snooze_until = m.snooze_until,
@@ -1530,7 +1611,7 @@ fn render_row_inner(
     )
 }
 
-fn render_scheduled_row(item: &ScheduledOutbound, token: &str) -> String {
+fn render_scheduled_row(item: &ScheduledOutbound, token: &str, prefs: PagePrefs) -> String {
     let parsed = crate::rfc822::parse(&item.raw);
     let subject_text = if parsed.subject.trim().is_empty() {
         "(no subject)".to_string()
@@ -1549,7 +1630,7 @@ fn render_scheduled_row(item: &ScheduledOutbound, token: &str) -> String {
     };
     let controls = schedule_controls_for(now_secs(), item.send_at);
     format!(
-        r#"<li class="mailrow-wrap folder-scheduled is-scheduled" data-id="{id}" data-send-at="{send_at}"><a class="mailrow" href="/compose?scheduled={scheduled}"><span class="dot seen"></span><span class="from">{to}</span><span class="subject">{subject}</span><span class="date">{date}</span></a><form class="row-actions scheduled-actions" method="post" action="/scheduled/{scheduled}/action">
+        r#"<li class="mailrow-wrap mailrow-wrap--{density} folder-scheduled is-scheduled" data-id="{id}" data-send-at="{send_at}"><a class="mailrow mailrow--{density}" href="/compose?scheduled={scheduled}"><span class="dot seen"></span><span class="from">{to}</span><span class="subject">{subject}</span><span class="date">{date}</span></a><form class="row-actions scheduled-actions" method="post" action="/scheduled/{scheduled}/action">
   <input type="hidden" name="csrf" value="{token}">
   <input type="hidden" name="return" value="/?folder=Scheduled">
   {controls}
@@ -1559,6 +1640,7 @@ fn render_scheduled_row(item: &ScheduledOutbound, token: &str) -> String {
   <button class="btn btn-danger btn-sm btn-cancel-scheduled" type="submit" name="op" value="cancel">Cancel</button>
 </form><span class="sr-only">From {from}</span></li>"#,
         id = esc(&item.batch_id),
+        density = esc(prefs.density),
         scheduled = url_encode(&item.batch_id),
         send_at = item.send_at,
         token = esc(token),
@@ -1710,6 +1792,64 @@ fn undo_send_window_options(selected: i64) -> String {
         ));
     }
     opts
+}
+
+fn page_prefs(settings: &MailboxSettings) -> PagePrefs {
+    PagePrefs {
+        density: effective_density(&settings.density),
+        reading_pane: effective_reading_pane(&settings.reading_pane),
+        theme: effective_theme(&settings.theme),
+    }
+}
+
+async fn settings_for_page(state: &AppState, mailbox: &str) -> MailboxSettings {
+    match state.store.get_settings(mailbox).await {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!(mailbox, error = %e, "failed to load mailbox settings; using defaults");
+            MailboxSettings::default_for(mailbox)
+        }
+    }
+}
+
+fn display_preference_options(settings: &MailboxSettings) -> (String, String, String) {
+    let prefs = page_prefs(settings);
+    (
+        select_options_selected(&DENSITY_CHOICES, prefs.density, density_label),
+        select_options_selected(
+            &READING_PANE_CHOICES,
+            prefs.reading_pane,
+            reading_pane_label,
+        ),
+        select_options_selected(&THEME_CHOICES, prefs.theme, theme_label),
+    )
+}
+
+fn density_label(value: &str) -> String {
+    match value {
+        "comfortable" => "Comfortable".to_string(),
+        "normal" => "Normal".to_string(),
+        "compact" => "Compact".to_string(),
+        other => esc(other),
+    }
+}
+
+fn reading_pane_label(value: &str) -> String {
+    match value {
+        "off" => "Off".to_string(),
+        "right" => "Right".to_string(),
+        "bottom" => "Bottom".to_string(),
+        other => esc(other),
+    }
+}
+
+fn theme_label(value: &str) -> String {
+    match value {
+        "system" => "System".to_string(),
+        "light" => "Light".to_string(),
+        "dark" => "Dark".to_string(),
+        other => esc(other),
+    }
 }
 
 fn schedule_presets(now: i64) -> [(i64, &'static str); 3] {
@@ -2375,7 +2515,7 @@ fn folder_tabs(t: &FolderTabs) -> String {
 
 /// Render one collapsed conversation row for the threaded folder view: the latest message's
 /// from/subject/date, a message count, and the unread indicator, linking to the conversation view.
-fn render_thread_row(t: &crate::model::ThreadSummary) -> String {
+fn render_thread_row(t: &crate::model::ThreadSummary, prefs: PagePrefs) -> String {
     let m = &t.latest;
     let cls = if t.unseen > 0 {
         "mailrow unseen"
@@ -2394,8 +2534,9 @@ fn render_thread_row(t: &crate::model::ThreadSummary) -> String {
         String::new()
     };
     format!(
-        r#"<li class="mailrow-wrap"><a class="{cls}" href="/t?id={id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{count}{subject}</span><span class="date">{date}</span></a></li>"#,
+        r#"<li class="mailrow-wrap mailrow-wrap--{density}"><a class="{cls} mailrow--{density}" href="/t?id={id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{count}{subject}</span><span class="date">{date}</span></a></li>"#,
         id = url_encode(&t.thread_id),
+        density = esc(prefs.density),
         from = esc(&display_from(&m.msg_from)),
         count = count_badge,
         date = fmt_date(m.received_at),
@@ -2442,6 +2583,8 @@ async fn read_message(
     let _ = state.store.mark_seen(&id).await;
     // Mint/reuse a CSRF token for the read-view action buttons (star/archive/delete/move/unread).
     let (token, set_cookie) = ensure_csrf(&headers);
+    let settings = settings_for_page(&state, &mb.addr).await;
+    let prefs = page_prefs(&settings);
 
     let body = render_message_body(&msg);
 
@@ -2492,9 +2635,31 @@ async fn read_message(
     } else {
         esc(&msg.subject)
     };
-    let content = format!(
-        r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
-<section class="card pad">
+    let mut pane_rows = String::new();
+    if prefs.reading_pane != "off" {
+        let return_to = format!("/m/{}", url_encode(&msg.id));
+        match state
+            .store
+            .list_folder(&mb.addr, &msg.folder, None, PAGE_DEFAULT)
+            .await
+        {
+            Ok(msgs) => {
+                for item in &msgs {
+                    pane_rows.push_str(&render_row(item, &token, &return_to, prefs));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    mailbox = %mb.addr,
+                    folder = %msg.folder,
+                    error = %e,
+                    "failed to load reading-pane list"
+                );
+            }
+        }
+    }
+    let read_card = format!(
+        r#"<section class="card pad read-pane read-pane--message" data-read-pane>
   <header class="msg-head">
     <h1 class="msg-subject">{subject}</h1>
     <div class="msg-meta">
@@ -2518,12 +2683,6 @@ async fn read_message(
         from = esc(&msg.msg_from),
         to = esc(&msg.msg_to),
         date = fmt_date(msg.received_at),
-        folder = esc(&msg.folder),
-        folder_label = if msg.folder == "INBOX" {
-            "Inbox".to_string()
-        } else {
-            esc(&msg.folder)
-        },
         id = esc(&msg.id),
         convo = convo_html,
         labels = labels_html,
@@ -2537,11 +2696,22 @@ async fn read_message(
             msg.snooze_until,
             msg.muted,
             &token,
-            &format!("/m/{}", esc(&msg.id))
+            &format!("/m/{}", url_encode(&msg.id))
         ),
     );
+    let reader = render_split_reader(&pane_rows, &read_card, prefs);
+    let content = format!(
+        r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
+{reader}"#,
+        folder = esc(&msg.folder),
+        folder_label = if msg.folder == "INBOX" {
+            "Inbox".to_string()
+        } else {
+            esc(&msg.folder)
+        },
+    );
     let content = format!("{content}\n<script src=\"/assets/webmail.js\"></script>");
-    let html = render_page(&msg.subject, &email, &content, "inbox");
+    let html = render_page_with_prefs(&msg.subject, &email, &content, "inbox", prefs);
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -2616,6 +2786,8 @@ async fn conversation(
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
     };
+    let settings = settings_for_page(&state, &mb.addr).await;
+    let prefs = page_prefs(&settings);
     let msgs = match state.store.list_thread(&mb.addr, &q.id, PAGE_MAX).await {
         Ok(m) => m,
         Err(e) => {
@@ -2649,7 +2821,7 @@ async fn conversation(
         let body = render_message_body(m);
         let attachments = render_attachment_list(m);
         blocks.push_str(&format!(
-            r#"<section class="card pad convo-msg" data-convo-item>
+            r#"<section class="card pad read-pane read-pane--conversation convo-msg" data-read-pane data-convo-item>
   <header class="msg-head">
     <div class="msg-meta">
       <b>From</b><span>{from}</span>
@@ -2681,7 +2853,14 @@ async fn conversation(
         count = msgs.len(),
         latest = esc(&latest_id),
     );
-    Html(render_page("Conversation", &email, &content, "inbox")).into_response()
+    Html(render_page_with_prefs(
+        "Conversation",
+        &email,
+        &content,
+        "inbox",
+        prefs,
+    ))
+    .into_response()
 }
 
 /// Form body for `POST /m/{id}/labels`: CSRF, `op` (`add`|`remove`), and the `label` id.
@@ -3000,6 +3179,45 @@ fn effective_undo_send_window_secs(secs: i64) -> i64 {
     } else {
         DEFAULT_UNDO_SEND_WINDOW_SECS
     }
+}
+
+fn effective_density(raw: &str) -> &'static str {
+    choice_or_default(raw, &DENSITY_CHOICES, DEFAULT_DENSITY)
+}
+
+fn effective_reading_pane(raw: &str) -> &'static str {
+    choice_or_default(raw, &READING_PANE_CHOICES, DEFAULT_READING_PANE)
+}
+
+fn effective_theme(raw: &str) -> &'static str {
+    choice_or_default(raw, &THEME_CHOICES, DEFAULT_THEME)
+}
+
+fn choice_or_default(raw: &str, choices: &[&'static str], default: &'static str) -> &'static str {
+    let raw = raw.trim();
+    choices
+        .iter()
+        .copied()
+        .find(|choice| *choice == raw)
+        .unwrap_or(default)
+}
+
+fn parse_display_choice(
+    raw: &str,
+    choices: &[&'static str],
+    label: &str,
+) -> Result<&'static str, (StatusCode, String)> {
+    let raw = raw.trim();
+    choices
+        .iter()
+        .copied()
+        .find(|choice| *choice == raw)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid {label} preference."),
+            )
+        })
 }
 
 fn parse_future_epoch(
@@ -3708,6 +3926,8 @@ async fn compose_form(
         return no_mailbox_page(&email);
     };
     let (token, set_cookie) = ensure_csrf(&headers);
+    let settings = settings_for_page(&state, &mb.addr).await;
+    let prefs = page_prefs(&settings);
 
     // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
     let mut pre = build_prefill(&state, &mb, &q).await;
@@ -3846,7 +4066,7 @@ async fn compose_form(
         schedule_controls = schedule_controls_for(now_secs(), pre.schedule_at),
         template_controls = render_compose_template_controls(&templates),
     );
-    let html = render_page("Compose", &email, &content, "compose");
+    let html = render_page_with_prefs("Compose", &email, &content, "compose", prefs);
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -5360,7 +5580,7 @@ async fn admin_add_alias(
 }
 
 // ---------------------------------------------------------------------------
-// Settings — filter rules / signature / auto-reply (per-mailbox)
+// Settings — filter rules / signature / display / auto-reply (per-mailbox)
 // ---------------------------------------------------------------------------
 
 /// The legal rule match fields / operators / actions (the settings selects + POST validation).
@@ -5368,8 +5588,8 @@ const RULE_FIELDS: [&str; 3] = ["from", "to", "subject"];
 const RULE_OPS: [&str; 2] = ["contains", "equals"];
 const RULE_ACTIONS: [&str; 5] = ["move", "star", "markread", "discard", "label"];
 
-/// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, and
-/// auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
+/// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, display,
+/// and auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
 async fn settings_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5531,6 +5751,7 @@ async fn settings_page(
         ""
     };
     let undo_window_opts = undo_send_window_options(settings.undo_send_window_secs);
+    let (density_opts, reading_pane_opts, theme_opts) = display_preference_options(&settings);
     let content = format!(
         r#"<div class="page-head"><h1>Settings</h1></div>
 <section id="filter-rules" class="card pad filter-rules">
@@ -5565,6 +5786,16 @@ async fn settings_page(
     <div class="form-actions"><button class="btn btn-primary" type="submit">Save undo send</button></div>
   </form>
 </section>
+<section class="card pad display-settings">
+  <h2>Display</h2>
+  <form method="post" action="/settings/preferences">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="density">Density</label><select id="density" name="density">{density_opts}</select></div>
+    <div class="field"><label for="reading_pane">Reading pane</label><select id="reading_pane" name="reading_pane">{reading_pane_opts}</select></div>
+    <div class="field"><label for="theme">Theme</label><select id="theme" name="theme">{theme_opts}</select></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Save display</button></div>
+  </form>
+</section>
 <section class="card pad">
   <h2>Auto-reply (vacation)</h2>
   <form method="post" action="/settings/autoreply">
@@ -5582,6 +5813,9 @@ async fn settings_page(
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
         undo_window_opts = undo_window_opts,
+        density_opts = density_opts,
+        reading_pane_opts = reading_pane_opts,
+        theme_opts = theme_opts,
         templates_section = render_templates_section(&templates, &token),
         labels_section = render_labels_section(&labels, &token),
         senders_section = render_sender_lists_section(&sender_lists, &token),
@@ -5594,7 +5828,13 @@ async fn settings_page(
             &token
         ),
     );
-    let html = render_page("Settings", &email, &content, "settings");
+    let html = render_page_with_prefs(
+        "Settings",
+        &email,
+        &content,
+        "settings",
+        page_prefs(&settings),
+    );
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -6336,6 +6576,71 @@ async fn settings_undo_send(
         mailbox = %mb.addr,
         secs,
         "undo-send window updated",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/preferences`.
+#[derive(Deserialize, Default)]
+struct DisplayPreferencesForm {
+    csrf: String,
+    #[serde(default)]
+    density: String,
+    #[serde(default)]
+    reading_pane: String,
+    #[serde(default)]
+    theme: String,
+}
+
+/// `POST /settings/preferences` — save display density, reading pane, and theme preferences.
+/// CSRF-guarded; values are finite strings so the root `data-*` attributes stay predictable.
+async fn settings_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DisplayPreferencesForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let density = match parse_display_choice(&form.density, &DENSITY_CHOICES, "density") {
+        Ok(value) => value,
+        Err((code, message)) => return error_page(code, "Invalid request", &message),
+    };
+    let reading_pane =
+        match parse_display_choice(&form.reading_pane, &READING_PANE_CHOICES, "reading pane") {
+            Ok(value) => value,
+            Err((code, message)) => return error_page(code, "Invalid request", &message),
+        };
+    let theme = match parse_display_choice(&form.theme, &THEME_CHOICES, "theme") {
+        Ok(value) => value,
+        Err((code, message)) => return error_page(code, "Invalid request", &message),
+    };
+    if let Err(e) = state
+        .store
+        .set_display_preferences(&mb.addr, density, reading_pane, theme)
+        .await
+    {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        density,
+        reading_pane,
+        theme,
+        "display preferences updated",
     );
     Redirect::to("/settings").into_response()
 }
@@ -8104,9 +8409,28 @@ pub fn esc(s: &str) -> String {
 /// Render a full page into the Odyssey v2 shell. `nav_active` marks the current app-bar nav
 /// destination (`"inbox"`, `"compose"`, or `""` for none — e.g. admin/error pages).
 fn render_page(title: &str, email_display: &str, content: &str, nav_active: &str) -> String {
+    render_page_with_prefs(
+        title,
+        email_display,
+        content,
+        nav_active,
+        PagePrefs::default(),
+    )
+}
+
+fn render_page_with_prefs(
+    title: &str,
+    email_display: &str,
+    content: &str,
+    nav_active: &str,
+    prefs: PagePrefs,
+) -> String {
     SHELL
         .replace("{{STYLE}}", APP_CSS)
         .replace("{{TITLE}}", &esc(title))
+        .replace("{{THEME}}", &esc(prefs.theme))
+        .replace("{{DENSITY}}", &esc(prefs.density))
+        .replace("{{PANE}}", &esc(prefs.reading_pane))
         .replace("{{NAV}}", &nav_bar(nav_active))
         .replace("{{USERBOX}}", &userbox(email_display))
         .replace("{{CONTENT}}", content)
@@ -8290,6 +8614,138 @@ mod tests {
         assert_eq!(display_from("Alice <a@b.com>"), "Alice");
         assert_eq!(display_from("<a@b.com>"), "a@b.com");
         assert_eq!(display_from("bare@x.com"), "bare@x.com");
+    }
+
+    #[test]
+    fn display_preference_values_are_finite() {
+        assert_eq!(effective_density("compact"), "compact");
+        assert_eq!(effective_density("spacious"), DEFAULT_DENSITY);
+        assert_eq!(effective_reading_pane("bottom"), "bottom");
+        assert_eq!(effective_reading_pane("sidecar"), DEFAULT_READING_PANE);
+        assert_eq!(effective_theme("dark"), "dark");
+        assert_eq!(effective_theme("sepia"), DEFAULT_THEME);
+        assert!(parse_display_choice("right", &READING_PANE_CHOICES, "reading pane").is_ok());
+        assert!(parse_display_choice("invalid", &THEME_CHOICES, "theme").is_err());
+    }
+
+    #[tokio::test]
+    async fn display_preferences_render_shell_and_pane_hooks() {
+        use tower::ServiceExt;
+
+        let state = crate::build_dev_state().await;
+        state
+            .store
+            .set_display_preferences("w33d@w33d.xyz", "compact", "right", "dark")
+            .await
+            .unwrap();
+        state
+            .store
+            .store_message(&Message {
+                id: "msg-density-1".to_string(),
+                mailbox: "w33d@w33d.xyz".to_string(),
+                msg_from: "Alice <alice@example.com>".to_string(),
+                msg_to: "w33d@w33d.xyz".to_string(),
+                subject: "Density hooks".to_string(),
+                raw_rfc822: "From: Alice <alice@example.com>\r\n\r\nHello".to_string(),
+                body_text: "Hello".to_string(),
+                body_html: String::new(),
+                received_at: 1,
+                seen: false,
+                folder: "INBOX".to_string(),
+                starred: false,
+                snooze_until: 0,
+                muted: false,
+                thread_id: String::new(),
+                message_id: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/")
+            .header("x-auth-subject", "w33d")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            r#"<html lang="en" data-theme="dark" data-density="compact" data-pane="right">"#,
+            r#"class="mailbox-layout mailbox-layout--right" data-pane="right""#,
+            r#"class="card mail-list-pane mail-list-pane--compact" data-density="compact""#,
+            r#"class="maillist maillist--compact" data-density="compact""#,
+            "mailrow-wrap--compact",
+            "read-pane--empty",
+        ] {
+            assert!(html.contains(needle), "missing display hook {needle}");
+        }
+
+        let req = Request::builder()
+            .uri("/settings")
+            .header("x-auth-subject", "w33d")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            r#"action="/settings/preferences""#,
+            r#"<option value="compact" selected>Compact</option>"#,
+            r#"<option value="right" selected>Right</option>"#,
+            r#"<option value="dark" selected>Dark</option>"#,
+        ] {
+            assert!(html.contains(needle), "missing settings hook {needle}");
+        }
+    }
+
+    #[tokio::test]
+    async fn display_preferences_post_saves_values() {
+        use tower::ServiceExt;
+
+        let state = crate::build_dev_state().await;
+        let req = Request::builder()
+            .uri("/settings")
+            .header("x-auth-subject", "w33d")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+        let token = cookie_pair
+            .strip_prefix("__Host-csrf=")
+            .expect("csrf cookie prefix");
+
+        let form = format!("csrf={token}&density=comfortable&reading_pane=bottom&theme=light");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/settings/preferences")
+            .header("x-auth-subject", "w33d")
+            .header(header::COOKIE, cookie_pair)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from(form))
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_redirection(),
+            "expected redirect, got {}",
+            resp.status()
+        );
+        let settings = state.store.get_settings("w33d@w33d.xyz").await.unwrap();
+        assert_eq!(settings.density, "comfortable");
+        assert_eq!(settings.reading_pane, "bottom");
+        assert_eq!(settings.theme, "light");
     }
 
     #[tokio::test]

@@ -31,7 +31,8 @@
 //! - `templates(id TEXT PK, user TEXT, name TEXT, body_html TEXT, body_text TEXT,
 //!    created_at BIGINT, updated_at BIGINT)`
 //! - `spam_annotations(message_id TEXT PK, mailbox TEXT, score BIGINT, reason TEXT)`
-//! - settings columns on `mailboxes` (signature, undo_send_window_secs, auto_reply_*), added
+//! - settings columns on `mailboxes` (signature, undo_send_window_secs, display prefs,
+//!   auto_reply_*), added
 //!   idempotently.
 
 use std::collections::BTreeMap;
@@ -44,7 +45,8 @@ use crate::model::{
     Alias, Contact, ContactGroup, FilterRule, Label, Mailbox, MailboxSettings, Message,
     MessageSummary, OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind,
     SearchQuery, SearchState, SendIdentity, SenderListEntry, Signature, SpamAnnotation, Template,
-    ThreadSummary, DEFAULT_UNDO_SEND_WINDOW_SECS,
+    ThreadSummary, DEFAULT_DENSITY, DEFAULT_READING_PANE, DEFAULT_THEME,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -196,6 +198,14 @@ pub trait Store: Send + Sync {
     async fn delete_signature(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
     /// Set the undo-send hold window in seconds (`0` keeps the legacy immediate-send path).
     async fn set_undo_send_window(&self, mailbox: &str, secs: i64) -> Result<(), StoreError>;
+    /// Set display preferences for list density, reading pane placement, and theme.
+    async fn set_display_preferences(
+        &self,
+        mailbox: &str,
+        density: &str,
+        reading_pane: &str,
+        theme: &str,
+    ) -> Result<(), StoreError>;
     /// Set the auto-reply (vacation) configuration (`until` of 0 = no expiry).
     async fn set_auto_reply(
         &self,
@@ -1347,6 +1357,27 @@ impl Store for InMemoryStore {
             }
         };
         s.undo_send_window_secs = secs;
+        Ok(())
+    }
+
+    async fn set_display_preferences(
+        &self,
+        mailbox: &str,
+        density: &str,
+        reading_pane: &str,
+        theme: &str,
+    ) -> Result<(), StoreError> {
+        let mut v = self.settings.lock().expect("settings lock poisoned");
+        let s = match v.iter_mut().find(|s| s.mailbox == mailbox) {
+            Some(s) => s,
+            None => {
+                v.push(MailboxSettings::default_for(mailbox));
+                v.last_mut().expect("just pushed")
+            }
+        };
+        s.density = density.to_string();
+        s.reading_pane = reading_pane.to_string();
+        s.theme = theme.to_string();
         Ok(())
     }
 
@@ -2599,12 +2630,15 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
-        // Per-mailbox settings (signature + undo send + auto-reply): added out-of-band
+        // Per-mailbox settings (signature + undo send + display prefs + auto-reply): added out-of-band
         // (idempotent) so an already-provisioned `mailboxes` table gains the columns without a
         // destructive rebuild. Nullable — pre-migration rows read as defaults.
         for stmt in [
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS signature TEXT",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS undo_send_window_secs BIGINT DEFAULT 10",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS density TEXT DEFAULT 'normal'",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS reading_pane TEXT DEFAULT 'off'",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS theme TEXT DEFAULT 'system'",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_enabled BOOLEAN DEFAULT FALSE",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_subject TEXT",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_body TEXT",
@@ -2884,6 +2918,15 @@ impl PgStore {
             undo_send_window_secs: row
                 .try_get::<Option<i64>, _>("undo_send_window_secs")?
                 .unwrap_or(DEFAULT_UNDO_SEND_WINDOW_SECS),
+            density: row
+                .try_get::<Option<String>, _>("density")?
+                .unwrap_or_else(|| DEFAULT_DENSITY.to_string()),
+            reading_pane: row
+                .try_get::<Option<String>, _>("reading_pane")?
+                .unwrap_or_else(|| DEFAULT_READING_PANE.to_string()),
+            theme: row
+                .try_get::<Option<String>, _>("theme")?
+                .unwrap_or_else(|| DEFAULT_THEME.to_string()),
             auto_reply_enabled: row
                 .try_get::<Option<bool>, _>("auto_reply_enabled")?
                 .unwrap_or(false),
@@ -3644,8 +3687,8 @@ impl Store for PgStore {
 
     async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError> {
         let row = sqlx::query(
-            "SELECT signature, undo_send_window_secs, auto_reply_enabled, auto_reply_subject, \
-                    auto_reply_body, auto_reply_until \
+            "SELECT signature, undo_send_window_secs, density, reading_pane, theme, \
+                    auto_reply_enabled, auto_reply_subject, auto_reply_body, auto_reply_until \
              FROM mailboxes WHERE addr = $1",
         )
         .bind(mailbox)
@@ -3866,6 +3909,26 @@ impl Store for PgStore {
             .execute(&self.pool)
             .await
             .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_display_preferences(
+        &self,
+        mailbox: &str,
+        density: &str,
+        reading_pane: &str,
+        theme: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE mailboxes SET density = $1, reading_pane = $2, theme = $3 WHERE addr = $4",
+        )
+        .bind(density)
+        .bind(reading_pane)
+        .bind(theme)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
         Ok(())
     }
 

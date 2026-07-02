@@ -50,10 +50,16 @@ pub struct FilterRule {
 
 /// Default Gmail-style undo-send hold window for new/unsaved mailbox settings.
 pub const DEFAULT_UNDO_SEND_WINDOW_SECS: i64 = 10;
+/// Default mailbox list density (`comfortable` | `normal` | `compact`).
+pub const DEFAULT_DENSITY: &str = "normal";
+/// Default reading pane placement (`off` | `right` | `bottom`).
+pub const DEFAULT_READING_PANE: &str = "off";
+/// Default theme preference (`system` | `light` | `dark`).
+pub const DEFAULT_THEME: &str = "system";
 
-/// Per-mailbox settings: the compose signature, undo-send window, and the auto-reply (vacation)
-/// responder. Stored on the `mailboxes` row; every field defaults to "off"/empty except undo-send
-/// for a mailbox that never saved any.
+/// Per-mailbox settings: compose signature, undo-send, display preferences, and the auto-reply
+/// (vacation) responder. Stored on the `mailboxes` row; every field defaults to "off"/empty except
+/// undo-send/display preferences for a mailbox that never saved any.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MailboxSettings {
     /// The mailbox these settings belong to ([`Mailbox::addr`]).
@@ -62,6 +68,12 @@ pub struct MailboxSettings {
     pub signature: String,
     /// Gmail-style undo-send hold window in seconds. `0` preserves immediate-send compatibility.
     pub undo_send_window_secs: i64,
+    /// Message-list density preference.
+    pub density: String,
+    /// Reading pane preference (`off` keeps the legacy full-page reader).
+    pub reading_pane: String,
+    /// Theme preference; frontend CSS handles the visual tokens.
+    pub theme: String,
     /// Whether the auto-reply (vacation) responder is on.
     pub auto_reply_enabled: bool,
     /// Auto-reply subject (empty falls back to `Auto: <original subject>`).
@@ -79,6 +91,9 @@ impl MailboxSettings {
             mailbox: mailbox.to_string(),
             signature: String::new(),
             undo_send_window_secs: DEFAULT_UNDO_SEND_WINDOW_SECS,
+            density: DEFAULT_DENSITY.to_string(),
+            reading_pane: DEFAULT_READING_PANE.to_string(),
+            theme: DEFAULT_THEME.to_string(),
             auto_reply_enabled: false,
             auto_reply_subject: String::new(),
             auto_reply_body: String::new(),
