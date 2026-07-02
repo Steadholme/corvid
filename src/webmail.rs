@@ -14,32 +14,33 @@
 //! - `GET /search/advanced` Gmail-style advanced search form; submits to the existing `?q=` search
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
+//! - `POST /compose/autosave` upsert the current compose into Drafts as a JSON progressive enhancement
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue behind the undo-send window;
-//!                   `action=draft`: persist into the Drafts folder without sending
+//!                   `action=draft`: persist/upsert into the Drafts folder without sending
 //! - `POST /send/undo` move a still-held send back to Drafts
 //! - `GET /settings` mailbox settings: filter rules / undo send / signature / auto-reply sections
 //! - `POST /settings/rules|undo-send|signature|autoreply` settings mutations (CSRF-guarded)
 
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 
 use crate::rfc822::Attachment;
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::Deserialize;
 use time::{Date, Month, OffsetDateTime};
 
+use crate::AppState;
 use crate::model::{
-    parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
-    SearchPredicateKind, SearchQuery, SenderListEntry, SpamAnnotation, Template,
-    DEFAULT_UNDO_SEND_WINDOW_SECS,
+    Alias, Contact, DEFAULT_UNDO_SEND_WINDOW_SECS, FilterRule, Label, Mailbox, Message,
+    ScheduledOutbound, SearchPredicateKind, SearchQuery, SenderListEntry, SpamAnnotation, Template,
+    parse_search_query,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
-use crate::AppState;
 
 /// The real (column-backed) folders the webmail surfaces: INBOX for received mail, the two
 /// locally-authored ones, plus Archive/Spam/Trash that message actions move mail into. These are
@@ -391,9 +392,9 @@ const WEBMAIL_JS: &str = r#"
 "#;
 
 /// Compose-form enhancement layer (additive; the plain form still submits with JS off). Adds a
-/// subject character counter, an in-flight ("Sending…"/"Saving…") button state, a client-side
-/// recipient check before send, and a blur-rendered recipient-chip reflection of the To/Cc fields
-/// (the text inputs stay the canonical `name=` source of truth).
+/// subject character counter, debounced Drafts autosave, an in-flight ("Sending…"/"Saving…") button
+/// state, a client-side recipient check before send, and a blur-rendered recipient-chip reflection of
+/// the To/Cc fields (the text inputs stay the canonical `name=` source of truth).
 const COMPOSE_UX_JS: &str = r#"
 (function () {
   var toast = window.__corvidToast || function () {};
@@ -503,6 +504,7 @@ const COMPOSE_UX_JS: &str = r#"
     }
     select.selectedIndex = 0;
     toast('Template inserted', 'ok');
+    scheduleAutosave(800);
   }
   var templateSelect = form.querySelector('[data-template-select]');
   if (templateSelect) {
@@ -535,7 +537,7 @@ const COMPOSE_UX_JS: &str = r#"
         var lbl = document.createElement('span'); lbl.textContent = tok; chip.appendChild(lbl);
         var x = document.createElement('button'); x.type = 'button'; x.className = 'chip__x';
         x.setAttribute('aria-label', 'Remove ' + tok); x.textContent = '×';
-        x.addEventListener('click', function () { var l = tokens(); l.splice(idx, 1); input.value = l.length ? l.join(', ') + ', ' : ''; render(); input.focus(); });
+        x.addEventListener('click', function () { var l = tokens(); l.splice(idx, 1); input.value = l.length ? l.join(', ') + ', ' : ''; input.dispatchEvent(new Event('input', { bubbles: true })); render(); input.focus(); });
         chip.appendChild(x); wrap.appendChild(chip);
       });
       wrap.hidden = list.length === 0;
@@ -547,6 +549,66 @@ const COMPOSE_UX_JS: &str = r#"
   chipify(form.querySelector('#to'));
   chipify(form.querySelector('#cc'));
 
+  var autosaveStatus = form.querySelector('[data-autosave-status]');
+  var draftId = form.querySelector('input[name="draft_id"]');
+  var autosaveTimer = null, autosaveInFlight = false, autosaveQueued = false, autosaveStopped = false;
+  var autosaveController = null;
+  function setAutosaveStatus(text) {
+    if (autosaveStatus) autosaveStatus.textContent = text || '';
+  }
+  function named(name) { return form.querySelector('[name="' + name + '"]'); }
+  function val(name) { var el = named(name); return el ? el.value : ''; }
+  function hasDraftContent() {
+    syncRich();
+    return !!(val('to').trim() || val('cc').trim() || val('subject').trim() || val('body').trim() || val('body_html').trim());
+  }
+  function autosavePayload() {
+    syncRich();
+    var data = new URLSearchParams();
+    ['csrf', 'draft_id', 'attachment_refs', 'to', 'cc', 'subject', 'body', 'body_html', 'in_reply_to', 'references', 'identity'].forEach(function (name) {
+      data.set(name, val(name));
+    });
+    data.set('body_text', val('body'));
+    return data;
+  }
+  function scheduleAutosave(delay) {
+    if (autosaveStopped) return;
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(runAutosave, delay || 2500);
+  }
+  function runAutosave() {
+    if (autosaveStopped || !draftId || !hasDraftContent()) return;
+    if (autosaveInFlight) { autosaveQueued = true; return; }
+    autosaveInFlight = true;
+    autosaveController = window.AbortController ? new AbortController() : null;
+    setAutosaveStatus('Saving…');
+    fetch('/compose/autosave', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: autosavePayload(),
+      signal: autosaveController ? autosaveController.signal : undefined
+    }).then(function (r) {
+      if (!r.ok) throw new Error('autosave failed');
+      return r.json();
+    }).then(function (data) {
+      if (data && data.draft_id) draftId.value = data.draft_id;
+      setAutosaveStatus('Saved just now');
+    }).catch(function (err) {
+      if (err && err.name === 'AbortError') return;
+      setAutosaveStatus('Autosave failed');
+    }).finally(function () {
+      autosaveInFlight = false; autosaveController = null;
+      if (autosaveQueued && !autosaveStopped) { autosaveQueued = false; scheduleAutosave(800); }
+    });
+  }
+  ['to', 'cc', 'subject', 'body', 'body_html', 'identity'].forEach(function (name) {
+    var el = named(name);
+    if (el) el.addEventListener('input', function () { scheduleAutosave(2500); });
+    if (el && el.tagName === 'SELECT') el.addEventListener('change', function () { scheduleAutosave(800); });
+  });
+  if (rich) rich.addEventListener('input', function () { scheduleAutosave(2500); });
+
   form.addEventListener('submit', function (e) {
     syncRich();
     var btn = e.submitter, action = btn ? btn.value : 'send';
@@ -554,6 +616,9 @@ const COMPOSE_UX_JS: &str = r#"
       var to = form.querySelector('#to');
       if (to && !to.value.trim()) { e.preventDefault(); toast('Add at least one recipient', 'err'); to.focus(); return; }
     }
+    autosaveStopped = true;
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    if (autosaveController) autosaveController.abort();
     // Disable AFTER the submit is queued so the submitter's name/value still posts.
     if (btn) setTimeout(function () { btn.disabled = true; btn.classList.add('is-busy'); btn.textContent = action === 'draft' ? 'Saving…' : 'Sending…'; }, 0);
   });
@@ -597,6 +662,7 @@ pub fn app(state: AppState) -> Router {
         .route("/m/{id}/labels", post(message_labels_post))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
+        .route("/compose/autosave", post(compose_autosave))
         .route("/send", post(send))
         .route("/send/undo", post(send_undo))
         .route("/scheduled/{batch_id}/action", post(scheduled_action))
@@ -1181,11 +1247,7 @@ fn advanced_folder_options(selected: &str) -> String {
 }
 
 fn selected_attr(value: &str, selected: &str) -> &'static str {
-    if value == selected {
-        " selected"
-    } else {
-        ""
-    }
+    if value == selected { " selected" } else { "" }
 }
 
 fn build_advanced_search_query(q: &AdvancedSearchQuery) -> Option<String> {
@@ -1350,9 +1412,15 @@ fn render_row_inner(
         },
         if m.muted { " is-muted" } else { "" }
     );
+    let href = if m.folder == "Drafts" {
+        format!("/compose?draft={}", url_encode(&m.id))
+    } else {
+        format!("/m/{}", url_encode(&m.id))
+    };
     format!(
-        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="{href}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
+        href = esc(&href),
         starred = m.starred,
         seen = m.seen,
         snooze_until = m.snooze_until,
@@ -2979,11 +3047,7 @@ fn safe_return(path: &str) -> String {
     let ok = p.starts_with('/')
         && !p.starts_with("//")
         && !p.chars().any(|c| c.is_whitespace() || c.is_control());
-    if ok {
-        p.to_string()
-    } else {
-        "/".to_string()
-    }
+    if ok { p.to_string() } else { "/".to_string() }
 }
 
 /// Render the read-view attachment strip: one download link per MIME attachment part enumerated
@@ -3005,6 +3069,29 @@ fn render_attachment_list(msg: &Message) -> String {
     }
     format!(
         r#"<div class="attachments"><b class="attach-head">Attachments</b><ul class="attach-list">{items}</ul></div>"#
+    )
+}
+
+fn draft_attachment_refs(msg: &Message) -> (String, String) {
+    let attachments = crate::rfc822::list_attachments(&msg.raw_rfc822);
+    if attachments.is_empty() {
+        return (String::new(), String::new());
+    }
+    let mut refs = Vec::new();
+    let mut items = String::new();
+    for a in &attachments {
+        refs.push(format!("{}:{}", msg.id, a.index));
+        items.push_str(&format!(
+            r#"<li>{name} <span class="muted attach-size">{size}</span></li>"#,
+            name = esc(&a.filename),
+            size = human_size(a.size),
+        ));
+    }
+    (
+        refs.join(","),
+        format!(
+            r#"<div class="attachments compose-attachments"><b class="attach-head">Attached to this draft</b><ul class="attach-list">{items}</ul></div>"#
+        ),
     )
 }
 
@@ -3061,6 +3148,8 @@ async fn download_attachment(
 #[derive(Deserialize, Default)]
 struct ComposeQuery {
     #[serde(default)]
+    draft: Option<String>,
+    #[serde(default)]
     reply: Option<String>,
     #[serde(default)]
     replyall: Option<String>,
@@ -3080,6 +3169,9 @@ struct Prefill {
     body_html: String,
     in_reply_to: String,
     references: String,
+    draft_id: String,
+    attachment_refs: String,
+    attachment_list: String,
     scheduled_batch_id: String,
     schedule_at: i64,
 }
@@ -3099,10 +3191,12 @@ async fn compose_form(
     let mut pre = build_prefill(&state, &mb, &q).await;
     // Per-mailbox signature: appended to every draft (blank compose, reply, forward) as the
     // conventional `--` delimited block. Best effort — a settings read failure just skips it.
-    if let Ok(settings) = state.store.get_settings(&mb.addr).await {
-        let sig = settings.signature.trim();
-        if !sig.is_empty() {
-            pre.body.push_str(&format!("\n\n--\n{sig}"));
+    if pre.draft_id.is_empty() {
+        if let Ok(settings) = state.store.get_settings(&mb.addr).await {
+            let sig = settings.signature.trim();
+            if !sig.is_empty() {
+                pre.body.push_str(&format!("\n\n--\n{sig}"));
+            }
         }
     }
 
@@ -3145,6 +3239,8 @@ async fn compose_form(
     <input type="hidden" name="csrf" value="{token}">
     <input type="hidden" name="in_reply_to" value="{in_reply_to}">
     <input type="hidden" name="references" value="{references}">
+    <input type="hidden" name="draft_id" value="{draft_id}">
+    <input type="hidden" name="attachment_refs" value="{attachment_refs}">
     <input type="hidden" name="scheduled_batch_id" value="{scheduled_batch_id}">
     <div class="field"><label for="from">From</label><select id="from" name="identity">{from_options}</select></div>
     <div class="field"><label for="to">To</label>
@@ -3173,8 +3269,9 @@ async fn compose_form(
       <div id="body-rich" class="compose-rich" role="textbox" aria-multiline="true" contenteditable="true" data-source="body" hidden></div>
       <textarea id="body" name="body">{body}</textarea>
     </div>
-    <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple></div>
+    <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple>{attachment_list}</div>
     <div class="form-actions">
+      <span class="autosave-status" data-autosave-status aria-live="polite"></span>
       <div class="send-split">
         <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
         {schedule_controls}
@@ -3193,6 +3290,9 @@ async fn compose_form(
         body_html = esc(&pre.body_html),
         in_reply_to = esc(&pre.in_reply_to),
         references = esc(&pre.references),
+        draft_id = esc(&pre.draft_id),
+        attachment_refs = esc(&pre.attachment_refs),
+        attachment_list = pre.attachment_list,
         scheduled_batch_id = esc(&pre.scheduled_batch_id),
         schedule_controls = schedule_controls_for(now_secs(), pre.schedule_at),
         template_controls = render_compose_template_controls(&templates),
@@ -3232,6 +3332,29 @@ fn render_compose_template_controls(templates: &[Template]) -> String {
 /// Build the reply/forward prefill from the original message referenced by `q`. Returns an empty
 /// [`Prefill`] for a blank compose or when the referenced message is not the user's own.
 async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Prefill {
+    if let Some(id) = q.draft.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(Some(msg)) = state.store.get_message(id).await {
+            if msg.mailbox == mb.addr && msg.folder == "Drafts" {
+                let (headers, _) = crate::rfc822::split_headers_body(&msg.raw_rfc822);
+                let hdrs = crate::rfc822::parse_headers(headers);
+                let (attachment_refs, attachment_list) = draft_attachment_refs(&msg);
+                return Prefill {
+                    to: msg.msg_to,
+                    cc: crate::rfc822::header(&hdrs, "cc").unwrap_or_default(),
+                    subject: msg.subject,
+                    body: msg.body_text,
+                    body_html: msg.body_html,
+                    in_reply_to: crate::rfc822::header(&hdrs, "in-reply-to").unwrap_or_default(),
+                    references: crate::rfc822::header(&hdrs, "references").unwrap_or_default(),
+                    draft_id: id.to_string(),
+                    attachment_refs,
+                    attachment_list,
+                    ..Prefill::default()
+                };
+            }
+        }
+    }
+
     if let Some(batch_id) = q
         .scheduled
         .as_deref()
@@ -3254,6 +3377,9 @@ async fn build_prefill(state: &AppState, mb: &Mailbox, q: &ComposeQuery) -> Pref
                 body_html: parsed.body_html,
                 in_reply_to: crate::rfc822::header(&hdrs, "in-reply-to").unwrap_or_default(),
                 references: crate::rfc822::header(&hdrs, "references").unwrap_or_default(),
+                draft_id: String::new(),
+                attachment_refs: String::new(),
+                attachment_list: String::new(),
                 scheduled_batch_id: item.batch_id,
                 schedule_at: item.send_at,
             };
@@ -3410,6 +3536,12 @@ struct SendForm {
     in_reply_to: String,
     #[serde(default)]
     references: String,
+    /// Existing Drafts message being edited/autosaved.
+    #[serde(default)]
+    draft_id: String,
+    /// Attachment references carried forward from an existing Drafts row.
+    #[serde(default)]
+    attachment_refs: String,
     /// Chosen send-identity id (empty = the mailbox's own address, the default identity).
     #[serde(default)]
     identity: String,
@@ -3427,6 +3559,93 @@ struct SendForm {
     action: String,
 }
 
+#[derive(Deserialize, Default)]
+struct AutosaveForm {
+    csrf: String,
+    #[serde(default)]
+    draft_id: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    cc: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    body_text: String,
+    #[serde(default)]
+    body_html: String,
+    #[serde(default)]
+    in_reply_to: String,
+    #[serde(default)]
+    references: String,
+    #[serde(default)]
+    identity: String,
+    #[serde(default)]
+    attachment_refs: String,
+}
+
+async fn compose_autosave(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutosaveForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return json_status(StatusCode::FORBIDDEN, "CSRF token missing or mismatched");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return json_status(StatusCode::FORBIDDEN, "no mailbox for this identity");
+    };
+    let from_header = match resolve_from_header_json(&state, &mb.addr, &form.identity).await {
+        Ok(from) => from,
+        Err(resp) => return resp,
+    };
+    let body_source = if form.body_text.is_empty() {
+        form.body.as_str()
+    } else {
+        form.body_text.as_str()
+    };
+    let (body_text, body_html) = compose_body_parts(body_source, &form.body_html);
+    let attachments = draft_attachments_from_refs(&state, &mb.addr, &form.attachment_refs).await;
+    let raw = build_rfc822(
+        &from_header,
+        &form.to,
+        &form.cc,
+        &form.subject,
+        &body_text,
+        &body_html,
+        &form.in_reply_to,
+        &form.references,
+        &state.config.mail_domain,
+        &attachments,
+    );
+    match upsert_draft_copy(
+        &state,
+        &mb.addr,
+        &form.draft_id,
+        &from_header,
+        &form.to,
+        &form.subject,
+        &body_text,
+        &body_html,
+        &raw,
+    )
+    .await
+    {
+        Ok(draft_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "draft_id": draft_id,
+                "saved_at": now_secs(),
+            })),
+        )
+            .into_response(),
+        Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 async fn send(State(state): State<AppState>, req: Request) -> Response {
     // Cookies/CSRF live in the headers; capture them before the body extractor consumes `req`.
     let headers = req.headers().clone();
@@ -3435,7 +3654,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
     // Compose now posts multipart/form-data (so it can carry file parts); the internal callers and
     // the pre-attachment tests still post urlencoded. Accept BOTH: parse attachments only from the
     // multipart body, an empty attachment set otherwise.
-    let (form, attachments) = match parse_send(req, &state, &headers).await {
+    let (form, mut attachments) = match parse_send(req, &state, &headers).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -3459,6 +3678,12 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             Err(resp) => return *resp,
         };
     let (body_text, body_html) = compose_body_parts(&form.body, &form.body_html);
+    let mut referenced_attachments =
+        draft_attachments_from_refs(&state, &mb.addr, &form.attachment_refs).await;
+    if !referenced_attachments.is_empty() {
+        referenced_attachments.append(&mut attachments);
+        attachments = referenced_attachments;
+    }
 
     let raw = build_rfc822(
         &from_header,
@@ -3475,18 +3700,28 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
 
     // "Save draft": persist without sending, and allow an incomplete recipient list.
     if form.action == "draft" {
-        store_local_copy(
+        match upsert_draft_copy(
             &state,
             &mb.addr,
+            &form.draft_id,
             &from_header,
             &form.to,
             &form.subject,
             &body_text,
             &body_html,
             &raw,
-            "Drafts",
         )
-        .await;
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage error",
+                    &e.to_string(),
+                );
+            }
+        }
         cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
         return Redirect::to("/?folder=Drafts").into_response();
     }
@@ -3527,6 +3762,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         {
             Ok(_) => {
                 cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
+                delete_submitted_draft(&state, &mb.addr, &form.draft_id).await;
                 Redirect::to("/?folder=Scheduled").into_response()
             }
             Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
@@ -3558,6 +3794,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         {
             Ok(enqueued) => {
                 cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
+                delete_submitted_draft(&state, &mb.addr, &form.draft_id).await;
                 Redirect::to(&format!(
                     "/?folder=Sent&undo={}&undo_until={}",
                     url_encode(&enqueued.batch_id),
@@ -3587,6 +3824,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             )
             .await;
             cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
+            delete_submitted_draft(&state, &mb.addr, &form.draft_id).await;
             Redirect::to("/?folder=Sent").into_response()
         }
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
@@ -3629,6 +3867,35 @@ async fn resolve_from_identity(
     }
 }
 
+async fn resolve_from_header_json(
+    state: &AppState,
+    mailbox: &str,
+    identity_id: &str,
+) -> Result<String, Response> {
+    let id = identity_id.trim();
+    if id.is_empty() {
+        return Ok(mailbox.to_string());
+    }
+    match state.store.get_send_identity(mailbox, id).await {
+        Ok(Some(idn)) => {
+            let display = idn.display_name.trim();
+            if display.is_empty() {
+                Ok(idn.from_addr)
+            } else {
+                Ok(format!("{} <{}>", header_safe(display), idn.from_addr))
+            }
+        }
+        Ok(None) => Err(json_status(
+            StatusCode::BAD_REQUEST,
+            "send identity is not available for this mailbox",
+        )),
+        Err(e) => Err(json_status(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
 /// Strip CR/LF from a value interpolated into a mail header (header injection defence).
 fn header_safe(s: &str) -> String {
     s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
@@ -3667,12 +3934,138 @@ async fn store_local_copy(
     raw: &str,
     folder: &str,
 ) {
+    let msg = local_copy_message(
+        state,
+        mailbox,
+        new_id("m"),
+        from,
+        to,
+        subject,
+        body,
+        body_html,
+        raw,
+        folder,
+    )
+    .await;
+    if let Err(e) = state.store.store_message(&msg).await {
+        tracing::warn!(error = %e, folder, "failed to file local message copy");
+    }
+    crate::delivery::harvest_contacts(state.store.as_ref(), mailbox, "", to).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_draft_copy(
+    state: &AppState,
+    mailbox: &str,
+    draft_id: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    body_html: &str,
+    raw: &str,
+) -> Result<String, crate::store::StoreError> {
+    let id = draft_id_for_upsert(state, mailbox, draft_id).await?;
+    let msg = local_copy_message(
+        state,
+        mailbox,
+        id.clone(),
+        from,
+        to,
+        subject,
+        body,
+        body_html,
+        raw,
+        "Drafts",
+    )
+    .await;
+    state.store.upsert_draft(&msg).await?;
+    crate::delivery::harvest_contacts(state.store.as_ref(), mailbox, "", to).await;
+    Ok(id)
+}
+
+async fn delete_submitted_draft(state: &AppState, mailbox: &str, draft_id: &str) {
+    let id = draft_id.trim();
+    if id.is_empty() {
+        return;
+    }
+    if let Err(e) = state.store.delete_draft(mailbox, id).await {
+        tracing::warn!(error = %e, draft = %id, "failed to delete submitted draft");
+    }
+}
+
+async fn draft_attachments_from_refs(
+    state: &AppState,
+    mailbox: &str,
+    refs: &str,
+) -> Vec<Attachment> {
+    let mut attachments = Vec::new();
+    for token in refs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((draft_id, idx)) = token.split_once(':') else {
+            continue;
+        };
+        if !looks_like_message_id(draft_id) {
+            continue;
+        }
+        let Ok(index) = idx.parse::<usize>() else {
+            continue;
+        };
+        let Ok(Some(msg)) = state.store.get_message(draft_id).await else {
+            continue;
+        };
+        if msg.mailbox != mailbox || msg.folder != "Drafts" {
+            continue;
+        }
+        if let Some(att) = crate::rfc822::extract_attachment(&msg.raw_rfc822, index) {
+            attachments.push(att);
+        }
+    }
+    attachments
+}
+
+async fn draft_id_for_upsert(
+    state: &AppState,
+    mailbox: &str,
+    requested: &str,
+) -> Result<String, crate::store::StoreError> {
+    let id = requested.trim();
+    if id.is_empty() || !looks_like_message_id(id) {
+        return Ok(new_id("m"));
+    }
+    match state.store.get_message(id).await? {
+        Some(existing) if existing.mailbox == mailbox && existing.folder == "Drafts" => {
+            Ok(id.to_string())
+        }
+        Some(_) => Ok(new_id("m")),
+        None => Ok(id.to_string()),
+    }
+}
+
+fn looks_like_message_id(id: &str) -> bool {
+    id.len() <= 80
+        && id.starts_with("m_")
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn local_copy_message(
+    state: &AppState,
+    mailbox: &str,
+    id: String,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    body_html: &str,
+    raw: &str,
+    folder: &str,
+) -> Message {
     let (message_id, thread_id) =
         crate::delivery::resolve_thread(state.store.as_ref(), mailbox, raw, subject)
             .await
             .unwrap_or_default();
-    let msg = Message {
-        id: new_id("m"),
+    Message {
+        id,
         mailbox: mailbox.to_string(),
         msg_from: from.to_string(),
         msg_to: to.to_string(),
@@ -3688,11 +4081,7 @@ async fn store_local_copy(
         muted: false,
         thread_id,
         message_id,
-    };
-    if let Err(e) = state.store.store_message(&msg).await {
-        tracing::warn!(error = %e, folder, "failed to file local message copy");
     }
-    crate::delivery::harvest_contacts(state.store.as_ref(), mailbox, "", to).await;
 }
 
 /// Parse a `POST /send` body into its [`SendForm`] fields plus any attachment file parts. A
@@ -3759,6 +4148,8 @@ async fn parse_send(
                     "body_html" => form.body_html = text,
                     "in_reply_to" => form.in_reply_to = text,
                     "references" => form.references = text,
+                    "draft_id" => form.draft_id = text,
+                    "attachment_refs" => form.attachment_refs = text,
                     "identity" => form.identity = text,
                     "scheduled_batch_id" => form.scheduled_batch_id = text,
                     "schedule_at" => form.schedule_at = text,
@@ -6200,12 +6591,16 @@ mod tests {
 
         let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
         assert_eq!(due.len(), 1);
-        assert!(due[0]
-            .raw
-            .contains("Content-Type: multipart/alternative; boundary="));
-        assert!(due[0]
-            .raw
-            .contains("Content-Type: text/html; charset=utf-8"));
+        assert!(
+            due[0]
+                .raw
+                .contains("Content-Type: multipart/alternative; boundary=")
+        );
+        assert!(
+            due[0]
+                .raw
+                .contains("Content-Type: text/html; charset=utf-8")
+        );
         assert!(due[0].raw.contains("<strong>rich</strong>"));
         assert!(!due[0].raw.contains("<script"));
         assert!(!due[0].raw.contains("alert(1)"));

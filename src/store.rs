@@ -36,10 +36,10 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::model::{
-    Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
-    OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
-    SearchState, SendIdentity, SenderListEntry, SpamAnnotation, Template, ThreadSummary,
-    DEFAULT_UNDO_SEND_WINDOW_SECS,
+    Alias, Contact, DEFAULT_UNDO_SEND_WINDOW_SECS, FilterRule, Label, Mailbox, MailboxSettings,
+    Message, MessageSummary, OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind,
+    SearchQuery, SearchState, SendIdentity, SenderListEntry, SpamAnnotation, Template,
+    ThreadSummary,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -74,6 +74,10 @@ pub trait Store: Send + Sync {
 
     /// Persist a received/delivered message.
     async fn store_message(&self, msg: &Message) -> Result<(), StoreError>;
+    /// Insert or replace an editable Drafts message by id, scoped to its owning mailbox.
+    async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError>;
+    /// Delete a Drafts message by id, scoped to its owning mailbox. Returns whether a row changed.
+    async fn delete_draft(&self, mailbox: &str, id: &str) -> Result<bool, StoreError>;
     /// Inbox listing for a mailbox, newest first, capped.
     async fn list_messages(
         &self,
@@ -686,6 +690,33 @@ impl Store for InMemoryStore {
             .expect("messages lock poisoned")
             .push(msg.clone());
         Ok(())
+    }
+
+    async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
+        if msg.folder != "Drafts" {
+            return Err(StoreError::Backend(
+                "upsert_draft requires folder=Drafts".to_string(),
+            ));
+        }
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(existing) = v.iter_mut().find(|m| m.id == msg.id) {
+            if existing.mailbox != msg.mailbox || existing.folder != "Drafts" {
+                return Err(StoreError::Backend(
+                    "draft id is not an editable draft".to_string(),
+                ));
+            }
+            *existing = msg.clone();
+        } else {
+            v.push(msg.clone());
+        }
+        Ok(())
+    }
+
+    async fn delete_draft(&self, mailbox: &str, id: &str) -> Result<bool, StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        let before = v.len();
+        v.retain(|m| !(m.mailbox == mailbox && m.id == id && m.folder == "Drafts"));
+        Ok(v.len() != before)
     }
 
     async fn list_messages(
@@ -1817,8 +1848,8 @@ impl Store for InMemoryStore {
 // PostgreSQL-backed store (portable: standard SQL, runtime queries, no macros).
 // --------------------------------------------------------------------------------------
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 /// PostgreSQL-backed [`Store`]. Holds just a `PgPool`; the async trait methods drive sqlx
 /// natively, so no worker thread is ever blocked on a DB round-trip.
@@ -2439,6 +2470,72 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
+        if msg.folder != "Drafts" {
+            return Err(StoreError::Backend(
+                "upsert_draft requires folder=Drafts".to_string(),
+            ));
+        }
+        let result = sqlx::query(
+            "INSERT INTO messages \
+                 (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
+                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'Drafts', $11, $12, $13, $14, $15) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 msg_from = EXCLUDED.msg_from, \
+                 msg_to = EXCLUDED.msg_to, \
+                 subject = EXCLUDED.subject, \
+                 raw_rfc822 = EXCLUDED.raw_rfc822, \
+                 body_text = EXCLUDED.body_text, \
+                 body_html = EXCLUDED.body_html, \
+                 received_at = EXCLUDED.received_at, \
+                 seen = EXCLUDED.seen, \
+                 folder = EXCLUDED.folder, \
+                 starred = EXCLUDED.starred, \
+                 snooze_until = EXCLUDED.snooze_until, \
+                 muted = EXCLUDED.muted, \
+                 thread_id = EXCLUDED.thread_id, \
+                 message_id = EXCLUDED.message_id \
+             WHERE messages.mailbox = EXCLUDED.mailbox AND messages.folder = 'Drafts'",
+        )
+        .bind(&msg.id)
+        .bind(&msg.mailbox)
+        .bind(&msg.msg_from)
+        .bind(&msg.msg_to)
+        .bind(&msg.subject)
+        .bind(&msg.raw_rfc822)
+        .bind(&msg.body_text)
+        .bind(&msg.body_html)
+        .bind(msg.received_at)
+        .bind(msg.seen)
+        .bind(msg.starred)
+        .bind(msg.snooze_until)
+        .bind(msg.muted)
+        .bind(&msg.thread_id)
+        .bind(&msg.message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::Backend(
+                "draft id is not an editable draft".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn delete_draft(&self, mailbox: &str, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM messages WHERE mailbox = $1 AND id = $2 AND folder = 'Drafts'",
+        )
+        .bind(mailbox)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_messages(
         &self,
         mailbox: &str,
@@ -2552,8 +2649,9 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
-        let mut sql =
-            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder FROM messages m WHERE m.mailbox = $1");
+        let mut sql = String::from(
+            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder FROM messages m WHERE m.mailbox = $1",
+        );
         let mut binds = Vec::new();
         let mut next_param = 2_usize;
 
@@ -3893,11 +3991,13 @@ mod tests {
         store.store_message(&m).await.unwrap();
 
         store.snooze_message(&m.id, now + 60).await.unwrap();
-        assert!(store
-            .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let snoozed = store
             .list_snoozed("w33d@w33d.xyz", now, None, 10)
             .await
@@ -3933,18 +4033,22 @@ mod tests {
         store.store_message(&reply).await.unwrap();
 
         store.set_thread_muted(&root, true).await.unwrap();
-        assert!(store
-            .is_thread_muted("w33d@w33d.xyz", "thr:1")
-            .await
-            .unwrap());
+        assert!(
+            store
+                .is_thread_muted("w33d@w33d.xyz", "thr:1")
+                .await
+                .unwrap()
+        );
         assert!(store.get_message("m_root").await.unwrap().unwrap().muted);
         assert!(store.get_message("m_reply").await.unwrap().unwrap().muted);
 
         store.set_thread_muted(&root, false).await.unwrap();
-        assert!(!store
-            .is_thread_muted("w33d@w33d.xyz", "thr:1")
-            .await
-            .unwrap());
+        assert!(
+            !store
+                .is_thread_muted("w33d@w33d.xyz", "thr:1")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3989,11 +4093,13 @@ mod tests {
             .delete_spam_annotation("w33d@w33d.xyz", "m_1")
             .await
             .unwrap();
-        assert!(store
-            .spam_annotation("w33d@w33d.xyz", "m_1")
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .spam_annotation("w33d@w33d.xyz", "m_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4052,11 +4158,13 @@ mod tests {
             .delete_template("w33d@w33d.xyz", "tpl_welcome")
             .await
             .unwrap();
-        assert!(store
-            .list_templates("w33d@w33d.xyz")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            store
+                .list_templates("w33d@w33d.xyz")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store.list_templates("alice@w33d.xyz").await.unwrap().len(),
             1
