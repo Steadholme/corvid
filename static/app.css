@@ -1098,3 +1098,33 @@ mark.search-hit {
   .adv-search__form,
   .filter-rule-form { grid-template-columns:1fr; }
 }
+
+/* ── Draft autosave status ──────────────────────────────────────────────
+   The compose footer's live "Saving…" / "Saved just now" readout — the
+   [data-autosave-status] span the compose JS writes into. It sits first
+   in the .form-actions DOM but we float it to the trailing edge of the
+   row (order + auto-margin) so it shares the line with Send yet never
+   competes with the primary action. Text is weakened to --ink-3 at a
+   small size; a tiny --ok status dot leads it as a calm, restrained
+   "autosave is healthy" cue that reads the same for both states. When the
+   JS clears the text the span collapses to nothing so the button row
+   never shifts. Colour rides the tokens; motion honours the global
+   prefers-reduced-motion rule above. */
+.autosave-status {
+  order:1; margin-left:auto;          /* trail the actions, sit at the row's right edge */
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:12px; line-height:1; white-space:nowrap;
+  color:var(--ink-3);
+  transition:opacity var(--dur) var(--ease);
+}
+/* A small live-status dot in the positive hue — faint enough at 6px to
+   stay a hint, not a headline. */
+.autosave-status::before {
+  content:""; flex:0 0 auto;
+  width:6px; height:6px; border-radius:var(--r-pill);
+  background:var(--ok);
+}
+/* Idle — no text, no placeholder, no layout jump: the span collapses and
+   drops its auto-margin so the button row is left untouched. */
+.autosave-status:empty { margin-left:0; opacity:0; }
+.autosave-status:empty::before { display:none; }
