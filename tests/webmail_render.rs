@@ -1332,6 +1332,60 @@ async fn search_view_renders_folder_scope() {
 }
 
 #[tokio::test]
+async fn advanced_search_page_redirects_to_search_or_filter_prefill() {
+    let state = build_dev_state().await;
+
+    let req = Request::builder()
+        .uri("/search/advanced")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    for needle in [
+        r#"class="card pad adv-search""#,
+        r#"class="field adv-search__field""#,
+        r#"name="from""#,
+        r#"name="has_attachment""#,
+        r#"btn-create-filter"#,
+    ] {
+        assert!(
+            html.contains(needle),
+            "advanced search page missing {needle}"
+        );
+    }
+
+    let req = Request::builder()
+        .uri("/search/advanced?from=alice%40example.com&subject=Report&has_attachment=on&mode=search")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/?q=from%3Aalice%40example.com%20subject%3AReport%20has%3Aattachment")
+    );
+
+    let req = Request::builder()
+        .uri("/search/advanced?from=alice%40example.com&mode=filter")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/settings?filter_q=from%3Aalice%40example.com#filter-rules")
+    );
+}
+
+#[tokio::test]
 async fn message_actions_star_archive_move_delete_unread() {
     let state = build_dev_state().await;
     let msg = seed_message("w33d@w33d.xyz", "Actionable", "a@b.com", "hi");
@@ -1522,6 +1576,18 @@ async fn inbox_search_and_starred_views_render() {
     assert!(
         html.contains(r#"<mark class="search-hit">Invoice</mark>"#),
         "matching free text is highlighted"
+    );
+    assert!(
+        html.contains(r#"class="search-actions""#),
+        "search actions rendered"
+    );
+    assert!(
+        html.contains(r#"class="btn btn-ghost btn-sm btn-create-filter""#),
+        "search results expose create-filter action"
+    );
+    assert!(
+        html.contains(r#"href="/settings?filter_q=invoice#filter-rules""#),
+        "current search is carried to settings"
     );
 
     // A search with no hit shows the empty state.

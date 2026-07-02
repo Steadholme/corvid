@@ -11,6 +11,7 @@
 //! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts|Spam`, newest first: from / subject / date)
 //!                   or `?q=` full-text search (subject/from/to/body, optional `?folder=` scope);
 //!                   both keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
+//! - `GET /search/advanced` Gmail-style advanced search form; submits to the existing `?q=` search
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue behind the undo-send window;
@@ -29,11 +30,12 @@ use crate::rfc822::Attachment;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::Deserialize;
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime};
 
 use crate::model::{
     parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
-    SearchQuery, SenderListEntry, SpamAnnotation, Template, DEFAULT_UNDO_SEND_WINDOW_SECS,
+    SearchPredicateKind, SearchQuery, SenderListEntry, SpamAnnotation, Template,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -584,6 +586,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(inbox))
+        .route("/search/advanced", get(advanced_search))
         .route("/t", get(conversation))
         .route("/m/{id}", get(read_message))
         .route("/m/{id}/action", post(message_action))
@@ -715,6 +718,78 @@ struct InboxQuery {
     undo_until: Option<String>,
 }
 
+/// Query string for `GET /search/advanced`. The same page both renders the independent advanced
+/// form and, when submitted, redirects to either the existing search results or the rule prefill.
+#[derive(Deserialize, Default)]
+struct AdvancedSearchQuery {
+    #[serde(default)]
+    from: String,
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    has_words: String,
+    #[serde(default)]
+    doesnt_have: String,
+    #[serde(default)]
+    size_cmp: String,
+    #[serde(default)]
+    size: String,
+    #[serde(default)]
+    size_unit: String,
+    #[serde(default)]
+    after: String,
+    #[serde(default)]
+    before: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(default)]
+    has_attachment: Option<String>,
+    #[serde(default)]
+    mode: String,
+}
+
+impl AdvancedSearchQuery {
+    fn has_input(&self) -> bool {
+        !self.from.trim().is_empty()
+            || !self.to.trim().is_empty()
+            || !self.subject.trim().is_empty()
+            || !self.has_words.trim().is_empty()
+            || !self.doesnt_have.trim().is_empty()
+            || !self.size.trim().is_empty()
+            || !self.after.trim().is_empty()
+            || !self.before.trim().is_empty()
+            || !self.folder.trim().is_empty()
+            || self.has_attachment.is_some()
+    }
+}
+
+async fn advanced_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AdvancedSearchQuery>,
+) -> Response {
+    let email = email_display(&headers);
+    let Some(_mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email);
+    };
+
+    if q.has_input() {
+        if let Some(search) = build_advanced_search_query(&q) {
+            let href = if q.mode == "filter" {
+                format!("/settings?filter_q={}#filter-rules", url_encode(&search))
+            } else {
+                format!("/?q={}", url_encode(&search))
+            };
+            return Redirect::to(&href).into_response();
+        }
+    }
+
+    let content = render_advanced_search_form(&q);
+    Html(render_page("Advanced search", &email, &content, "inbox")).into_response()
+}
+
 async fn inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -751,7 +826,7 @@ async fn inbox(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Storage error",
                     &e.to_string(),
-                )
+                );
             }
         };
         let base = format!("/?label={}&limit={limit}", url_encode(label_id));
@@ -808,7 +883,7 @@ async fn inbox(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Storage error",
                         &e.to_string(),
-                    )
+                    );
                 }
             };
             let mut rows = String::new();
@@ -869,7 +944,7 @@ async fn inbox(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Storage error",
                     &e.to_string(),
-                )
+                );
             }
         };
         let mut rows = String::new();
@@ -928,7 +1003,7 @@ async fn inbox(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Storage error",
                     &e.to_string(),
-                )
+                );
             }
         };
         let mut base = format!("/?q={}&limit={limit}", url_encode(query));
@@ -968,7 +1043,7 @@ async fn inbox(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Storage error",
                     &e.to_string(),
-                )
+                );
             }
         };
         let heading = if folder == "INBOX" {
@@ -1006,9 +1081,11 @@ async fn inbox(
         }
     }
 
+    let search_actions = search.map(render_search_actions).unwrap_or_default();
     let content = format!(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
+{search_actions}
 <section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
@@ -1029,6 +1106,172 @@ async fn inbox(
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
     }
+}
+
+fn render_search_actions(query: &str) -> String {
+    let q = url_encode(query);
+    format!(
+        r#"<div class="search-actions"><a class="btn btn-ghost btn-sm adv-search-link" href="/search/advanced">Advanced search</a><a class="btn btn-ghost btn-sm btn-create-filter" href="/settings?filter_q={q}#filter-rules">Create filter</a></div>"#
+    )
+}
+
+fn render_advanced_search_form(q: &AdvancedSearchQuery) -> String {
+    let size_cmp = match q.size_cmp.trim() {
+        "smaller" => "smaller",
+        _ => "larger",
+    };
+    let size_unit = match q.size_unit.trim().to_ascii_lowercase().as_str() {
+        "b" => "b",
+        "k" | "kb" => "k",
+        _ => "m",
+    };
+    let folder = real_folder(&q.folder).unwrap_or("");
+    let has_attachment_checked = if q.has_attachment.is_some() {
+        " checked"
+    } else {
+        ""
+    };
+    let folder_options = advanced_folder_options(folder);
+
+    format!(
+        r#"<div class="page-head"><h1>Advanced search</h1></div>
+<section class="card pad adv-search">
+  <form class="adv-search__form" method="get" action="/search/advanced">
+    <div class="field adv-search__field"><label for="adv_from">From</label><input id="adv_from" name="from" value="{from}"></div>
+    <div class="field adv-search__field"><label for="adv_to">To</label><input id="adv_to" name="to" value="{to}"></div>
+    <div class="field adv-search__field"><label for="adv_subject">Subject</label><input id="adv_subject" name="subject" value="{subject}"></div>
+    <div class="field adv-search__field"><label for="adv_has_words">Has the words</label><input id="adv_has_words" name="has_words" value="{has_words}"></div>
+    <div class="field adv-search__field"><label for="adv_doesnt_have">Doesn't have</label><input id="adv_doesnt_have" name="doesnt_have" value="{doesnt_have}"></div>
+    <div class="field adv-search__field adv-search__field--size"><label for="adv_size">Size</label><select name="size_cmp" aria-label="Size comparison"><option value="larger"{larger_sel}>Larger than</option><option value="smaller"{smaller_sel}>Smaller than</option></select><input id="adv_size" name="size" inputmode="numeric" value="{size}"><select name="size_unit" aria-label="Size unit"><option value="b"{b_sel}>B</option><option value="k"{k_sel}>KB</option><option value="m"{m_sel}>MB</option></select></div>
+    <div class="field adv-search__field"><label for="adv_after">After</label><input id="adv_after" name="after" type="date" value="{after}"></div>
+    <div class="field adv-search__field"><label for="adv_before">Before</label><input id="adv_before" name="before" type="date" value="{before}"></div>
+    <div class="field adv-search__field"><label for="adv_folder">In folder</label><select id="adv_folder" name="folder">{folder_options}</select></div>
+    <div class="field adv-search__field"><label><input type="checkbox" name="has_attachment" value="on"{has_attachment_checked}> Has attachment</label></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit" name="mode" value="search">Search</button><button class="btn btn-ghost btn-create-filter" type="submit" name="mode" value="filter">Create filter</button></div>
+  </form>
+</section>"#,
+        from = esc(&q.from),
+        to = esc(&q.to),
+        subject = esc(&q.subject),
+        has_words = esc(&q.has_words),
+        doesnt_have = esc(&q.doesnt_have),
+        size = esc(&q.size),
+        after = esc(&q.after),
+        before = esc(&q.before),
+        larger_sel = selected_attr(size_cmp, "larger"),
+        smaller_sel = selected_attr(size_cmp, "smaller"),
+        b_sel = selected_attr(size_unit, "b"),
+        k_sel = selected_attr(size_unit, "k"),
+        m_sel = selected_attr(size_unit, "m"),
+    )
+}
+
+fn advanced_folder_options(selected: &str) -> String {
+    let mut out = format!(
+        r#"<option value=""{}>Anywhere</option>"#,
+        selected_attr(selected, "")
+    );
+    for f in FOLDERS {
+        out.push_str(&format!(
+            r#"<option value="{f}"{}>{f}</option>"#,
+            selected_attr(selected, f)
+        ));
+    }
+    out
+}
+
+fn selected_attr(value: &str, selected: &str) -> &'static str {
+    if value == selected {
+        " selected"
+    } else {
+        ""
+    }
+}
+
+fn build_advanced_search_query(q: &AdvancedSearchQuery) -> Option<String> {
+    let mut parts = Vec::new();
+    push_search_predicate(&mut parts, "from", &q.from);
+    push_search_predicate(&mut parts, "to", &q.to);
+    push_search_predicate(&mut parts, "subject", &q.subject);
+    push_search_text(&mut parts, &q.has_words, false);
+    push_search_text(&mut parts, &q.doesnt_have, true);
+    if let Some(size) = advanced_size_clause(&q.size_cmp, &q.size, &q.size_unit) {
+        parts.push(size);
+    }
+    if let Some(after) = valid_search_date(&q.after) {
+        parts.push(format!("after:{after}"));
+    }
+    if let Some(before) = valid_search_date(&q.before) {
+        parts.push(format!("before:{before}"));
+    }
+    if let Some(folder) = real_folder(&q.folder) {
+        parts.push(format!("in:{folder}"));
+    }
+    if q.has_attachment.is_some() {
+        parts.push("has:attachment".to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn push_search_predicate(parts: &mut Vec<String>, op: &str, value: &str) {
+    if let Some(value) = search_value(value) {
+        parts.push(format!("{op}:{value}"));
+    }
+}
+
+fn push_search_text(parts: &mut Vec<String>, value: &str, negated: bool) {
+    if let Some(value) = search_value(value) {
+        if negated {
+            parts.push(format!("-{value}"));
+        } else {
+            parts.push(value);
+        }
+    }
+}
+
+fn search_value(value: &str) -> Option<String> {
+    let value = value.replace('"', " ");
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().any(char::is_whitespace) {
+        Some(format!(r#""{value}""#))
+    } else {
+        Some(value)
+    }
+}
+
+fn advanced_size_clause(cmp: &str, size: &str, unit: &str) -> Option<String> {
+    let cmp = match cmp.trim() {
+        "larger" | "smaller" => cmp.trim(),
+        _ => return None,
+    };
+    let size = size.trim();
+    if size.is_empty() || !size.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let suffix = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" | "byte" | "bytes" => "",
+        "k" | "kb" => "K",
+        "m" | "mb" => "M",
+        _ => return None,
+    };
+    Some(format!("{cmp}:{size}{suffix}"))
+}
+
+fn valid_search_date(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let month = Month::try_from(month).ok()?;
+    Date::from_calendar_date(year, month, day).ok()?;
+    Some(value.to_string())
 }
 
 fn render_undo_bar(batch_id: Option<&str>, undo_until: Option<&str>, token: &str) -> String {
@@ -1596,6 +1839,9 @@ fn folder_tabs(t: &FolderTabs) -> String {
         r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button><div class="search-hint">from: to: cc: subject: label: is:unread is:read is:starred has:attachment in: before: after: larger: smaller: "exact phrase" -exclude OR</div></form>"#,
         q = esc(t.search_q),
     ));
+    out.push_str(
+        r#"<a class="btn btn-ghost btn-sm adv-search-link" href="/search/advanced">Advanced</a>"#,
+    );
     out.push_str("</nav>");
     out
 }
@@ -1659,7 +1905,7 @@ async fn read_message(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     // Authorisation: a message is only viewable from its own mailbox.
@@ -1861,7 +2107,7 @@ async fn conversation(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     if msgs.is_empty() {
@@ -1970,7 +2216,7 @@ async fn message_labels_post(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     }
     let label_id = form.label.trim();
@@ -1982,7 +2228,7 @@ async fn message_labels_post(
                 StatusCode::BAD_REQUEST,
                 "Invalid request",
                 "Unknown label action.",
-            )
+            );
         }
     };
     if let Err(e) = result {
@@ -2050,7 +2296,7 @@ async fn message_action(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     if msg.mailbox != mb.addr {
@@ -2328,14 +2574,14 @@ async fn scheduled_action(
                         StatusCode::NOT_FOUND,
                         "Not found",
                         "No such scheduled send.",
-                    )
+                    );
                 }
                 Err(e) => {
                     return error_page(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Storage error",
                         &e.to_string(),
-                    )
+                    );
                 }
             };
             let parsed = crate::rfc822::parse(&item.raw);
@@ -2371,7 +2617,7 @@ async fn scheduled_action(
                 StatusCode::BAD_REQUEST,
                 "Invalid request",
                 "Unknown action.",
-            )
+            );
         }
     };
     let changed = match result {
@@ -2381,7 +2627,7 @@ async fn scheduled_action(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     if !changed {
@@ -2448,14 +2694,14 @@ async fn send_undo(
                 StatusCode::NOT_FOUND,
                 "Not found",
                 "Undo window has expired.",
-            )
+            );
         }
         Err(e) => {
             return error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     let changed = match state
@@ -2469,7 +2715,7 @@ async fn send_undo(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     if !changed {
@@ -3294,7 +3540,7 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     if undo_window_secs > 0 {
@@ -3477,7 +3723,7 @@ async fn parse_send(
                         StatusCode::BAD_REQUEST,
                         "Invalid upload",
                         &e.to_string(),
-                    ))
+                    ));
                 }
             };
             let name = field.name().unwrap_or("").to_string();
@@ -3842,7 +4088,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     let aliases = match state.store.list_aliases().await {
@@ -3852,7 +4098,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
 
@@ -3965,7 +4211,7 @@ async fn admin_create_mailbox(
                 StatusCode::CONFLICT,
                 "Already exists",
                 "A mailbox with that address already exists.",
-            )
+            );
         }
         Ok(None) => {}
         Err(e) => {
@@ -3973,7 +4219,7 @@ async fn admin_create_mailbox(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     }
     let mb = Mailbox {
@@ -4037,14 +4283,14 @@ async fn admin_add_alias(
                 StatusCode::BAD_REQUEST,
                 "Invalid request",
                 "The target mailbox does not exist.",
-            )
+            );
         }
         Err(e) => {
             return error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     }
     let alias = Alias {
@@ -4079,7 +4325,11 @@ const RULE_ACTIONS: [&str; 5] = ["move", "star", "markread", "discard", "label"]
 
 /// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, and
 /// auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
-async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn settings_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SettingsQuery>,
+) -> Response {
     let email = email_display(&headers);
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
@@ -4093,7 +4343,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     let settings = match state.store.get_settings(&mb.addr).await {
@@ -4103,7 +4353,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
@@ -4124,7 +4374,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
     let templates = match state.store.list_templates(&mb.addr).await {
@@ -4134,7 +4384,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Storage error",
                 &e.to_string(),
-            )
+            );
         }
     };
 
@@ -4146,8 +4396,23 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         rule_rows.push_str(&render_rule_row(i, rules.len(), r, &labels, &token));
     }
 
-    let field_opts = select_options(&RULE_FIELDS, |f| field_label(f));
-    let op_opts = select_options(&RULE_OPS, |o| o.to_string());
+    let rule_prefill = rule_prefill_from_search(&q.filter_q);
+    let rule_field = rule_prefill
+        .as_ref()
+        .map(|p| p.field.as_str())
+        .unwrap_or("");
+    let rule_op = rule_prefill.as_ref().map(|p| p.op.as_str()).unwrap_or("");
+    let rule_needle = rule_prefill
+        .as_ref()
+        .map(|p| p.needle.as_str())
+        .unwrap_or("");
+    let rule_form_class = if rule_prefill.is_some() {
+        "filter-rule-form is-prefilled"
+    } else {
+        "filter-rule-form"
+    };
+    let field_opts = select_options_selected(&RULE_FIELDS, rule_field, |f| field_label(f));
+    let op_opts = select_options_selected(&RULE_OPS, rule_op, |o| o.to_string());
     let action_opts = select_options(&RULE_ACTIONS, |a| action_label(a));
     let mut folder_opts = String::new();
     for f in FOLDERS {
@@ -4171,18 +4436,18 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let undo_window_opts = undo_send_window_options(settings.undo_send_window_secs);
     let content = format!(
         r#"<div class="page-head"><h1>Settings</h1></div>
-<section class="card pad">
+<section id="filter-rules" class="card pad filter-rules">
   <h2>Filter rules</h2>
   <p class="muted">Applied to incoming mail at delivery, top to bottom — the first matching rule wins.</p>
   <table class="data admin-table">
     <thead><tr><th>#</th><th>Match</th><th>Action</th><th>Status</th><th></th></tr></thead>
     <tbody>{rule_rows}</tbody>
   </table>
-  <form method="post" action="/settings/rules">
+  <form class="{rule_form_class}" method="post" action="/settings/rules">
     <input type="hidden" name="csrf" value="{token}">
     <div class="field"><label for="rule_field">Field</label><select id="rule_field" name="field">{field_opts}</select></div>
     <div class="field"><label for="rule_op">Condition</label><select id="rule_op" name="op">{op_opts}</select></div>
-    <div class="field"><label for="rule_needle">Text to match</label><input id="rule_needle" name="needle" placeholder="newsletter@example.com"></div>
+    <div class="field"><label for="rule_needle">Text to match</label><input id="rule_needle" name="needle" value="{rule_needle}" placeholder="newsletter@example.com"></div>
     <div class="field"><label for="rule_action">Action</label><select id="rule_action" name="action">{action_opts}</select></div>
     <div class="field"><label for="rule_folder">Target folder (for Move)</label><select id="rule_folder" name="folder">{folder_opts}</select></div>
     <div class="field"><label for="rule_label">Target label (for Add label)</label><select id="rule_label" name="label">{rule_label_opts}</select></div>
@@ -4222,6 +4487,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
   </form>
 </section>"#,
         token = esc(&token),
+        rule_needle = esc(rule_needle),
         sig = esc(&settings.signature),
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
@@ -4238,6 +4504,14 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
     }
+}
+
+/// Query string for `GET /settings`. `filter_q` is a search query carried from search results or
+/// advanced search; settings maps the first delivery-rule-compatible predicate into the add form.
+#[derive(Deserialize, Default)]
+struct SettingsQuery {
+    #[serde(default)]
+    filter_q: String,
 }
 
 /// One filter-rule table row: the match/action summary plus its inline control form
@@ -4305,11 +4579,58 @@ fn render_rule_row(
 
 /// `<option>` list for a settings select, labelled by `label`.
 fn select_options(values: &[&str], label: impl Fn(&str) -> String) -> String {
+    select_options_selected(values, "", label)
+}
+
+fn select_options_selected(
+    values: &[&str],
+    selected: &str,
+    label: impl Fn(&str) -> String,
+) -> String {
     let mut out = String::new();
     for v in values {
-        out.push_str(&format!(r#"<option value="{v}">{}</option>"#, label(v)));
+        out.push_str(&format!(
+            r#"<option value="{v}"{}>{}</option>"#,
+            selected_attr(v, selected),
+            label(v)
+        ));
     }
     out
+}
+
+#[derive(Default)]
+struct RulePrefill {
+    field: String,
+    op: String,
+    needle: String,
+}
+
+fn rule_prefill_from_search(raw: &str) -> Option<RulePrefill> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let query = parse_search_query(raw);
+    for predicate in query.predicates {
+        if predicate.negated {
+            continue;
+        }
+        let (field, needle) = match predicate.kind {
+            SearchPredicateKind::From(value) => ("from", value),
+            SearchPredicateKind::To(value) => ("to", value),
+            SearchPredicateKind::Subject(value) => ("subject", value),
+            _ => continue,
+        };
+        let needle = needle.trim();
+        if !needle.is_empty() {
+            return Some(RulePrefill {
+                field: field.to_string(),
+                op: "contains".to_string(),
+                needle: needle.to_string(),
+            });
+        }
+    }
+    None
 }
 
 fn field_label(field: &str) -> String {
@@ -4403,7 +4724,7 @@ async fn settings_rules_post(
                 StatusCode::BAD_REQUEST,
                 "Invalid request",
                 "Unknown rule command.",
-            )
+            );
         }
     };
     if let Err(e) = result {
@@ -5011,7 +5332,7 @@ async fn settings_senders_post(
                         StatusCode::BAD_REQUEST,
                         "Invalid request",
                         "Unknown sender list kind.",
-                    )
+                    );
                 }
             };
             let Some(address_or_domain) = normalize_sender_list_value(&form.address_or_domain)
@@ -6166,6 +6487,59 @@ mod tests {
         assert_eq!(parse_cursor(Some("junk")), None);
         assert_eq!(parse_cursor(Some("notanum_m1")), None);
         assert_eq!(parse_cursor(None), None);
+    }
+
+    #[test]
+    fn advanced_search_query_assembles_supported_operators() {
+        let q = AdvancedSearchQuery {
+            from: "Alice Example".to_string(),
+            to: "bob@example.com".to_string(),
+            subject: "Q3".to_string(),
+            has_words: "budget review".to_string(),
+            doesnt_have: "draft".to_string(),
+            size_cmp: "larger".to_string(),
+            size: "10".to_string(),
+            size_unit: "m".to_string(),
+            after: "2026-07-01".to_string(),
+            before: "2026-07-31".to_string(),
+            folder: "Archive".to_string(),
+            has_attachment: Some("on".to_string()),
+            mode: "search".to_string(),
+        };
+
+        assert_eq!(
+            build_advanced_search_query(&q).as_deref(),
+            Some(
+                r#"from:"Alice Example" to:bob@example.com subject:Q3 "budget review" -draft larger:10M after:2026-07-01 before:2026-07-31 in:Archive has:attachment"#
+            )
+        );
+    }
+
+    #[test]
+    fn advanced_search_query_ignores_invalid_values() {
+        let q = AdvancedSearchQuery {
+            size_cmp: "larger".to_string(),
+            size: "many".to_string(),
+            after: "not-a-date".to_string(),
+            before: "2026-99-99".to_string(),
+            folder: "Starred".to_string(),
+            ..Default::default()
+        };
+
+        assert!(q.has_input());
+        assert_eq!(build_advanced_search_query(&q), None);
+    }
+
+    #[test]
+    fn rule_prefill_from_search_uses_first_supported_positive_predicate() {
+        let prefill =
+            rule_prefill_from_search("-from:blocked has:attachment subject:\"Quarterly Report\"")
+                .expect("subject predicate can prefill a delivery rule");
+
+        assert_eq!(prefill.field, "subject");
+        assert_eq!(prefill.op, "contains");
+        assert_eq!(prefill.needle, "Quarterly Report");
+        assert!(rule_prefill_from_search("has:attachment larger:10M").is_none());
     }
 
     #[test]

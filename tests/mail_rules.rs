@@ -570,6 +570,40 @@ async fn settings_page_renders_core_sections() {
 }
 
 #[tokio::test]
+async fn settings_page_prefills_rule_form_from_search_query() {
+    let state = build_dev_state().await;
+    let req = Request::builder()
+        .uri("/settings?filter_q=from%3Aalice%40example.com%20subject%3AReport")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+
+    assert!(
+        html.contains(r#"<section id="filter-rules" class="card pad filter-rules">"#),
+        "filter rules anchor is rendered"
+    );
+    assert!(
+        html.contains(r#"class="filter-rule-form is-prefilled""#),
+        "form marks search prefill state"
+    );
+    assert!(
+        html.contains(r#"<option value="from" selected>From</option>"#),
+        "first supported search predicate selects the field"
+    );
+    assert!(
+        html.contains(r#"<option value="contains" selected>contains</option>"#),
+        "prefilled search rules use contains"
+    );
+    assert!(
+        html.contains(r#"id="rule_needle" name="needle" value="alice@example.com""#),
+        "needle is carried from the search query"
+    );
+}
+
+#[tokio::test]
 async fn settings_rules_add_reorder_toggle_delete_roundtrip() {
     let state = build_dev_state().await;
     let (token, cookie) = mint_csrf(&state).await;
