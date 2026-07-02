@@ -911,3 +911,90 @@ mark.search-hit {
     max-width:none; width:auto;
   }
 }
+
+/* ============================================================
+   Templates zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   · .template-menu (compose "insert template" control row — wraps a
+     bare native <select data-template-select> + .btn-insert-template
+     action + a "Manage" .btn link)
+   · .template-list (#templates settings section, already .card.pad)
+     containing .template-list__items > .template-item (per-template
+     inline edit form) and the trailing .template-create (add-new form)
+   Tokens only — no new fonts/libs/external links. Motion rides
+   --dur/--ease (globally stilled by the prefers-reduced-motion reset
+   above); every colour is token-driven so light/dark track the same
+   way the snooze/schedule zones do. Templates live in the --accent
+   family, matching the schedule-send action idiom. */
+
+/* Compose control row — inline cluster like .send-split, wraps on
+   narrow compose widths. A small muted caption leads the picker. */
+.template-menu {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  margin:0 0 4px;
+}
+.template-menu label { font-size:12px; font-weight:600; color:var(--ink-3); }
+
+/* The bare native <select> would inherit the global select rule
+   (width:100%, 10px/12px padding) and blow out the row; compact it to
+   the shared snooze/schedule/move-select footprint so every dropdown in
+   the app reads the same — 32px field, the shared caret glyph, an
+   accent focus ring. */
+.template-menu select {
+  width:auto; font:inherit; font-size:12px; height:32px; line-height:normal;
+  padding:0 26px 0 8px; color:var(--ink-2);
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs);
+  appearance:none; -webkit-appearance:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23727a8a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>");
+  background-repeat:no-repeat; background-position:right 8px center;
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.template-menu select:focus {
+  border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none;
+}
+
+/* Insert action — reuses .btn.btn-ghost.btn-sm from the markup and stays
+   restrained (same quiet idiom as .btn-unsnooze / .btn-schedule-send: an
+   accent-tinted label, a coloured border on hover, no loud fill). A faint
+   document glyph signals "drop the template into the body". .btn already
+   supplies the gap before it. */
+.btn-insert-template { color:var(--accent-ink); }
+.btn-insert-template::before {
+  content:""; flex:none; width:14px; height:14px; background:var(--accent-ink);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/><path d='M14 3v5h5'/><path d='M9 13h6'/><path d='M9 17h4'/></svg>") center/contain no-repeat;
+  mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z'/><path d='M14 3v5h5'/><path d='M9 13h6'/><path d='M9 17h4'/></svg>") center/contain no-repeat;
+}
+.btn-insert-template:hover {
+  background:var(--surface-2); border-color:var(--accent-2); color:var(--accent-ink);
+}
+
+/* Settings list — the section is already .card.pad; give the stored
+   templates breathing room and set the trailing create form apart. */
+.template-list__items { display:grid; gap:12px; margin:0 0 6px; }
+
+/* Each stored template edits inline in a tidy nested panel: a soft
+   surface-2 fill + hairline border sets it off from the parent card, the
+   same way admin rows sit inside .card.pad. */
+.template-item {
+  padding:14px 16px;
+  background:var(--surface-2);
+  border:1px solid var(--hairline);
+  border-radius:var(--r-sm);
+  transition:border-color var(--dur) var(--ease);
+}
+.template-item:hover { border-color:var(--border-2); }
+.template-item form { margin:0; }
+
+/* The global `.field textarea { min-height:220px }` is huge for a list of
+   templates; compact the bodies here so the list stays scannable. The
+   name + action buttons still ride the shared .field / .form-actions
+   rules, keeping every row aligned. */
+.template-list .field { margin-bottom:12px; }
+.template-list .field textarea { min-height:88px; }
+
+/* Add-new form — divide it from the list so "Add template" reads as a
+   distinct affordance below the existing entries. */
+.template-create {
+  margin-top:16px; padding-top:16px;
+  border-top:1px solid var(--hairline);
+}
