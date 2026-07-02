@@ -15,7 +15,8 @@
 //! - `mailboxes(addr TEXT PK, owner_sub TEXT)`
 //! - `messages(id TEXT PK, mailbox TEXT, msg_from TEXT, msg_to TEXT, subject TEXT,
 //!    raw_rfc822 TEXT, body_text TEXT, body_html TEXT, received_at BIGINT,
-//!    seen BOOLEAN DEFAULT FALSE, folder TEXT DEFAULT 'INBOX')`
+//!    seen BOOLEAN DEFAULT FALSE, folder TEXT DEFAULT 'INBOX',
+//!    snooze_until BIGINT DEFAULT 0, muted BOOLEAN DEFAULT FALSE)`
 //! - `outbound_queue(id TEXT PK, raw TEXT, env_from TEXT, rcpts TEXT, to_domain TEXT,
 //!    attempts BIGINT, next_at BIGINT, status TEXT)`
 //! - `filter_rules(id TEXT PK, mailbox TEXT, position BIGINT, field TEXT, op TEXT, needle TEXT,
@@ -91,6 +92,16 @@ pub trait Store: Send + Sync {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
+    /// Cross-folder listing of currently snoozed messages, newest first, keyset-paginated like
+    /// [`Store::list_folder`]. `now` is supplied by the caller so tests and the relay worker are
+    /// deterministic.
+    async fn list_snoozed(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError>;
     /// Search a mailbox with a parsed query, newest first, optionally scoped to one `folder`
     /// (`None` searches the whole mailbox), keyset-paginated: `before` is the `(received_at, id)`
     /// of the last row of the previous page (`None` for the first page). A query containing only
@@ -113,6 +124,16 @@ pub trait Store: Send + Sync {
     async fn set_folder(&self, id: &str, folder: &str) -> Result<(), StoreError>;
     /// Set/clear a message's star (flag).
     async fn set_starred(&self, id: &str, starred: bool) -> Result<(), StoreError>;
+    /// Snooze a message until `until`, moving it out of the Inbox-backed folder listings.
+    async fn snooze_message(&self, id: &str, until: i64) -> Result<(), StoreError>;
+    /// Clear snooze state and restore the message to the Inbox.
+    async fn unsnooze_message(&self, id: &str) -> Result<(), StoreError>;
+    /// Restore due snoozed messages to the Inbox, capped so each background tick is bounded.
+    async fn restore_due_snoozes(&self, now: i64, limit: i64) -> Result<i64, StoreError>;
+    /// Mark every known row in the same conversation muted/unmuted.
+    async fn set_thread_muted(&self, msg: &Message, muted: bool) -> Result<(), StoreError>;
+    /// Whether an already-known conversation is muted.
+    async fn is_thread_muted(&self, mailbox: &str, thread_id: &str) -> Result<bool, StoreError>;
     /// Unread count for the app-bar badge.
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError>;
 
@@ -347,7 +368,23 @@ fn summary(m: &Message) -> MessageSummary {
         received_at: m.received_at,
         seen: m.seen,
         starred: m.starred,
+        snooze_until: m.snooze_until,
+        muted: m.muted,
         folder: m.folder.clone(),
+    }
+}
+
+fn is_snoozed_at(m: &Message, now: i64) -> bool {
+    m.snooze_until > now
+}
+
+fn thread_matches(m: &Message, root: &Message) -> bool {
+    if !root.thread_id.is_empty() {
+        m.thread_id == root.thread_id || m.message_id == root.thread_id
+    } else if !root.message_id.is_empty() {
+        m.message_id == root.message_id || m.thread_id == root.message_id
+    } else {
+        m.id == root.id
     }
 }
 
@@ -580,12 +617,17 @@ impl Store for InMemoryStore {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
+        let now = crate::util::now_secs();
         let mut v: Vec<Message> = self
             .messages
             .lock()
             .expect("messages lock poisoned")
             .iter()
-            .filter(|m| m.mailbox == mailbox && m.folder == folder)
+            .filter(|m| {
+                m.mailbox == mailbox
+                    && m.folder == folder
+                    && (!folder.eq_ignore_ascii_case("INBOX") || !is_snoozed_at(m, now))
+            })
             .cloned()
             .collect();
         v.sort_by(|a, b| {
@@ -622,6 +664,31 @@ impl Store for InMemoryStore {
         Ok(v.iter().map(summary).collect())
     }
 
+    async fn list_snoozed(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let mut v: Vec<Message> = self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.mailbox == mailbox && is_snoozed_at(m, now))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        apply_before(&mut v, before);
+        v.truncate(limit.max(0) as usize);
+        Ok(v.iter().map(summary).collect())
+    }
+
     async fn search_messages(
         &self,
         mailbox: &str,
@@ -630,6 +697,7 @@ impl Store for InMemoryStore {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
+        let now = crate::util::now_secs();
         let labels = self.labels.lock().expect("labels lock poisoned").clone();
         let message_labels = self
             .message_labels
@@ -643,7 +711,10 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| {
                 m.mailbox == mailbox
-                    && folder.map_or(true, |f| m.folder == f)
+                    && folder.map_or(true, |f| {
+                        m.folder == f
+                            && (!f.eq_ignore_ascii_case("INBOX") || !is_snoozed_at(m, now))
+                    })
                     && message_matches_search(m, query, &labels, &message_labels)
             })
             .cloned()
@@ -700,13 +771,78 @@ impl Store for InMemoryStore {
         Ok(())
     }
 
-    async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError> {
+    async fn snooze_message(&self, id: &str, until: i64) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+            m.snooze_until = until.max(0);
+            if m.snooze_until > 0 {
+                m.folder = "Archive".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    async fn unsnooze_message(&self, id: &str) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        if let Some(m) = v.iter_mut().find(|m| m.id == id) {
+            m.snooze_until = 0;
+            m.folder = "INBOX".to_string();
+        }
+        Ok(())
+    }
+
+    async fn restore_due_snoozes(&self, now: i64, limit: i64) -> Result<i64, StoreError> {
+        let mut restored = 0_i64;
+        let max = limit.max(0);
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        for m in v.iter_mut() {
+            if restored >= max {
+                break;
+            }
+            if m.snooze_until > 0 && m.snooze_until <= now {
+                m.snooze_until = 0;
+                m.folder = "INBOX".to_string();
+                restored += 1;
+            }
+        }
+        Ok(restored)
+    }
+
+    async fn set_thread_muted(&self, msg: &Message, muted: bool) -> Result<(), StoreError> {
+        let mut v = self.messages.lock().expect("messages lock poisoned");
+        for m in v
+            .iter_mut()
+            .filter(|m| m.mailbox == msg.mailbox && thread_matches(m, msg))
+        {
+            m.muted = muted;
+        }
+        Ok(())
+    }
+
+    async fn is_thread_muted(&self, mailbox: &str, thread_id: &str) -> Result<bool, StoreError> {
+        if thread_id.is_empty() {
+            return Ok(false);
+        }
         Ok(self
             .messages
             .lock()
             .expect("messages lock poisoned")
             .iter()
-            .filter(|m| m.mailbox == mailbox && !m.seen)
+            .any(|m| {
+                m.mailbox == mailbox
+                    && m.muted
+                    && (m.thread_id == thread_id || m.message_id == thread_id)
+            }))
+    }
+
+    async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError> {
+        let now = crate::util::now_secs();
+        Ok(self
+            .messages
+            .lock()
+            .expect("messages lock poisoned")
+            .iter()
+            .filter(|m| m.mailbox == mailbox && !m.seen && !is_snoozed_at(m, now))
             .count() as i64)
     }
 
@@ -916,7 +1052,13 @@ impl Store for InMemoryStore {
         });
         Ok(candidates
             .into_iter()
-            .map(|m| m.thread_id)
+            .map(|m| {
+                if m.thread_id.is_empty() {
+                    m.message_id
+                } else {
+                    m.thread_id
+                }
+            })
             .find(|t| !t.is_empty()))
     }
 
@@ -927,12 +1069,17 @@ impl Store for InMemoryStore {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<ThreadSummary>, StoreError> {
+        let now = crate::util::now_secs();
         let msgs: Vec<Message> = self
             .messages
             .lock()
             .expect("messages lock poisoned")
             .iter()
-            .filter(|m| m.mailbox == mailbox && m.folder == folder)
+            .filter(|m| {
+                m.mailbox == mailbox
+                    && m.folder == folder
+                    && (!folder.eq_ignore_ascii_case("INBOX") || !is_snoozed_at(m, now))
+            })
             .cloned()
             .collect();
         // Group by thread_id (empty thread_id => the message is its own singleton, keyed by id).
@@ -1424,7 +1571,9 @@ impl PgStore {
                  body_html TEXT NOT NULL DEFAULT '', \
                  received_at BIGINT NOT NULL, \
                  seen BOOLEAN NOT NULL DEFAULT FALSE, \
-                 folder TEXT NOT NULL DEFAULT 'INBOX'\
+                 folder TEXT NOT NULL DEFAULT 'INBOX', \
+                 snooze_until BIGINT NOT NULL DEFAULT 0, \
+                 muted BOOLEAN NOT NULL DEFAULT FALSE\
              )",
         )
         .execute(&self.pool)
@@ -1434,6 +1583,16 @@ impl PgStore {
         sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS starred BOOLEAN DEFAULT FALSE")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS snooze_until BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
         // Conversation threading: the computed `thread_id` (grouping key) and the message's own
         // `Message-ID` (referenced by inbound replies). Both nullable — pre-threading rows read as
         // empty (an ungrouped singleton), so every existing listing behaves byte-identically.
@@ -1457,6 +1616,12 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_starred ON messages (mailbox, starred, received_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_snoozed ON messages (mailbox, snooze_until, received_at)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_muted_thread ON messages (mailbox, muted, thread_id)")
             .execute(&self.pool)
             .await?;
         // Keyset-pagination path: matches `ORDER BY received_at DESC, id DESC` within a mailbox
@@ -1706,6 +1871,8 @@ impl PgStore {
             folder: row.try_get("folder")?,
             // Nullable column (pre-migration rows are NULL) — read as Option, default unset.
             starred: row.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
+            snooze_until: row.try_get::<Option<i64>, _>("snooze_until")?.unwrap_or(0),
+            muted: row.try_get::<Option<bool>, _>("muted")?.unwrap_or(false),
             thread_id: row
                 .try_get::<Option<String>, _>("thread_id")?
                 .unwrap_or_default(),
@@ -1879,8 +2046,8 @@ impl Store for PgStore {
         sqlx::query(
             "INSERT INTO messages \
                  (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                  received_at, seen, folder, starred, thread_id, message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&msg.id)
         .bind(&msg.mailbox)
@@ -1894,6 +2061,8 @@ impl Store for PgStore {
         .bind(msg.seen)
         .bind(&msg.folder)
         .bind(msg.starred)
+        .bind(msg.snooze_until)
+        .bind(msg.muted)
         .bind(&msg.thread_id)
         .bind(&msg.message_id)
         .execute(&self.pool)
@@ -1908,7 +2077,7 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 ORDER BY received_at DESC, id DESC LIMIT $2",
         )
         .bind(mailbox)
@@ -1931,13 +2100,15 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 AND folder = $2 \
-               AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
-             ORDER BY received_at DESC, id DESC LIMIT $5",
+               AND ($2 <> 'INBOX' OR COALESCE(snooze_until, 0) <= $3) \
+               AND (received_at < $4 OR (received_at = $4 AND id < $5)) \
+             ORDER BY received_at DESC, id DESC LIMIT $6",
         )
         .bind(mailbox)
         .bind(folder)
+        .bind(crate::util::now_secs())
         .bind(cur_ts)
         .bind(&cur_id)
         .bind(limit)
@@ -1958,12 +2129,40 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 AND starred = TRUE \
                AND (received_at < $2 OR (received_at = $2 AND id < $3)) \
              ORDER BY received_at DESC, id DESC LIMIT $4",
         )
         .bind(mailbox)
+        .bind(cur_ts)
+        .bind(&cur_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(summary_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn list_snoozed(
+        &self,
+        mailbox: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<MessageSummary>, StoreError> {
+        let (cur_ts, cur_id) = Self::cursor(before);
+        let rows = sqlx::query(
+            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
+             WHERE mailbox = $1 AND COALESCE(snooze_until, 0) > $2 \
+               AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
+             ORDER BY received_at DESC, id DESC LIMIT $5",
+        )
+        .bind(mailbox)
+        .bind(now)
         .bind(cur_ts)
         .bind(&cur_id)
         .bind(limit)
@@ -1986,13 +2185,18 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let mut sql =
-            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder FROM messages m WHERE m.mailbox = $1");
+            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder FROM messages m WHERE m.mailbox = $1");
         let mut binds = Vec::new();
         let mut next_param = 2_usize;
 
         if let Some(folder) = folder {
             let param = push_text_param(&mut binds, &mut next_param, folder.to_string());
             sql.push_str(&format!(" AND m.folder = {param}"));
+            if folder.eq_ignore_ascii_case("INBOX") {
+                let now_param =
+                    push_int_param(&mut binds, &mut next_param, crate::util::now_secs());
+                sql.push_str(&format!(" AND COALESCE(m.snooze_until, 0) <= {now_param}"));
+            }
         }
 
         let mut positives = Vec::new();
@@ -2057,7 +2261,7 @@ impl Store for PgStore {
     async fn get_message(&self, id: &str) -> Result<Option<Message>, StoreError> {
         let row = sqlx::query(
             "SELECT id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                    received_at, seen, folder, starred, thread_id, message_id \
+                    received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id \
              FROM messages WHERE id = $1",
         )
         .bind(id)
@@ -2108,13 +2312,91 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn snooze_message(&self, id: &str, until: i64) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE messages SET snooze_until = $1, folder = CASE WHEN $1 > 0 THEN 'Archive' ELSE folder END WHERE id = $2",
+        )
+        .bind(until.max(0))
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn unsnooze_message(&self, id: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE messages SET snooze_until = 0, folder = 'INBOX' WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn restore_due_snoozes(&self, now: i64, limit: i64) -> Result<i64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE messages SET snooze_until = 0, folder = 'INBOX' \
+             WHERE id IN ( \
+               SELECT id FROM messages WHERE COALESCE(snooze_until, 0) > 0 AND snooze_until <= $1 \
+               ORDER BY snooze_until ASC, id ASC LIMIT $2 \
+             )",
+        )
+        .bind(now)
+        .bind(limit.max(0))
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(result.rows_affected() as i64)
+    }
+
+    async fn set_thread_muted(&self, msg: &Message, muted: bool) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE messages SET muted = $5 \
+             WHERE mailbox = $1 AND ( \
+               ($2 <> '' AND (thread_id = $2 OR message_id = $2)) \
+               OR ($2 = '' AND $3 <> '' AND (message_id = $3 OR thread_id = $3)) \
+               OR ($2 = '' AND $3 = '' AND id = $4) \
+             )",
+        )
+        .bind(&msg.mailbox)
+        .bind(&msg.thread_id)
+        .bind(&msg.message_id)
+        .bind(&msg.id)
+        .bind(muted)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn is_thread_muted(&self, mailbox: &str, thread_id: &str) -> Result<bool, StoreError> {
+        if thread_id.is_empty() {
+            return Ok(false);
+        }
+        let row = sqlx::query(
+            "SELECT EXISTS( \
+               SELECT 1 FROM messages \
+               WHERE mailbox = $1 AND muted = TRUE AND (thread_id = $2 OR message_id = $2) \
+             ) AS yes",
+        )
+        .bind(mailbox)
+        .bind(thread_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.try_get("yes").map_err(backend)
+    }
+
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError> {
-        let row =
-            sqlx::query("SELECT COUNT(*) AS n FROM messages WHERE mailbox = $1 AND seen = FALSE")
-                .bind(mailbox)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(backend)?;
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM messages \
+             WHERE mailbox = $1 AND seen = FALSE AND COALESCE(snooze_until, 0) <= $2",
+        )
+        .bind(mailbox)
+        .bind(crate::util::now_secs())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
         row.try_get("n").map_err(backend)
     }
 
@@ -2358,8 +2640,8 @@ impl Store for PgStore {
         let placeholders: Vec<String> = (0..refs.len()).map(|i| format!("${}", i + 2)).collect();
         let ph = placeholders.join(", ");
         let sql = format!(
-            "SELECT thread_id FROM messages \
-             WHERE mailbox = $1 AND thread_id IS NOT NULL AND thread_id <> '' \
+            "SELECT COALESCE(NULLIF(thread_id, ''), message_id) AS tid FROM messages \
+             WHERE mailbox = $1 AND COALESCE(NULLIF(thread_id, ''), message_id) <> '' \
                AND ((message_id IN ({ph})) OR (thread_id IN ({ph}))) \
              ORDER BY received_at ASC, id ASC LIMIT 1"
         );
@@ -2369,7 +2651,7 @@ impl Store for PgStore {
         }
         let row = q.fetch_optional(&self.pool).await.map_err(backend)?;
         Ok(row
-            .map(|r| r.try_get::<String, _>("thread_id"))
+            .map(|r| r.try_get::<String, _>("tid"))
             .transpose()
             .map_err(backend)?)
     }
@@ -2382,29 +2664,35 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<ThreadSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
+        let now = crate::util::now_secs();
         // The grouping key: the thread_id, or a per-message singleton (`m:<id>`) for pre-threading
         // rows. NOT EXISTS keeps only the newest message per group (the representative snippet),
         // keyset-paginated on that representative's (received_at, id). Correlated COUNTs give the
         // thread size + unread tally. All standard SQL (|| concat, NULLIF/COALESCE, subqueries).
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder, \
+            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder, \
                     COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id) AS gk, \
                     (SELECT COUNT(*) FROM messages c WHERE c.mailbox = m.mailbox AND c.folder = m.folder \
+                       AND (m.folder <> 'INBOX' OR COALESCE(c.snooze_until, 0) <= $3) \
                        AND COALESCE(NULLIF(c.thread_id, ''), 'm:' || c.id) = COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id)) AS cnt, \
                     (SELECT COUNT(*) FROM messages u WHERE u.mailbox = m.mailbox AND u.folder = m.folder AND u.seen = FALSE \
+                       AND (m.folder <> 'INBOX' OR COALESCE(u.snooze_until, 0) <= $3) \
                        AND COALESCE(NULLIF(u.thread_id, ''), 'm:' || u.id) = COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id)) AS unseen_cnt \
              FROM messages m \
              WHERE m.mailbox = $1 AND m.folder = $2 \
+               AND ($2 <> 'INBOX' OR COALESCE(m.snooze_until, 0) <= $3) \
                AND NOT EXISTS ( \
                  SELECT 1 FROM messages n WHERE n.mailbox = m.mailbox AND n.folder = m.folder \
+                   AND ($2 <> 'INBOX' OR COALESCE(n.snooze_until, 0) <= $3) \
                    AND COALESCE(NULLIF(n.thread_id, ''), 'm:' || n.id) = COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id) \
                    AND (n.received_at > m.received_at OR (n.received_at = m.received_at AND n.id > m.id)) \
                ) \
-               AND (m.received_at < $3 OR (m.received_at = $3 AND m.id < $4)) \
-             ORDER BY m.received_at DESC, m.id DESC LIMIT $5",
+               AND (m.received_at < $4 OR (m.received_at = $4 AND m.id < $5)) \
+             ORDER BY m.received_at DESC, m.id DESC LIMIT $6",
         )
         .bind(mailbox)
         .bind(folder)
+        .bind(now)
         .bind(cur_ts)
         .bind(&cur_id)
         .bind(limit)
@@ -2437,7 +2725,7 @@ impl Store for PgStore {
         }
         let rows = sqlx::query(
             "SELECT id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                    received_at, seen, folder, starred, thread_id, message_id \
+                    received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id \
              FROM messages WHERE mailbox = $1 AND thread_id = $2 \
              ORDER BY received_at ASC, id ASC LIMIT $3",
         )
@@ -2696,7 +2984,7 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder \
+            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder \
              FROM messages m JOIN message_labels ml ON ml.message_id = m.id \
              WHERE m.mailbox = $1 AND ml.mailbox = $1 AND ml.label_id = $2 \
                AND (m.received_at < $3 OR (m.received_at = $3 AND m.id < $4)) \
@@ -2821,7 +3109,7 @@ impl Store for PgStore {
     }
 }
 
-/// Map a summary row (id, msg_from, subject, received_at, seen, starred, folder) into a
+/// Map a summary row into a
 /// [`MessageSummary`].
 fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::Error> {
     Ok(MessageSummary {
@@ -2831,6 +3119,8 @@ fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::E
         received_at: r.try_get("received_at")?,
         seen: r.try_get("seen")?,
         starred: r.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
+        snooze_until: r.try_get::<Option<i64>, _>("snooze_until")?.unwrap_or(0),
+        muted: r.try_get::<Option<bool>, _>("muted")?.unwrap_or(false),
         folder: r.try_get("folder")?,
     })
 }
@@ -2981,6 +3271,8 @@ mod tests {
             seen: false,
             folder: "INBOX".to_string(),
             starred: false,
+            snooze_until: 0,
+            muted: false,
             thread_id: String::new(),
             message_id: String::new(),
         }
@@ -3008,6 +3300,68 @@ mod tests {
             ["m_a", "m_z"],
             "same-ts rows tie-break on id, older ts always kept"
         );
+    }
+
+    #[tokio::test]
+    async fn snooze_hides_from_inbox_and_restores_when_due() {
+        let store = InMemoryStore::new();
+        let now = crate::util::now_secs();
+        let m = msg("m_snooze", now);
+        store.store_message(&m).await.unwrap();
+
+        store.snooze_message(&m.id, now + 60).await.unwrap();
+        assert!(store
+            .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let snoozed = store
+            .list_snoozed("w33d@w33d.xyz", now, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(snoozed.len(), 1);
+        assert_eq!(snoozed[0].snooze_until, now + 60);
+
+        assert_eq!(store.restore_due_snoozes(now, 10).await.unwrap(), 0);
+        assert_eq!(store.restore_due_snoozes(now + 60, 10).await.unwrap(), 1);
+        let restored = store.get_message(&m.id).await.unwrap().unwrap();
+        assert_eq!(restored.snooze_until, 0);
+        assert_eq!(restored.folder, "INBOX");
+        assert_eq!(
+            store
+                .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_muted_marks_matching_messages() {
+        let store = InMemoryStore::new();
+        let mut root = msg("m_root", 1);
+        root.thread_id = "thr:1".to_string();
+        root.message_id = "<root@example>".to_string();
+        let mut reply = msg("m_reply", 2);
+        reply.thread_id = "thr:1".to_string();
+        reply.message_id = "<reply@example>".to_string();
+        store.store_message(&root).await.unwrap();
+        store.store_message(&reply).await.unwrap();
+
+        store.set_thread_muted(&root, true).await.unwrap();
+        assert!(store
+            .is_thread_muted("w33d@w33d.xyz", "thr:1")
+            .await
+            .unwrap());
+        assert!(store.get_message("m_root").await.unwrap().unwrap().muted);
+        assert!(store.get_message("m_reply").await.unwrap().unwrap().muted);
+
+        store.set_thread_muted(&root, false).await.unwrap();
+        assert!(!store
+            .is_thread_muted("w33d@w33d.xyz", "thr:1")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

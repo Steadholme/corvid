@@ -131,6 +131,10 @@ pub struct Message {
     pub folder: String,
     /// Star/flag: surfaced in the cross-folder `Starred` view.
     pub starred: bool,
+    /// Snooze expiry (epoch seconds). `0` means the message is not snoozed.
+    pub snooze_until: i64,
+    /// Muted conversations skip the Inbox for later inbound replies.
+    pub muted: bool,
     /// The conversation this message belongs to (computed at delivery/send time from the
     /// `References`/`In-Reply-To` chain, falling back to the normalised `Subject`). Empty on
     /// pre-threading rows — read back as an ungrouped singleton.
@@ -149,6 +153,8 @@ pub struct MessageSummary {
     pub received_at: i64,
     pub seen: bool,
     pub starred: bool,
+    pub snooze_until: i64,
+    pub muted: bool,
     pub folder: String,
 }
 

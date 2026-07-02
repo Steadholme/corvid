@@ -23,6 +23,8 @@ fn seed(mailbox: &str, subject: &str) -> Message {
         seen: false,
         folder: "INBOX".to_string(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: String::new(),
         message_id: String::new(),
     }
@@ -54,6 +56,9 @@ async fn inbox_markup_has_enhancement_hooks() {
     assert!(!html.contains("<script>"), "no inline script token");
     // Unseen row offers optimistic Mark read.
     assert!(html.contains(r#"value="read""#), "unseen row offers read op");
+    assert!(html.contains("btn-snooze"), "snooze hook present");
+    assert!(html.contains("snooze-menu"), "snooze preset menu present");
+    assert!(html.contains("btn-mute"), "mute hook present");
 }
 
 #[tokio::test]
@@ -127,6 +132,49 @@ async fn api_action_report_spam_and_not_spam_update_sender_lists() {
 }
 
 #[tokio::test]
+async fn api_action_snooze_unsnooze_and_mute() {
+    let state = build_dev_state().await;
+    let mut m = seed("w33d@w33d.xyz", "Later");
+    m.thread_id = "thr:snooze".to_string();
+    state.store.store_message(&m).await.unwrap();
+    let (token, cookie) = mint(&state).await;
+    let until = now_secs() + 3600;
+
+    let req = Request::builder().method("POST").uri(format!("/api/m/{}/action", m.id))
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone()).body(Body::from(format!("csrf={token}&op=snooze&snooze_until={until}"))).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = state.store.get_message(&m.id).await.unwrap().unwrap();
+    assert_eq!(stored.folder, "Archive");
+    assert_eq!(stored.snooze_until, until);
+    assert!(state.store.list_folder("w33d@w33d.xyz", "INBOX", None, 10).await.unwrap().is_empty());
+
+    let req = Request::builder().method("POST").uri(format!("/api/m/{}/action", m.id))
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone()).body(Body::from(format!("csrf={token}&op=unsnooze"))).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = state.store.get_message(&m.id).await.unwrap().unwrap();
+    assert_eq!(stored.folder, "INBOX");
+    assert_eq!(stored.snooze_until, 0);
+
+    let req = Request::builder().method("POST").uri(format!("/api/m/{}/action", m.id))
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone()).body(Body::from(format!("csrf={token}&op=mute"))).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.store.get_message(&m.id).await.unwrap().unwrap().muted);
+
+    let req = Request::builder().method("POST").uri(format!("/api/m/{}/action", m.id))
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie).body(Body::from(format!("csrf={token}&op=unmute"))).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!state.store.get_message(&m.id).await.unwrap().unwrap().muted);
+}
+
+#[tokio::test]
 async fn api_bulk_archives_only_owned() {
     let state = build_dev_state().await;
     state.store.upsert_mailbox(&corvid::model::Mailbox { addr: "alice@w33d.xyz".into(), owner_sub: "alice".into() }).await.unwrap();
@@ -146,4 +194,34 @@ async fn api_bulk_archives_only_owned() {
     assert!(j.contains("\"applied\":1"), "only the owned message counted: {j}");
     assert_eq!(state.store.get_message(&mine.id).await.unwrap().unwrap().folder, "Archive");
     assert_eq!(state.store.get_message(&hers.id).await.unwrap().unwrap().folder, "INBOX", "foreign message untouched");
+}
+
+#[tokio::test]
+async fn api_bulk_snooze_and_mute() {
+    let state = build_dev_state().await;
+    let mut one = seed("w33d@w33d.xyz", "one");
+    one.thread_id = "thr:bulk-one".to_string();
+    let mut two = seed("w33d@w33d.xyz", "two");
+    two.thread_id = "thr:bulk-two".to_string();
+    state.store.store_message(&one).await.unwrap();
+    state.store.store_message(&two).await.unwrap();
+    let (token, cookie) = mint(&state).await;
+
+    let body = format!("csrf={token}&op=mute&ids={},{}", one.id, two.id);
+    let req = Request::builder().method("POST").uri("/api/m/bulk")
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie.clone()).body(Body::from(body)).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(state.store.get_message(&one.id).await.unwrap().unwrap().muted);
+    assert!(state.store.get_message(&two.id).await.unwrap().unwrap().muted);
+
+    let until = now_secs() + 7200;
+    let body = format!("csrf={token}&op=snooze&snooze_until={until}&ids={},{}", one.id, two.id);
+    let req = Request::builder().method("POST").uri("/api/m/bulk")
+        .header("x-auth-subject", "w33d").header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie).body(Body::from(body)).unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(state.store.list_snoozed("w33d@w33d.xyz", now_secs(), None, 10).await.unwrap().len(), 2);
 }

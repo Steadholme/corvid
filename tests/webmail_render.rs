@@ -22,6 +22,8 @@ fn seed_message(mailbox: &str, subject: &str, from: &str, body: &str) -> Message
         seen: false,
         folder: "INBOX".to_string(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: String::new(),
         message_id: String::new(),
     }

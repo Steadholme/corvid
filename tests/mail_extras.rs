@@ -30,6 +30,8 @@ fn inbound(from: &str, subject: &str, raw: &str, received_at: i64) -> Message {
         seen: false,
         folder: "INBOX".to_string(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: String::new(),
         message_id: String::new(),
     }

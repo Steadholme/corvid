@@ -53,6 +53,9 @@ const FOLDERS: [&str; 6] = [
 /// but never stored in `Message.folder`.
 const STARRED_VIEW: &str = "Starred";
 
+/// A virtual, cross-folder view of messages whose `snooze_until` is still in the future.
+const SNOOZED_VIEW: &str = "Snoozed";
+
 /// Default rows per folder/search page when `?limit=` is absent.
 const PAGE_DEFAULT: i64 = 50;
 
@@ -164,9 +167,9 @@ window.__corvidToast = function (msg, kind) {
 
 /// Webmail progressive-enhancement layer (inbox list + read/conversation views). Everything here
 /// is ADDITIVE: with JS off, the original `<form>` POSTs still work. It provides:
-/// - optimistic per-message actions (star / mark-read / archive / spam / delete / move) via `fetch()` to
+/// - optimistic per-message actions (star / mark-read / archive / snooze / mute / spam / delete / move) via `fetch()` to
 ///   the JSON siblings of the form routes, rolling back + toasting on failure;
-/// - checkbox multi-select + a sticky bulk toolbar (mark-read / archive / spam / move / delete);
+/// - checkbox multi-select + a sticky bulk toolbar (mark-read / archive / snooze / mute / spam / move / delete);
 /// - keyboard nav (j/k prev-next, e archive, # delete, r reply, x select, Enter open);
 /// - collapse/expand for older messages in a conversation.
 ///
@@ -176,6 +179,7 @@ const WEBMAIL_JS: &str = r#"
   var toast = window.__corvidToast || function () {};
   function apiUrl(form) { try { return '/api' + new URL(form.action, location.origin).pathname; } catch (e) { return null; } }
   function field(form, name) { var el = form.querySelector('[name=' + name + ']'); return el ? el.value : ''; }
+  function snoozeFields(root) { return { snooze_until: field(root, 'snooze_until'), snooze_custom: field(root, 'snooze_custom') }; }
   function post(url, params) {
     var body = new URLSearchParams();
     Object.keys(params).forEach(function (k) { body.append(k, params[k]); });
@@ -187,7 +191,7 @@ const WEBMAIL_JS: &str = r#"
   }
 
   // ---- optimistic per-message actions ------------------------------------
-  function inverse(op) { return op === 'star' ? 'unstar' : op === 'unstar' ? 'star' : op === 'unread' ? 'read' : 'unread'; }
+  function inverse(op) { return op === 'star' ? 'unstar' : op === 'unstar' ? 'star' : op === 'unread' ? 'read' : op === 'read' ? 'unread' : op === 'mute' ? 'unmute' : 'mute'; }
   function applyToggle(row, form, op) {
     if (op === 'star' || op === 'unstar') {
       var on = op === 'star';
@@ -222,6 +226,18 @@ const WEBMAIL_JS: &str = r#"
         ub.title = toUnread ? 'Mark read' : 'Mark unread';
         ub.textContent = toUnread ? 'Read' : 'Unread';
       }
+    } else if (op === 'mute' || op === 'unmute') {
+      var muted = op === 'mute';
+      if (row) {
+        row.setAttribute('data-muted', muted ? 'true' : 'false');
+        row.classList.toggle('is-muted', muted);
+      }
+      var mb = form.querySelector('button[name=op][value=mute],button[name=op][value=unmute]');
+      if (mb) {
+        mb.value = muted ? 'unmute' : 'mute';
+        mb.title = muted ? 'Unmute thread' : 'Mute thread';
+        mb.textContent = muted ? 'Unmute' : 'Mute';
+      }
     }
   }
   function enhanceAction(form) {
@@ -229,7 +245,7 @@ const WEBMAIL_JS: &str = r#"
       var btn = e.submitter; if (!btn || btn.name !== 'op') return;
       var op = btn.value, url = apiUrl(form); if (!url) return;
       var row = form.closest('.mailrow-wrap'), inList = !!form.closest('.maillist');
-      if (op === 'star' || op === 'unstar' || op === 'read' || op === 'unread') {
+      if (op === 'star' || op === 'unstar' || op === 'read' || op === 'unread' || op === 'mute' || op === 'unmute') {
         e.preventDefault();
         applyToggle(row, form, op);
         post(url, { csrf: field(form, 'csrf'), op: op }).then(function (ok) {
@@ -237,15 +253,17 @@ const WEBMAIL_JS: &str = r#"
         }).catch(function () { applyToggle(row, form, inverse(op)); toast('Action failed', 'err'); });
         return;
       }
-      if (op === 'archive' || op === 'delete' || op === 'move' || op === 'report_spam' || op === 'not_spam') {
+      if (op === 'archive' || op === 'delete' || op === 'move' || op === 'report_spam' || op === 'not_spam' || op === 'snooze' || op === 'unsnooze') {
         var folder = op === 'move' ? field(form, 'folder') : '';
         if (op === 'move' && !folder) { e.preventDefault(); toast('Choose a folder to move to', 'err'); return; }
+        var snooze = snoozeFields(form);
+        if (op === 'snooze' && !snooze.snooze_until && !snooze.snooze_custom) { e.preventDefault(); toast('Choose a snooze time', 'err'); return; }
         if (inList && row) {
           e.preventDefault();
           var parent = row.parentNode, next = row.nextSibling;
           row.remove();
-          post(url, { csrf: field(form, 'csrf'), op: op, folder: folder }).then(function (ok) {
-            if (ok) { toast(op === 'delete' ? 'Moved to Trash' : op === 'archive' ? 'Archived' : op === 'report_spam' ? 'Reported spam' : op === 'not_spam' ? 'Moved to Inbox' : 'Moved', 'ok'); }
+          post(url, { csrf: field(form, 'csrf'), op: op, folder: folder, snooze_until: snooze.snooze_until, snooze_custom: snooze.snooze_custom }).then(function (ok) {
+            if (ok) { toast(op === 'delete' ? 'Moved to Trash' : op === 'archive' ? 'Archived' : op === 'report_spam' ? 'Reported spam' : op === 'not_spam' ? 'Moved to Inbox' : op === 'snooze' ? 'Snoozed' : op === 'unsnooze' ? 'Moved to Inbox' : 'Moved', 'ok'); }
             else { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); }
           }).catch(function () { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); });
         }
@@ -274,6 +292,15 @@ const WEBMAIL_JS: &str = r#"
         var op = b.getAttribute('data-bulk'), rows = selectedRows(); if (!rows.length) return;
         var ids = rows.map(function (r) { return r.getAttribute('data-id'); }).filter(Boolean);
         var csrf = bar.getAttribute('data-csrf');
+        if (op === 'mute' || op === 'unmute') {
+          var muted = op === 'mute';
+          var changedMute = rows.map(function (r) { var prev = r.getAttribute('data-muted') === 'true'; r.setAttribute('data-muted', muted ? 'true' : 'false'); r.classList.toggle('is-muted', muted); return { row: r, prev: prev }; });
+          post('/api/m/bulk', { csrf: csrf, op: op, ids: ids.join(',') }).then(function (ok) {
+            if (ok) { toast(ids.length + ' ' + (muted ? 'muted' : 'unmuted'), 'ok'); clearAll(); }
+            else { changedMute.forEach(function (c) { c.row.setAttribute('data-muted', c.prev ? 'true' : 'false'); c.row.classList.toggle('is-muted', c.prev); }); toast('Bulk action failed', 'err'); }
+          }).catch(function () { changedMute.forEach(function (c) { c.row.setAttribute('data-muted', c.prev ? 'true' : 'false'); c.row.classList.toggle('is-muted', c.prev); }); toast('Bulk action failed', 'err'); });
+          return;
+        }
         if (op === 'read') {
           var changed = rows.map(function (r) {
             var mr = r.querySelector('.mailrow'), was = mr && mr.classList.contains('unseen');
@@ -288,10 +315,12 @@ const WEBMAIL_JS: &str = r#"
         }
         var folder = '';
         if (op === 'move') { var sel = bar.querySelector('[data-bulk-folder]'); folder = sel ? sel.value : ''; if (!folder) { toast('Choose a folder to move to', 'err'); return; } }
+        var snooze = snoozeFields(bar);
+        if (op === 'snooze' && !snooze.snooze_until && !snooze.snooze_custom) { toast('Choose a snooze time', 'err'); return; }
         var det = rows.map(function (r) { return { row: r, parent: r.parentNode, next: r.nextSibling }; });
         det.forEach(function (d) { d.row.remove(); });
-        post('/api/m/bulk', { csrf: csrf, op: op, folder: folder, ids: ids.join(',') }).then(function (ok) {
-          if (ok) { toast(ids.length + ' ' + (op === 'delete' ? 'deleted' : op === 'archive' ? 'archived' : op === 'report_spam' ? 'reported spam' : op === 'not_spam' ? 'moved to Inbox' : 'moved'), 'ok'); clearAll(); }
+        post('/api/m/bulk', { csrf: csrf, op: op, folder: folder, snooze_until: snooze.snooze_until, snooze_custom: snooze.snooze_custom, ids: ids.join(',') }).then(function (ok) {
+          if (ok) { toast(ids.length + ' ' + (op === 'delete' ? 'deleted' : op === 'archive' ? 'archived' : op === 'report_spam' ? 'reported spam' : op === 'not_spam' ? 'moved to Inbox' : op === 'snooze' ? 'snoozed' : op === 'unsnooze' ? 'moved to Inbox' : 'moved'), 'ok'); clearAll(); }
           else { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); }
         }).catch(function () { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); });
       });
@@ -688,7 +717,7 @@ async fn inbox(
     let threads_on = q.view.as_deref() == Some("threads") && search.is_none();
     if threads_on {
         let folder = canonical_folder(q.folder.as_deref());
-        if folder != STARRED_VIEW {
+        if folder != STARRED_VIEW && folder != SNOOZED_VIEW {
             let threads = match state
                 .store
                 .list_folder_threads(&mb.addr, folder, cursor, limit)
@@ -785,6 +814,11 @@ async fn inbox(
         let folder = canonical_folder(q.folder.as_deref());
         let listed = if folder == STARRED_VIEW {
             state.store.list_starred(&mb.addr, cursor, limit).await
+        } else if folder == SNOOZED_VIEW {
+            state
+                .store
+                .list_snoozed(&mb.addr, now_secs(), cursor, limit)
+                .await
         } else {
             state
                 .store
@@ -808,7 +842,7 @@ async fn inbox(
             esc(folder)
         };
         let next = next_page_link(&msgs, limit, &format!("/?folder={folder}&limit={limit}"));
-        // Searching from a folder view scopes to it; the Inbox (and Starred) search everything.
+        // Searching from a folder view scopes to it; the Inbox and virtual views search everything.
         let scope = real_folder(folder).filter(|f| *f != "INBOX");
         (folder, heading, msgs, next, scope)
     };
@@ -896,15 +930,36 @@ fn render_row_inner(
         .map(|q| highlight_search_hits(&from_display, q))
         .unwrap_or_else(|| esc(&from_display));
     let star = star_mark(m.starred);
+    let state_cls = format!(
+        "{}{}{}",
+        folder_class(&m.folder),
+        if m.snooze_until > now_secs() {
+            " is-snoozed"
+        } else {
+            ""
+        },
+        if m.muted { " is-muted" } else { "" }
+    );
     format!(
-        r#"<li class="mailrow-wrap {folder_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         starred = m.starred,
         seen = m.seen,
-        folder_cls = folder_class(&m.folder),
+        snooze_until = m.snooze_until,
+        muted = m.muted,
+        state_cls = state_cls,
         from = from,
         date = fmt_date(m.received_at),
-        actions = row_actions(&m.id, m.starred, m.seen, &m.folder, token, return_to),
+        actions = row_actions(
+            &m.id,
+            m.starred,
+            m.seen,
+            &m.folder,
+            m.snooze_until,
+            m.muted,
+            token,
+            return_to
+        ),
     )
 }
 
@@ -993,6 +1048,24 @@ fn folder_class(folder: &str) -> String {
     }
 }
 
+fn snooze_controls(now: i64) -> String {
+    let presets = [
+        (now + 3 * 60 * 60, "Later"),
+        (now + 6 * 60 * 60, "Tonight"),
+        (now + 24 * 60 * 60, "Tomorrow"),
+        (now + 7 * 24 * 60 * 60, "Next week"),
+    ];
+    let mut opts = String::new();
+    for (until, label) in presets {
+        opts.push_str(&format!(r#"<option value="{until}">{label}</option>"#));
+    }
+    format!(
+        r#"<select class="snooze-menu" name="snooze_until" aria-label="Snooze until">{opts}</select>
+  <input class="snooze-custom" type="number" name="snooze_custom" min="{min}" placeholder="Epoch" aria-label="Custom snooze epoch">"#,
+        min = now + 1,
+    )
+}
+
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
 /// button submits the same form with a distinct `op`. The read/unread button reflects the current
 /// `seen` state (so a read row offers "Unread" and an unread row offers "Read" — the optimistic
@@ -1002,6 +1075,8 @@ fn row_actions(
     starred: bool,
     seen: bool,
     folder: &str,
+    snooze_until: i64,
+    muted: bool,
     token: &str,
     return_to: &str,
 ) -> String {
@@ -1020,6 +1095,18 @@ fn row_actions(
     } else {
         r#"<button class="btn btn-ghost btn-sm btn-report-spam" type="submit" name="op" value="report_spam" title="Move to Spam and block sender">Report spam</button>"#
     };
+    let now = now_secs();
+    let snooze_controls = snooze_controls(now);
+    let unsnooze_button = if snooze_until > now {
+        r#"<button class="btn btn-ghost btn-sm btn-unsnooze" type="submit" name="op" value="unsnooze" title="Move back to Inbox">Unsnooze</button>"#
+    } else {
+        ""
+    };
+    let (mute_op, mute_label) = if muted {
+        ("unmute", "Unmute")
+    } else {
+        ("mute", "Mute")
+    };
     let mut opts = String::new();
     for f in FOLDERS {
         opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
@@ -1031,6 +1118,10 @@ fn row_actions(
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{star_op}" title="{star_label}">{star_glyph}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{seen_op}" title="Mark {seen_label_lc}">{seen_label}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="archive" title="Archive">Archive</button>
+  <button class="btn btn-ghost btn-sm btn-mute" type="submit" name="op" value="{mute_op}" title="{mute_label} thread">{mute_label}</button>
+  {snooze_controls}
+  <button class="btn btn-ghost btn-sm btn-snooze" type="submit" name="op" value="snooze" title="Snooze">Snooze</button>
+  {unsnooze_button}
   {spam_button}
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
   <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Move…</option>{opts}</select>
@@ -1040,6 +1131,8 @@ fn row_actions(
         token = esc(token),
         ret = esc(return_to),
         spam_button = spam_button,
+        snooze_controls = snooze_controls,
+        unsnooze_button = unsnooze_button,
         seen_label_lc = seen_label.to_ascii_lowercase(),
     )
 }
@@ -1063,6 +1156,7 @@ fn bulk_toolbar(token: &str) -> String {
     for f in FOLDERS {
         opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
     }
+    let snooze_controls = snooze_controls(now_secs());
     format!(
         r#"<div class="bulkbar" role="toolbar" aria-label="Bulk actions" data-bulkbar data-csrf="{token}" hidden>
   <div class="bulkbar__lead">
@@ -1072,6 +1166,11 @@ fn bulk_toolbar(token: &str) -> String {
   <div class="bulkbar__actions">
     <button class="btn btn-ghost btn-sm" type="button" data-bulk="read">Mark read</button>
     <button class="btn btn-ghost btn-sm" type="button" data-bulk="archive">Archive</button>
+    <button class="btn btn-ghost btn-sm btn-mute" type="button" data-bulk="mute">Mute</button>
+    <button class="btn btn-ghost btn-sm btn-mute" type="button" data-bulk="unmute">Unmute</button>
+    {snooze_controls}
+    <button class="btn btn-ghost btn-sm btn-snooze" type="button" data-bulk="snooze">Snooze</button>
+    <button class="btn btn-ghost btn-sm btn-unsnooze" type="button" data-bulk="unsnooze">Unsnooze</button>
     <button class="btn btn-ghost btn-sm btn-report-spam" type="button" data-bulk="report_spam">Report spam</button>
     <button class="btn btn-ghost btn-sm btn-not-spam" type="button" data-bulk="not_spam">Not spam</button>
     <select class="move-select" data-bulk-folder aria-label="Move selected to folder"><option value="" selected disabled>Move…</option>{opts}</select>
@@ -1080,6 +1179,7 @@ fn bulk_toolbar(token: &str) -> String {
   </div>
 </div>"#,
         token = esc(token),
+        snooze_controls = snooze_controls,
     )
 }
 
@@ -1129,6 +1229,7 @@ fn url_encode(s: &str) -> String {
 fn canonical_folder(requested: Option<&str>) -> &'static str {
     match requested.map(str::trim) {
         Some(f) if f.eq_ignore_ascii_case(STARRED_VIEW) => STARRED_VIEW,
+        Some(f) if f.eq_ignore_ascii_case(SNOOZED_VIEW) => SNOOZED_VIEW,
         Some(f) => FOLDERS
             .into_iter()
             .find(|c| c.eq_ignore_ascii_case(f))
@@ -1154,7 +1255,7 @@ struct FolderTabs<'a> {
 /// (carried as a hidden `folder` field); `None` searches the whole mailbox.
 fn folder_tabs(t: &FolderTabs) -> String {
     let mut out = String::from(r#"<nav class="folder-tabs">"#);
-    for f in FOLDERS.iter().copied().chain(std::iter::once(STARRED_VIEW)) {
+    for f in FOLDERS.iter().copied().chain([SNOOZED_VIEW, STARRED_VIEW]) {
         // A folder pill is only "active" when no label filter is in effect.
         let cls = if f == t.active && t.active_label.is_empty() {
             "btn btn-primary btn-sm"
@@ -1168,7 +1269,11 @@ fn folder_tabs(t: &FolderTabs) -> String {
         ));
     }
     // Threads/Messages toggle — meaningful for a real folder view (never the Starred/search view).
-    if t.active_label.is_empty() && !t.active.is_empty() && t.active != STARRED_VIEW {
+    if t.active_label.is_empty()
+        && !t.active.is_empty()
+        && t.active != STARRED_VIEW
+        && t.active != SNOOZED_VIEW
+    {
         if t.threads_on {
             out.push_str(&format!(
                 r#"<a class="btn btn-ghost btn-sm" href="/?folder={f}" title="Show individual messages">Messages</a>"#,
@@ -1378,6 +1483,8 @@ async fn read_message(
             msg.starred,
             msg.seen,
             &msg.folder,
+            msg.snooze_until,
+            msg.muted,
             &token,
             &format!("/m/{}", esc(&msg.id))
         ),
@@ -1609,8 +1716,8 @@ async fn message_labels_post(
 }
 
 /// Form body for `POST /m/{id}/action`: a double-submit CSRF token, the operation `op`
-/// (`star|unstar|read|unread|archive|report_spam|not_spam|delete|move`), a target `folder` (only
-/// for `op=move`), and a safe local `return` path to redirect back to.
+/// (`star|unstar|read|unread|archive|snooze|unsnooze|mute|unmute|report_spam|not_spam|delete|move`),
+/// a target `folder` (only for `op=move`), and a safe local `return` path to redirect back to.
 #[derive(Deserialize, Default)]
 struct ActionForm {
     csrf: String,
@@ -1618,6 +1725,10 @@ struct ActionForm {
     op: String,
     #[serde(default)]
     folder: String,
+    #[serde(default)]
+    snooze_until: String,
+    #[serde(default)]
+    snooze_custom: String,
     #[serde(default, rename = "return")]
     return_to: String,
 }
@@ -1657,7 +1768,16 @@ async fn message_action(
         return error_page(StatusCode::NOT_FOUND, "Not found", "No such message.");
     }
 
-    if let Err((code, message)) = apply_message_op(&state, &msg, &form.op, &form.folder).await {
+    if let Err((code, message)) = apply_message_op(
+        &state,
+        &msg,
+        &form.op,
+        &form.folder,
+        &form.snooze_until,
+        &form.snooze_custom,
+    )
+    .await
+    {
         if code == StatusCode::BAD_REQUEST {
             return error_page(StatusCode::BAD_REQUEST, "Invalid request", &message);
         }
@@ -1684,6 +1804,8 @@ async fn apply_message_op(
     msg: &Message,
     op: &str,
     folder: &str,
+    snooze_until: &str,
+    snooze_custom: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     use serde_json::json;
     let err500 = |e: crate::store::StoreError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
@@ -1749,6 +1871,35 @@ async fn apply_message_op(
                 .map_err(err500)?;
             Ok(json!({"ok": true, "id": id, "op": op, "folder": "INBOX"}))
         }
+        "snooze" => {
+            let until = parse_snooze_epoch(snooze_until, snooze_custom)?;
+            state
+                .store
+                .snooze_message(id, until)
+                .await
+                .map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "folder": "Archive", "snooze_until": until}))
+        }
+        "unsnooze" => {
+            state.store.unsnooze_message(id).await.map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "folder": "INBOX", "snooze_until": 0}))
+        }
+        "mute" => {
+            state
+                .store
+                .set_thread_muted(msg, true)
+                .await
+                .map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "muted": true}))
+        }
+        "unmute" => {
+            state
+                .store
+                .set_thread_muted(msg, false)
+                .await
+                .map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "muted": false}))
+        }
         "unread" => state
             .store
             .mark_unseen(id)
@@ -1775,6 +1926,21 @@ async fn apply_message_op(
             .map_err(err500),
         _ => Err((StatusCode::BAD_REQUEST, "unknown action".to_string())),
     }
+}
+
+fn parse_snooze_epoch(preset: &str, custom: &str) -> Result<i64, (StatusCode, String)> {
+    let raw = custom.trim();
+    let raw = if raw.is_empty() { preset.trim() } else { raw };
+    let until = raw
+        .parse::<i64>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid snooze time".to_string()))?;
+    if until <= now_secs() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "snooze time must be in the future".to_string(),
+        ));
+    }
+    Ok(until)
 }
 
 async fn upsert_sender_for_message(
@@ -1845,7 +2011,16 @@ async fn api_message_action(
     if msg.mailbox != mb.addr {
         return json_status(StatusCode::NOT_FOUND, "no such message");
     }
-    match apply_message_op(&state, &msg, &form.op, &form.folder).await {
+    match apply_message_op(
+        &state,
+        &msg,
+        &form.op,
+        &form.folder,
+        &form.snooze_until,
+        &form.snooze_custom,
+    )
+    .await
+    {
         Ok(body) => {
             tracing::info!(
                 target: "corvid::audit",
@@ -1872,10 +2047,14 @@ struct BulkForm {
     #[serde(default)]
     folder: String,
     #[serde(default)]
+    snooze_until: String,
+    #[serde(default)]
+    snooze_custom: String,
+    #[serde(default)]
     ids: String,
 }
 
-/// `POST /api/m/bulk` — apply one `op` (`read|unread|archive|report_spam|not_spam|delete|move`) to a batch of the
+/// `POST /api/m/bulk` — apply one `op` (`read|unread|archive|snooze|unsnooze|mute|unmute|report_spam|not_spam|delete|move`) to a batch of the
 /// signed-in mailbox's messages, for the multi-select bulk toolbar. Double-submit CSRF; EACH id is
 /// re-checked to belong to this mailbox (a forged/foreign id in the batch is skipped, never
 /// actioned), reusing the SAME per-message store mutations via [`apply_message_op`]. Returns the
@@ -1894,12 +2073,25 @@ async fn api_bulk_action(
     // A deliberately narrow (non-star) bulk op set; `move` still needs a real target folder.
     if !matches!(
         form.op.as_str(),
-        "read" | "unread" | "archive" | "report_spam" | "not_spam" | "delete" | "move"
+        "read"
+            | "unread"
+            | "archive"
+            | "snooze"
+            | "unsnooze"
+            | "mute"
+            | "unmute"
+            | "report_spam"
+            | "not_spam"
+            | "delete"
+            | "move"
     ) {
         return json_status(StatusCode::BAD_REQUEST, "unknown bulk action");
     }
     if form.op == "move" && real_folder(&form.folder).is_none() {
         return json_status(StatusCode::BAD_REQUEST, "unknown target folder");
+    }
+    if form.op == "snooze" && parse_snooze_epoch(&form.snooze_until, &form.snooze_custom).is_err() {
+        return json_status(StatusCode::BAD_REQUEST, "invalid snooze time");
     }
     let ids: Vec<&str> = form
         .ids
@@ -1914,9 +2106,16 @@ async fn api_bulk_action(
             Ok(Some(m)) if m.mailbox == mb.addr => m,
             _ => continue,
         };
-        if apply_message_op(&state, &msg, &form.op, &form.folder)
-            .await
-            .is_ok()
+        if apply_message_op(
+            &state,
+            &msg,
+            &form.op,
+            &form.folder,
+            &form.snooze_until,
+            &form.snooze_custom,
+        )
+        .await
+        .is_ok()
         {
             applied += 1;
         }
@@ -2508,6 +2707,8 @@ async fn store_local_copy(
         seen: true,
         folder: folder.to_string(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id,
         message_id,
     };
@@ -4873,6 +5074,8 @@ mod tests {
             seen: false,
             folder: "INBOX".to_string(),
             starred: false,
+            snooze_until: 0,
+            muted: false,
             thread_id: String::new(),
             message_id: String::new(),
         };
@@ -4887,6 +5090,7 @@ mod tests {
         assert_eq!(canonical_folder(Some("Sent")), "Sent");
         assert_eq!(canonical_folder(Some("sent")), "Sent");
         assert_eq!(canonical_folder(Some("spam")), "Spam");
+        assert_eq!(canonical_folder(Some("snoozed")), "Snoozed");
         assert_eq!(canonical_folder(Some("bogus")), "INBOX");
         assert_eq!(canonical_folder(None), "INBOX");
     }
@@ -4901,12 +5105,18 @@ mod tests {
             None,
             "the virtual view is not a folder"
         );
+        assert_eq!(
+            real_folder("Snoozed"),
+            None,
+            "the virtual view is not a folder"
+        );
         assert_eq!(real_folder("bogus"), None);
     }
 
     #[test]
     fn folder_class_exposes_spam_hook() {
         assert_eq!(folder_class("Spam"), "folder-spam");
+        assert_eq!(folder_class("Snoozed"), "folder-snoozed");
         assert_eq!(folder_class("INBOX"), "folder-inbox");
     }
 
@@ -4940,6 +5150,8 @@ mod tests {
             received_at: ts,
             seen: false,
             starred: false,
+            snooze_until: 0,
+            muted: false,
             folder: "INBOX".to_string(),
         };
         // Short page (or empty) -> nothing older -> no link.

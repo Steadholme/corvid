@@ -74,6 +74,8 @@ async fn pg_store_full_integration() {
         seen: false,
         folder: "INBOX".into(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: String::new(),
         message_id: String::new(),
     };
@@ -395,6 +397,8 @@ async fn pg_store_full_integration() {
         seen: false,
         folder: "INBOX".into(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: tid.into(),
         message_id: mid.into(),
     };

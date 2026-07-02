@@ -481,6 +481,8 @@ impl Session {
                 seen: false,
                 folder: "INBOX".to_string(),
                 starred: false,
+                snooze_until: 0,
+                muted: false,
                 // Threading is computed inside the delivery hook (keeps this path surgical).
                 thread_id: String::new(),
                 message_id: String::new(),

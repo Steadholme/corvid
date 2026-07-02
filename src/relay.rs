@@ -86,6 +86,11 @@ fn from_domain_matches(raw: &str, domain: &str) -> bool {
 pub async fn run_worker(store: Arc<dyn Store>, myhostname: String, try_tls: bool) {
     loop {
         let now = now_secs();
+        match store.restore_due_snoozes(now, 100).await {
+            Ok(n) if n > 0 => tracing::info!(restored = n, "relay: restored snoozed messages"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "relay: failed to restore snoozed messages"),
+        }
         match store.due_outbound(now, 20).await {
             Ok(items) => {
                 for item in items {

@@ -328,6 +328,8 @@ async fn signature_prefills_compose_and_reply() {
         seen: false,
         folder: "INBOX".to_string(),
         starred: false,
+        snooze_until: 0,
+        muted: false,
         thread_id: String::new(),
         message_id: String::new(),
     };

@@ -41,6 +41,8 @@ pub async fn process_inbound(
     let (mid, tid) = resolve_thread(store, &msg.mailbox, &msg.raw_rfc822, &msg.subject).await?;
     msg.message_id = mid;
     msg.thread_id = tid;
+    let thread_muted = store.is_thread_muted(&msg.mailbox, &msg.thread_id).await?;
+    msg.muted = thread_muted;
 
     let rules = store.list_rules(&msg.mailbox).await?;
     let mut labelled: Option<String> = None;
@@ -86,6 +88,15 @@ pub async fn process_inbound(
             "spam assessment placed inbound message in Spam",
         );
         msg.folder = SPAM_FOLDER.to_string();
+    }
+    if thread_muted && msg.folder.eq_ignore_ascii_case("INBOX") {
+        tracing::info!(
+            target: "corvid::audit",
+            mailbox = %msg.mailbox,
+            thread = %msg.thread_id,
+            "muted inbound thread archived",
+        );
+        msg.folder = "Archive".to_string();
     }
     store.store_message(&msg).await?;
     if let Some(annotation) = spam.annotation(&msg) {
@@ -511,6 +522,8 @@ mod tests {
             seen: false,
             folder: "INBOX".to_string(),
             starred: false,
+            snooze_until: 0,
+            muted: false,
             thread_id: String::new(),
             message_id: String::new(),
         }
@@ -690,6 +703,30 @@ mod tests {
             "INBOX",
             "safe sender never lands in Spam"
         );
+    }
+
+    #[tokio::test]
+    async fn muted_thread_replies_archive_instead_of_inbox() {
+        let store = InMemoryStore::new();
+        let mut root = msg("Alice <alice@example.com>", "w33d@w33d.xyz", "Hello");
+        root.id = "m_root".to_string();
+        root.raw_rfc822 = "Message-ID: <root@example>\r\nFrom: alice@example.com\r\nTo: w33d@w33d.xyz\r\nSubject: Hello\r\n\r\nroot".to_string();
+        process_inbound(&store, None, "w33d.xyz", "alice@example.com", root)
+            .await
+            .unwrap();
+        let stored_root = store.get_message("m_root").await.unwrap().unwrap();
+        store.set_thread_muted(&stored_root, true).await.unwrap();
+
+        let mut reply = msg("Alice <alice@example.com>", "w33d@w33d.xyz", "Re: Hello");
+        reply.id = "m_reply".to_string();
+        reply.raw_rfc822 = "Message-ID: <reply@example>\r\nReferences: <root@example>\r\nIn-Reply-To: <root@example>\r\nFrom: alice@example.com\r\nTo: w33d@w33d.xyz\r\nSubject: Re: Hello\r\n\r\nreply".to_string();
+        process_inbound(&store, None, "w33d.xyz", "alice@example.com", reply)
+            .await
+            .unwrap();
+
+        let stored_reply = store.get_message("m_reply").await.unwrap().unwrap();
+        assert_eq!(stored_reply.folder, "Archive");
+        assert!(stored_reply.muted);
     }
 
     #[test]
