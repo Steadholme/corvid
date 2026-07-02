@@ -29,7 +29,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::model::{Alias, FilterRule, Mailbox, Message};
+use crate::model::{Alias, Contact, FilterRule, Label, Mailbox, Message};
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
@@ -52,6 +52,82 @@ const PAGE_MAX: i64 = 200;
 
 const APP_CSS: &str = include_str!("../static/app.css");
 const SHELL: &str = include_str!("../templates/shell.html");
+
+/// Vanilla, dependency-free To/Cc autocomplete. Progressive enhancement: the inputs are plain
+/// text fields that submit fine with JS off; this only layers a debounced suggestion listbox on
+/// top. Remote strings are written with `textContent` (never innerHTML) so a hostile display-name
+/// can never inject markup. ARIA combobox roles + keyboard nav for accessibility.
+const COMPOSE_JS: &str = r#"
+(function () {
+  var boxes = document.querySelectorAll('input[data-autocomplete]');
+  boxes.forEach(function (input) {
+    var list = document.getElementById(input.getAttribute('aria-controls'));
+    if (!list) return;
+    var timer = null, active = -1, items = [];
+    function lastToken() {
+      var v = input.value; var i = v.lastIndexOf(',');
+      return i < 0 ? v.trim() : v.slice(i + 1).trim();
+    }
+    function close() {
+      list.hidden = true; list.textContent = ''; active = -1; items = [];
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
+    }
+    function choose(addr) {
+      var v = input.value; var i = v.lastIndexOf(',');
+      input.value = (i < 0 ? '' : v.slice(0, i + 1) + ' ') + addr + ', ';
+      close(); input.focus();
+    }
+    function render(sugs) {
+      list.textContent = ''; items = []; active = -1;
+      sugs.forEach(function (s, idx) {
+        var li = document.createElement('li');
+        li.setAttribute('role', 'option');
+        li.id = list.id + '-opt-' + idx;
+        li.className = 'combo__opt';
+        var a = document.createElement('span'); a.className = 'combo__addr';
+        a.textContent = s.addr;
+        li.appendChild(a);
+        if (s.name) {
+          var n = document.createElement('span'); n.className = 'combo__name';
+          n.textContent = s.name; li.appendChild(n);
+        }
+        li.addEventListener('mousedown', function (e) { e.preventDefault(); choose(s.addr); });
+        list.appendChild(li); items.push(li);
+      });
+      if (items.length) { list.hidden = false; input.setAttribute('aria-expanded', 'true'); }
+      else { close(); }
+    }
+    function highlight(n) {
+      items.forEach(function (li) { li.setAttribute('aria-selected', 'false'); li.classList.remove('is-active'); });
+      if (n >= 0 && n < items.length) {
+        items[n].setAttribute('aria-selected', 'true'); items[n].classList.add('is-active');
+        input.setAttribute('aria-activedescendant', items[n].id); active = n;
+      }
+    }
+    function fetchSuggest() {
+      var q = lastToken();
+      if (q.length < 1) { close(); return; }
+      fetch('/contacts/suggest?q=' + encodeURIComponent(q), { headers: { 'Accept': 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (data) { render(Array.isArray(data) ? data : []); })
+        .catch(function () { close(); });
+    }
+    input.addEventListener('input', function () {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(fetchSuggest, 160);
+    });
+    input.addEventListener('keydown', function (e) {
+      if (list.hidden) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); highlight(Math.min(active + 1, items.length - 1)); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); highlight(Math.max(active - 1, 0)); }
+      else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); items[active].dispatchEvent(new MouseEvent('mousedown')); }
+      else if (e.key === 'Escape') { close(); }
+    });
+    input.addEventListener('blur', function () { setTimeout(close, 150); });
+  });
+})();
+"#;
 const LOGOUT_URL: &str = "https://sso.w33d.xyz/_gw/auth/logout";
 const CSRF_COOKIE: &str = "__Host-csrf";
 
@@ -79,16 +155,22 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(inbox))
+        .route("/t", get(conversation))
         .route("/m/{id}", get(read_message))
         .route("/m/{id}/action", post(message_action))
+        .route("/m/{id}/labels", post(message_labels_post))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
         .route("/api/send", post(api_send))
+        .route("/contacts/suggest", get(contacts_suggest))
         .route("/settings", get(settings_page))
         .route("/settings/rules", get(settings_rules_redirect).post(settings_rules_post))
         .route("/settings/signature", post(settings_signature))
         .route("/settings/autoreply", post(settings_autoreply))
+        .route("/settings/identities", post(settings_identities_post))
+        .route("/settings/labels", post(settings_labels_post))
+        .route("/settings/contacts", post(settings_contacts_post))
         .merge(admin)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
@@ -147,6 +229,12 @@ struct InboxQuery {
     before: Option<String>,
     #[serde(default)]
     limit: Option<i64>,
+    /// `threads` collapses the folder into conversations; anything else lists messages.
+    #[serde(default)]
+    view: Option<String>,
+    /// A label id to filter by (a flat cross-folder listing of that label's messages).
+    #[serde(default)]
+    label: Option<String>,
 }
 
 async fn inbox(
@@ -164,6 +252,74 @@ async fn inbox(
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let limit = clamp_limit(q.limit);
     let cursor = parse_cursor(q.before.as_deref());
+    // The mailbox's labels drive both the tab strip and the label-filter view.
+    let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+
+    // Label-filter view: a flat, cross-folder listing of one label's messages.
+    if let Some(label_id) = q.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(label) = labels.iter().find(|l| l.id == label_id) else {
+            return error_page(StatusCode::NOT_FOUND, "Not found", "No such label.");
+        };
+        let msgs = match state.store.list_by_label(&mb.addr, label_id, cursor, limit).await {
+            Ok(m) => m,
+            Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+        };
+        let base = format!("/?label={}&limit={limit}", url_encode(label_id));
+        let next_link = next_page_link(&msgs, limit, &base);
+        let return_to = base.clone();
+        let mut rows = String::new();
+        if msgs.is_empty() {
+            rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No messages with this label.</span></div></li>"#);
+        }
+        for m in &msgs {
+            rows.push_str(&render_row(m, &token, &return_to));
+        }
+        let heading = format!(r#"Label: <span class="pill">{}</span>"#, esc(&label.name));
+        let content = format!(
+            r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
+{tabs}
+<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+            tabs = folder_tabs(&FolderTabs { active: "", search_q: "", scope: None, labels: &labels, active_label: label_id, threads_on: false }),
+        );
+        let html = render_page(&label.name, &email, &content, "inbox");
+        return match set_cookie {
+            Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+            None => Html(html).into_response(),
+        };
+    }
+
+    // Threaded folder view: collapsed conversations for a real folder (not search / not Starred).
+    let threads_on = q.view.as_deref() == Some("threads") && search.is_none();
+    if threads_on {
+        let folder = canonical_folder(q.folder.as_deref());
+        if folder != STARRED_VIEW {
+            let threads = match state.store.list_folder_threads(&mb.addr, folder, cursor, limit).await {
+                Ok(t) => t,
+                Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+            };
+            let mut rows = String::new();
+            if threads.is_empty() {
+                rows.push_str(r#"<li><div class="mailrow"><span class="subject muted">No conversations here.</span></div></li>"#);
+            }
+            for t in &threads {
+                rows.push_str(&render_thread_row(t));
+            }
+            let base = format!("/?folder={folder}&view=threads&limit={limit}");
+            let next_link = next_thread_link(&threads, limit, &base);
+            let heading = if folder == "INBOX" { "Inbox".to_string() } else { esc(folder) };
+            let content = format!(
+                r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
+{tabs}
+<section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
+                tabs = folder_tabs(&FolderTabs { active: folder, search_q: "", scope: real_folder(folder).filter(|f| *f != "INBOX"), labels: &labels, active_label: "", threads_on: true }),
+            );
+            let html = render_page(folder, &email, &content, "inbox");
+            return match set_cookie {
+                Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+                None => Html(html).into_response(),
+            };
+        }
+    }
 
     // Fetch the rows for the active view, plus the return path row actions redirect back to, a
     // `next` keyset link to the older page (only when this page is full), and the folder the
@@ -225,7 +381,14 @@ async fn inbox(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{next_link}"#,
-        tabs = folder_tabs(folder, search.unwrap_or(""), scope),
+        tabs = folder_tabs(&FolderTabs {
+            active: folder,
+            search_q: search.unwrap_or(""),
+            scope,
+            labels: &labels,
+            active_label: "",
+            threads_on: false,
+        }),
     );
     let title = if folder.is_empty() { "Search" } else { folder };
     let html = render_page(title, &email, &content, "inbox");
@@ -335,25 +498,99 @@ fn canonical_folder(requested: Option<&str>) -> &'static str {
     }
 }
 
+/// Inputs for [`folder_tabs`]: which folder/label is active, the current search text + scope, the
+/// mailbox's labels, and whether the folder is showing the threaded (conversation) view.
+struct FolderTabs<'a> {
+    active: &'a str,
+    search_q: &'a str,
+    scope: Option<&'a str>,
+    labels: &'a [Label],
+    active_label: &'a str,
+    threads_on: bool,
+}
+
 /// Render the folder switcher as a row of pill links (INBOX/Sent/Drafts/Archive/Trash/Starred),
-/// highlighting the active folder, followed by the `?q=` search box. `scope` is the folder the
-/// search box narrows to (carried as a hidden `folder` field); `None` searches the whole mailbox.
-fn folder_tabs(active: &str, search_q: &str, scope: Option<&str>) -> String {
+/// highlighting the active folder, then a Threads/Messages toggle for the active folder, then a
+/// pill per label, then the `?q=` search box. `scope` is the folder the search box narrows to
+/// (carried as a hidden `folder` field); `None` searches the whole mailbox.
+fn folder_tabs(t: &FolderTabs) -> String {
     let mut out = String::from(r#"<nav class="folder-tabs">"#);
     for f in FOLDERS.iter().copied().chain(std::iter::once(STARRED_VIEW)) {
-        let cls = if f == active { "btn btn-primary btn-sm" } else { "btn btn-ghost btn-sm" };
+        // A folder pill is only "active" when no label filter is in effect.
+        let cls = if f == t.active && t.active_label.is_empty() {
+            "btn btn-primary btn-sm"
+        } else {
+            "btn btn-ghost btn-sm"
+        };
         let label = if f == "INBOX" { "Inbox" } else { f };
         out.push_str(&format!(r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#));
     }
-    let scope_input = scope
+    // Threads/Messages toggle — meaningful for a real folder view (never the Starred/search view).
+    if t.active_label.is_empty() && !t.active.is_empty() && t.active != STARRED_VIEW {
+        if t.threads_on {
+            out.push_str(&format!(
+                r#"<a class="btn btn-ghost btn-sm" href="/?folder={f}" title="Show individual messages">Messages</a>"#,
+                f = t.active,
+            ));
+        } else {
+            out.push_str(&format!(
+                r#"<a class="btn btn-ghost btn-sm" href="/?folder={f}&view=threads" title="Group into conversations">Threads</a>"#,
+                f = t.active,
+            ));
+        }
+    }
+    // Label pills.
+    for l in t.labels {
+        let cls = if l.id == t.active_label { "btn btn-primary btn-sm label-pill" } else { "btn btn-ghost btn-sm label-pill" };
+        out.push_str(&format!(
+            r#"<a class="{cls}" href="/?label={id}">{name}</a>"#,
+            id = url_encode(&l.id),
+            name = esc(&l.name),
+        ));
+    }
+    let scope_input = t
+        .scope
         .map(|f| format!(r#"<input type="hidden" name="folder" value="{}">"#, esc(f)))
         .unwrap_or_default();
     out.push_str(&format!(
         r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button></form>"#,
-        q = esc(search_q),
+        q = esc(t.search_q),
     ));
     out.push_str("</nav>");
     out
+}
+
+/// Render one collapsed conversation row for the threaded folder view: the latest message's
+/// from/subject/date, a message count, and the unread indicator, linking to the conversation view.
+fn render_thread_row(t: &crate::model::ThreadSummary) -> String {
+    let m = &t.latest;
+    let cls = if t.unseen > 0 { "mailrow unseen" } else { "mailrow" };
+    let dot = if t.unseen > 0 { "dot" } else { "dot seen" };
+    let subject = if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) };
+    let count_badge = if t.count > 1 {
+        format!(r#"<span class="pill thread-count">{}</span> "#, t.count)
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<li class="mailrow-wrap"><a class="{cls}" href="/t?id={id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{count}{subject}</span><span class="date">{date}</span></a></li>"#,
+        id = url_encode(&t.thread_id),
+        from = esc(&display_from(&m.msg_from)),
+        count = count_badge,
+        date = fmt_date(m.received_at),
+    )
+}
+
+/// The keyset "Load older" link for the threaded view — same rule as [`next_page_link`] but keyed
+/// on the last conversation's representative (newest) message `(received_at, id)`.
+fn next_thread_link(threads: &[crate::model::ThreadSummary], limit: i64, base: &str) -> String {
+    let Some(last) = threads.last().filter(|_| threads.len() as i64 >= limit) else {
+        return String::new();
+    };
+    format!(
+        r#"<div class="page-more"><a class="btn btn-ghost btn-sm" href="{base}&before={cursor}">Load older</a></div>"#,
+        cursor = url_encode(&format!("{}_{}", last.latest.received_at, last.latest.id)),
+    )
 }
 
 async fn read_message(
@@ -389,6 +626,26 @@ async fn read_message(
     // Enumerate the stored raw source's MIME parts and offer a download link per attachment.
     let attachments = render_attachment_list(&msg);
 
+    // Label strip + assign/remove control (scoped to this mailbox's labels).
+    let all_labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let msg_labels = state.store.labels_for_message(&mb.addr, &id).await.unwrap_or_default();
+    let labels_html = render_message_labels(&msg.id, &all_labels, &msg_labels, &token);
+
+    // "View conversation" link when this message is part of a multi-message thread.
+    let convo_html = if !msg.thread_id.is_empty() {
+        let count = state.store.list_thread(&mb.addr, &msg.thread_id, 200).await.map(|v| v.len()).unwrap_or(0);
+        if count > 1 {
+            format!(
+                r#"<a class="btn btn-ghost btn-sm" href="/t?id={tid}">View conversation ({count})</a>"#,
+                tid = url_encode(&msg.thread_id),
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let subject = if msg.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&msg.subject) };
     let content = format!(
         r#"<nav class="crumbs"><a href="/?folder={folder}">← {folder_label}</a></nav>
@@ -404,8 +661,10 @@ async fn read_message(
       <a class="btn btn-primary btn-sm" href="/compose?reply={id}">Reply</a>
       <a class="btn btn-ghost btn-sm" href="/compose?replyall={id}">Reply all</a>
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
+      {convo}
     </div>
     {actions}
+    {labels}
   </header>
   {attachments}
   {body}
@@ -416,6 +675,8 @@ async fn read_message(
         folder = esc(&msg.folder),
         folder_label = if msg.folder == "INBOX" { "Inbox".to_string() } else { esc(&msg.folder) },
         id = esc(&msg.id),
+        convo = convo_html,
+        labels = labels_html,
         // Read-view actions return to the message so a star/unread toggle stays in context.
         actions = row_actions(&msg.id, msg.starred, &token, &format!("/m/{}", esc(&msg.id))),
     );
@@ -424,6 +685,163 @@ async fn read_message(
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
     }
+}
+
+/// Render the read-view label strip: a removable pill per applied label plus an add-label form
+/// (only offering labels not already applied). CSRF double-submit; posts to `/m/{id}/labels`.
+fn render_message_labels(id: &str, all: &[Label], applied: &[Label], token: &str) -> String {
+    let mut pills = String::new();
+    for l in applied {
+        pills.push_str(&format!(
+            r#"<form class="label-chip" method="post" action="/m/{id}/labels"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="op" value="remove"><input type="hidden" name="label" value="{lid}"><span class="pill label-pill">{name}</span><button class="label-x" type="submit" title="Remove label" aria-label="Remove label {name}">×</button></form>"#,
+            id = esc(id),
+            token = esc(token),
+            lid = esc(&l.id),
+            name = esc(&l.name),
+        ));
+    }
+    let available: Vec<&Label> = all.iter().filter(|l| !applied.iter().any(|a| a.id == l.id)).collect();
+    let add_form = if available.is_empty() {
+        String::new()
+    } else {
+        let mut opts = String::from(r#"<option value="" selected disabled>Add label…</option>"#);
+        for l in &available {
+            opts.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = esc(&l.id), name = esc(&l.name)));
+        }
+        format!(
+            r#"<form class="row-actions" method="post" action="/m/{id}/labels"><input type="hidden" name="csrf" value="{token}"><input type="hidden" name="op" value="add"><select class="move-select" name="label" aria-label="Add label">{opts}</select><button class="btn btn-ghost btn-sm" type="submit">Add</button></form>"#,
+            id = esc(id),
+            token = esc(token),
+        )
+    };
+    format!(r#"<div class="msg-labels">{pills}{add_form}</div>"#)
+}
+
+/// Query for `GET /t`: the conversation (thread) id.
+#[derive(Deserialize)]
+struct ConversationQuery {
+    id: String,
+}
+
+/// `GET /t?id=<thread_id>` — the conversation view: every message in the thread the signed-in user
+/// owns, oldest first. Marks the whole thread read. Reply/forward act on the newest message.
+async fn conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ConversationQuery>,
+) -> Response {
+    let email = email_display(&headers);
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email);
+    };
+    let msgs = match state.store.list_thread(&mb.addr, &q.id, PAGE_MAX).await {
+        Ok(m) => m,
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+    if msgs.is_empty() {
+        return error_page(StatusCode::NOT_FOUND, "Not found", "No such conversation.");
+    }
+
+    // The subject of the conversation = the earliest message's subject.
+    let subject = msgs
+        .first()
+        .map(|m| if m.subject.trim().is_empty() { "(no subject)".to_string() } else { esc(&m.subject) })
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let latest_id = msgs.last().map(|m| m.id.clone()).unwrap_or_default();
+
+    let mut blocks = String::new();
+    for m in &msgs {
+        let _ = state.store.mark_seen(&m.id).await;
+        let body = if !m.body_html.is_empty() {
+            format!(r#"<div class="msg-body">{}</div>"#, crate::sanitize::sanitize_html(&m.body_html))
+        } else {
+            format!(r#"<div class="msg-body"><pre>{}</pre></div>"#, esc(&m.body_text))
+        };
+        let attachments = render_attachment_list(m);
+        blocks.push_str(&format!(
+            r#"<section class="card pad convo-msg">
+  <header class="msg-head">
+    <div class="msg-meta">
+      <b>From</b><span>{from}</span>
+      <b>To</b><span>{to}</span>
+      <b>Date</b><span>{date}</span>
+    </div>
+    <div class="form-actions msg-actions">
+      <a class="btn btn-ghost btn-sm" href="/m/{id}">Open</a>
+      <a class="btn btn-ghost btn-sm" href="/compose?reply={id}">Reply</a>
+      <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
+    </div>
+  </header>
+  {attachments}
+  {body}
+</section>"#,
+            from = esc(&m.msg_from),
+            to = esc(&m.msg_to),
+            date = fmt_date(m.received_at),
+            id = esc(&m.id),
+        ));
+    }
+
+    let content = format!(
+        r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
+<div class="page-head"><h1>{subject} <span class="pill thread-count">{count}</span></h1><a class="btn btn-primary btn-sm" href="/compose?replyall={latest}">Reply all</a></div>
+{blocks}"#,
+        count = msgs.len(),
+        latest = esc(&latest_id),
+    );
+    Html(render_page("Conversation", &email, &content, "inbox")).into_response()
+}
+
+/// Form body for `POST /m/{id}/labels`: CSRF, `op` (`add`|`remove`), and the `label` id.
+#[derive(Deserialize, Default)]
+struct MessageLabelForm {
+    csrf: String,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    label: String,
+}
+
+/// `POST /m/{id}/labels` — add/remove a label on a message. CSRF-guarded; the store enforces that
+/// both the message and the label belong to the signed-in user's mailbox. Redirects back to the
+/// message.
+async fn message_labels_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<MessageLabelForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    // Authorisation: the message must belong to this mailbox (mirrors the read/action views).
+    match state.store.get_message(&id).await {
+        Ok(Some(m)) if m.mailbox == mb.addr => {}
+        Ok(_) => return error_page(StatusCode::NOT_FOUND, "Not found", "No such message."),
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    }
+    let label_id = form.label.trim();
+    let result = match form.op.as_str() {
+        "add" => state.store.assign_label(&mb.addr, &id, label_id).await,
+        "remove" => state.store.remove_label(&mb.addr, &id, label_id).await,
+        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown label action."),
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        message = %id,
+        op = %form.op,
+        label = %label_id,
+        "message label change",
+    );
+    Redirect::to(&format!("/m/{}", url_encode(&id))).into_response()
 }
 
 /// Form body for `POST /m/{id}/action`: a double-submit CSRF token, the operation `op`
@@ -611,7 +1029,6 @@ async fn compose_form(
     let Some(mb) = resolve_mailbox(&state, &headers).await else {
         return no_mailbox_page(&email);
     };
-    let from = mb.addr.clone();
     let (token, set_cookie) = ensure_csrf(&headers);
 
     // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
@@ -625,6 +1042,28 @@ async fn compose_form(
         }
     }
 
+    // The "From" selector: the mailbox's own address (implicit default) plus any owned identities.
+    let identities = state.store.list_send_identities(&mb.addr).await.unwrap_or_default();
+    let default_selected = !identities.iter().any(|i| i.is_default);
+    let mut from_options = format!(
+        r#"<option value=""{sel}>{addr}</option>"#,
+        addr = esc(&mb.addr),
+        sel = if default_selected { " selected" } else { "" },
+    );
+    for idn in &identities {
+        let label = if idn.display_name.trim().is_empty() {
+            idn.from_addr.clone()
+        } else {
+            format!("{} <{}>", idn.display_name, idn.from_addr)
+        };
+        from_options.push_str(&format!(
+            r#"<option value="{id}"{sel}>{label}</option>"#,
+            id = esc(&idn.id),
+            label = esc(&label),
+            sel = if idn.is_default { " selected" } else { "" },
+        ));
+    }
+
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
 <section class="card pad">
@@ -633,8 +1072,13 @@ async fn compose_form(
     <input type="hidden" name="csrf" value="{token}">
     <input type="hidden" name="in_reply_to" value="{in_reply_to}">
     <input type="hidden" name="references" value="{references}">
-    <div class="field"><label>From</label><input value="{from}" disabled></div>
-    <div class="field"><label for="to">To</label><input id="to" name="to" value="{to}" placeholder="someone@example.com"></div>
+    <div class="field"><label for="from">From</label><select id="from" name="identity">{from_options}</select></div>
+    <div class="field"><label for="to">To</label>
+      <div class="combo"><input id="to" name="to" value="{to}" placeholder="someone@example.com" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="to-list" autocomplete="off" data-autocomplete><ul class="combo__list" id="to-list" role="listbox" hidden></ul></div>
+    </div>
+    <div class="field"><label for="cc">Cc</label>
+      <div class="combo"><input id="cc" name="cc" value="{cc}" placeholder="(optional)" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="cc-list" autocomplete="off" data-autocomplete><ul class="combo__list" id="cc-list" role="listbox" hidden></ul></div>
+    </div>
     <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" value="{subject}" placeholder="Subject"></div>
     <div class="field"><label for="body">Message</label><textarea id="body" name="body">{body}</textarea></div>
     <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple></div>
@@ -644,13 +1088,15 @@ async fn compose_form(
       <a class="btn btn-ghost btn-sm" href="/">Cancel</a>
     </div>
   </form>
-</section>"#,
-        from = esc(&from),
+</section>
+<script>{compose_js}</script>"#,
         to = esc(&pre.to),
+        cc = String::new(),
         subject = esc(&pre.subject),
         body = esc(&pre.body),
         in_reply_to = esc(&pre.in_reply_to),
         references = esc(&pre.references),
+        compose_js = COMPOSE_JS,
     );
     let html = render_page("Compose", &email, &content, "compose");
     match set_cookie {
@@ -798,6 +1244,9 @@ struct SendForm {
     csrf: String,
     #[serde(default)]
     to: String,
+    /// Optional carbon-copy recipients (also relayed). Empty for a plain send.
+    #[serde(default)]
+    cc: String,
     #[serde(default)]
     subject: String,
     #[serde(default)]
@@ -807,6 +1256,9 @@ struct SendForm {
     in_reply_to: String,
     #[serde(default)]
     references: String,
+    /// Chosen send-identity id (empty = the mailbox's own address, the default identity).
+    #[serde(default)]
+    identity: String,
     /// `send` (default) or `draft`.
     #[serde(default)]
     action: String,
@@ -832,9 +1284,17 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
         return no_mailbox_page(&email);
     };
 
+    // Resolve the outbound "From": the mailbox's own address (default), or a send identity the
+    // mailbox OWNS. A submitted-but-unowned identity is rejected (never silently sent as the mailbox).
+    let (from_header, env_from) = match resolve_from_identity(&state, &mb.addr, &form.identity).await {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
     let raw = build_rfc822(
-        &mb.addr,
+        &from_header,
         &form.to,
+        &form.cc,
         &form.subject,
         &form.body,
         &form.in_reply_to,
@@ -845,13 +1305,15 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
 
     // "Save draft": persist without sending, and allow an incomplete recipient list.
     if form.action == "draft" {
-        store_local_copy(&state, &mb.addr, &form.to, &form.subject, &form.body, &raw, "Drafts").await;
+        store_local_copy(&state, &mb.addr, &from_header, &form.to, &form.subject, &form.body, &raw, "Drafts").await;
         return Redirect::to("/?folder=Drafts").into_response();
     }
 
+    // To + Cc are both relayed.
     let rcpts: Vec<String> = form
         .to
         .split([',', ';'])
+        .chain(form.cc.split([',', ';']))
         .map(str::trim)
         .filter(|s| s.contains('@') && domain_of(s).is_some())
         .map(str::to_string)
@@ -861,31 +1323,75 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
     }
 
     let signer = state.signer.as_deref();
-    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &mb.addr, &rcpts).await {
+    match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &env_from, &rcpts).await {
         Ok(signed) => {
             // File a copy of the sent message into the sender's Sent folder.
-            store_local_copy(&state, &mb.addr, &form.to, &form.subject, &form.body, &signed, "Sent").await;
+            store_local_copy(&state, &mb.addr, &from_header, &form.to, &form.subject, &form.body, &signed, "Sent").await;
             Redirect::to("/?folder=Sent").into_response()
         }
         Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
     }
 }
 
-/// Persist a locally-authored message (a Sent copy or a Draft) into `mailbox`'s `folder`. Best
-/// effort: a storage error is logged but never fails the user's send/save (the mail already left).
+/// Resolve the outbound From for a send: `(from_header, env_from_addr)`. An empty identity id uses
+/// the mailbox's own address (the implicit default — byte-identical to the pre-identity behaviour).
+/// A non-empty id must resolve to an identity the mailbox OWNS, else a `400` is returned so a forged
+/// identity id can never send as another address.
+async fn resolve_from_identity(
+    state: &AppState,
+    mailbox: &str,
+    identity_id: &str,
+) -> Result<(String, String), Box<Response>> {
+    let id = identity_id.trim();
+    if id.is_empty() {
+        return Ok((mailbox.to_string(), mailbox.to_string()));
+    }
+    match state.store.get_send_identity(mailbox, id).await {
+        Ok(Some(idn)) => {
+            let display = idn.display_name.trim();
+            let from_header = if display.is_empty() {
+                idn.from_addr.clone()
+            } else {
+                format!("{} <{}>", header_safe(display), idn.from_addr)
+            };
+            Ok((from_header, idn.from_addr))
+        }
+        Ok(None) => Err(Box::new(error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "That send identity is not available for this mailbox.",
+        ))),
+        Err(e) => Err(Box::new(error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()))),
+    }
+}
+
+/// Strip CR/LF from a value interpolated into a mail header (header injection defence).
+fn header_safe(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
+/// Persist a locally-authored message (a Sent copy or a Draft) into `mailbox`'s `folder`, from the
+/// chosen `from` identity. Best effort: a storage error is logged but never fails the user's
+/// send/save (the mail already left). Threads the copy into its conversation and harvests the
+/// recipient(s) into contacts so both features cover self-authored mail too.
+#[allow(clippy::too_many_arguments)]
 async fn store_local_copy(
     state: &AppState,
     mailbox: &str,
+    from: &str,
     to: &str,
     subject: &str,
     body: &str,
     raw: &str,
     folder: &str,
 ) {
+    let (message_id, thread_id) = crate::delivery::resolve_thread(state.store.as_ref(), mailbox, raw, subject)
+        .await
+        .unwrap_or_default();
     let msg = Message {
         id: new_id("m"),
         mailbox: mailbox.to_string(),
-        msg_from: mailbox.to_string(),
+        msg_from: from.to_string(),
         msg_to: to.to_string(),
         subject: subject.to_string(),
         raw_rfc822: raw.to_string(),
@@ -895,10 +1401,13 @@ async fn store_local_copy(
         seen: true,
         folder: folder.to_string(),
         starred: false,
+        thread_id,
+        message_id,
     };
     if let Err(e) = state.store.store_message(&msg).await {
         tracing::warn!(error = %e, folder, "failed to file local message copy");
     }
+    crate::delivery::harvest_contacts(state.store.as_ref(), mailbox, "", to).await;
 }
 
 /// Parse a `POST /send` body into its [`SendForm`] fields plus any attachment file parts. A
@@ -1025,15 +1534,42 @@ async fn api_send(
         return json_status(StatusCode::BAD_REQUEST, "at least one valid recipient is required");
     }
 
-    let raw = build_rfc822(&from_addr, &req.to, &req.subject, &req.body, "", "", &state.config.mail_domain, &[]);
+    let raw = build_rfc822(&from_addr, &req.to, "", &req.subject, &req.body, "", "", &state.config.mail_domain, &[]);
     let signer = state.signer.as_deref();
     match crate::relay::enqueue_outbound(state.store.as_ref(), signer, &raw, &from_addr, &rcpts).await {
         Ok(signed) => {
             // File a Sent copy for the sending address (parity with the webmail /send path).
-            store_local_copy(&state, &from_addr, &req.to, &req.subject, &req.body, &signed, "Sent").await;
+            store_local_copy(&state, &from_addr, &from_addr, &req.to, &req.subject, &req.body, &signed, "Sent").await;
             json_status(StatusCode::ACCEPTED, "queued")
         }
         Err(e) => json_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("enqueue failed: {e}")),
+    }
+}
+
+/// Query for `GET /contacts/suggest`.
+#[derive(Deserialize, Default)]
+struct SuggestQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Number of autocomplete suggestions returned per keystroke.
+const SUGGEST_LIMIT: i64 = 8;
+
+/// `GET /contacts/suggest?q=` — the To/Cc autocomplete backend. Returns a JSON array of
+/// `{addr, name, …}` suggestions from the SIGNED-IN mailbox's contacts only (strictly scoped);
+/// an unauthenticated / mailbox-less caller gets an empty array (the combobox just shows nothing).
+async fn contacts_suggest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SuggestQuery>,
+) -> Response {
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return Json(Vec::<crate::model::Contact>::new()).into_response();
+    };
+    match state.store.suggest_contacts(&mb.addr, &q.q, SUGGEST_LIMIT).await {
+        Ok(list) => Json(list).into_response(),
+        Err(_) => Json(Vec::<crate::model::Contact>::new()).into_response(),
     }
 }
 
@@ -1067,9 +1603,11 @@ fn json_status(status: StatusCode, message: &str) -> Response {
 /// `attachments` the body is a single `text/plain` part (unchanged wire format); with attachments
 /// it becomes a `multipart/mixed` — a `text/plain` body part followed by one base64
 /// `Content-Disposition: attachment` part per file.
+#[allow(clippy::too_many_arguments)]
 fn build_rfc822(
     from: &str,
     to: &str,
+    cc: &str,
     subject: &str,
     body: &str,
     in_reply_to: &str,
@@ -1085,9 +1623,15 @@ fn build_rfc822(
     if !references.trim().is_empty() {
         thread.push_str(&format!("References: {}\r\n", references.trim()));
     }
+    // Cc is optional: emitted only when present, so a send without a Cc is byte-identical to before.
+    let cc_hdr = if cc.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Cc: {}\r\n", cc.trim())
+    };
 
     let head = format!(
-        "From: {from}\r\nTo: {to}\r\nSubject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n{thread}MIME-Version: 1.0\r\n",
+        "From: {from}\r\nTo: {to}\r\n{cc_hdr}Subject: {subject}\r\nDate: {date}\r\nMessage-ID: {mid}\r\n{thread}MIME-Version: 1.0\r\n",
         date = email_date(),
         mid = message_id(domain),
     );
@@ -1327,7 +1871,7 @@ async fn admin_add_alias(
 /// The legal rule match fields / operators / actions (the settings selects + POST validation).
 const RULE_FIELDS: [&str; 3] = ["from", "to", "subject"];
 const RULE_OPS: [&str; 2] = ["contains", "equals"];
-const RULE_ACTIONS: [&str; 4] = ["move", "star", "markread", "discard"];
+const RULE_ACTIONS: [&str; 5] = ["move", "star", "markread", "discard", "label"];
 
 /// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, and
 /// auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
@@ -1346,13 +1890,16 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         Ok(s) => s,
         Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
     };
+    let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let identities = state.store.list_send_identities(&mb.addr).await.unwrap_or_default();
+    let contacts = state.store.suggest_contacts(&mb.addr, "", 200).await.unwrap_or_default();
 
     let mut rule_rows = String::new();
     if rules.is_empty() {
         rule_rows.push_str(r#"<tr><td colspan="5" class="muted">No filter rules yet — incoming mail lands in the Inbox.</td></tr>"#);
     }
     for (i, r) in rules.iter().enumerate() {
-        rule_rows.push_str(&render_rule_row(i, rules.len(), r, &token));
+        rule_rows.push_str(&render_rule_row(i, rules.len(), r, &labels, &token));
     }
 
     let field_opts = select_options(&RULE_FIELDS, |f| field_label(f));
@@ -1361,6 +1908,11 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     let mut folder_opts = String::new();
     for f in FOLDERS {
         folder_opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
+    }
+    // Label select for the `label` rule action (empty when the mailbox has none yet).
+    let mut rule_label_opts = String::new();
+    for l in &labels {
+        rule_label_opts.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = esc(&l.id), name = esc(&l.name)));
     }
 
     let ar_checked = if settings.auto_reply_enabled { " checked" } else { "" };
@@ -1380,9 +1932,13 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     <div class="field"><label for="rule_needle">Text to match</label><input id="rule_needle" name="needle" placeholder="newsletter@example.com"></div>
     <div class="field"><label for="rule_action">Action</label><select id="rule_action" name="action">{action_opts}</select></div>
     <div class="field"><label for="rule_folder">Target folder (for Move)</label><select id="rule_folder" name="folder">{folder_opts}</select></div>
+    <div class="field"><label for="rule_label">Target label (for Add label)</label><select id="rule_label" name="label">{rule_label_opts}</select></div>
     <div class="form-actions"><button class="btn btn-primary" type="submit">Add rule</button></div>
   </form>
 </section>
+{labels_section}
+{identities_section}
+{contacts_section}
 <section class="card pad">
   <h2>Signature</h2>
   <form method="post" action="/settings/signature">
@@ -1407,6 +1963,9 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
+        labels_section = render_labels_section(&labels, &token),
+        identities_section = render_identities_section(&identities, &mb.addr, &token),
+        contacts_section = render_contacts_section(&contacts, &token),
     );
     let html = render_page("Settings", &email, &content, "settings");
     match set_cookie {
@@ -1417,7 +1976,8 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
 
 /// One filter-rule table row: the match/action summary plus its inline control form
 /// (up/down/enable-disable/delete), all POSTing back to `/settings/rules` with the CSRF token.
-fn render_rule_row(index: usize, total: usize, r: &FilterRule, token: &str) -> String {
+/// `labels` resolves an `Add label` rule's target id to its display name.
+fn render_rule_row(index: usize, total: usize, r: &FilterRule, labels: &[Label], token: &str) -> String {
     let status = if r.enabled {
         r#"<span class="pill pill-ok">Enabled</span>"#
     } else {
@@ -1426,6 +1986,15 @@ fn render_rule_row(index: usize, total: usize, r: &FilterRule, token: &str) -> S
     let toggle = if r.enabled { ("disable", "Disable") } else { ("enable", "Enable") };
     let action = match r.action.as_str() {
         "move" => format!("Move to {}", esc(r.target_folder.as_deref().unwrap_or("?"))),
+        "label" => {
+            let name = r
+                .target_label
+                .as_deref()
+                .and_then(|id| labels.iter().find(|l| l.id == id))
+                .map(|l| l.name.clone())
+                .unwrap_or_else(|| "?".to_string());
+            format!("Add label {}", esc(&name))
+        }
         other => action_label(other),
     };
     let up = if index > 0 {
@@ -1482,6 +2051,7 @@ fn action_label(action: &str) -> String {
         "star" => "Star".to_string(),
         "markread" => "Mark read".to_string(),
         "discard" => "Discard".to_string(),
+        "label" => "Add label".to_string(),
         other => esc(other),
     }
 }
@@ -1510,6 +2080,9 @@ struct RuleForm {
     action: String,
     #[serde(default)]
     folder: String,
+    /// Target label id for the `label` action.
+    #[serde(default)]
+    label: String,
 }
 
 /// `POST /settings/rules` — add/reorder/toggle/delete a filter rule. CSRF-guarded; every store
@@ -1575,6 +2148,23 @@ async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) ->
     } else {
         None
     };
+    // The `label` action needs a target label the mailbox actually owns.
+    let target_label = if action == "label" {
+        let lid = form.label.trim();
+        let owned = state
+            .store
+            .list_labels(mailbox)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|l| l.id == lid);
+        if lid.is_empty() || !owned {
+            return Err("An Add-label rule needs one of your labels.".to_string());
+        }
+        Some(lid.to_string())
+    } else {
+        None
+    };
     let existing = state.store.list_rules(mailbox).await.map_err(|e| e.to_string())?;
     let position = existing.iter().map(|r| r.position).max().unwrap_or(0) + 1;
     let rule = FilterRule {
@@ -1586,6 +2176,7 @@ async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) ->
         needle,
         action,
         target_folder,
+        target_label,
         enabled: true,
         created_at: now_secs(),
     };
@@ -1730,6 +2321,301 @@ fn fmt_until(ts: i64) -> String {
         Ok(dt) => format!("{:04}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day()),
         Err(_) => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Settings — labels / send identities / contacts (per-mailbox, self-managed)
+// ---------------------------------------------------------------------------
+
+/// The Labels settings card: existing labels (with delete) + an add form.
+fn render_labels_section(labels: &[Label], token: &str) -> String {
+    let mut rows = String::new();
+    if labels.is_empty() {
+        rows.push_str(r#"<tr><td colspan="2" class="muted">No labels yet.</td></tr>"#);
+    }
+    for l in labels {
+        rows.push_str(&format!(
+            r#"<tr><td><span class="pill label-pill">{name}</span></td><td>
+<form class="row-actions" method="post" action="/settings/labels">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="id" value="{id}">
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+</form></td></tr>"#,
+            name = esc(&l.name),
+            id = esc(&l.id),
+            token = esc(token),
+        ));
+    }
+    format!(
+        r#"<section class="card pad">
+  <h2>Labels</h2>
+  <p class="muted">Arbitrary tags you can apply to messages (independent of folders). Filter by a label from the tab strip, or add one automatically with an "Add label" filter rule.</p>
+  <table class="data admin-table">
+    <thead><tr><th>Label</th><th></th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <form method="post" action="/settings/labels">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="label_name">New label</label><input id="label_name" name="name" placeholder="Receipts"></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Add label</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+/// The Send identities settings card: the mailbox's own address (implicit), each configured
+/// identity (with delete), and an add form.
+fn render_identities_section(identities: &[crate::model::SendIdentity], mailbox: &str, token: &str) -> String {
+    let mut rows = format!(
+        r#"<tr><td>{addr}</td><td class="muted">mailbox default</td><td></td></tr>"#,
+        addr = esc(mailbox),
+    );
+    for i in identities {
+        let display = if i.display_name.trim().is_empty() {
+            String::from("—")
+        } else {
+            esc(&i.display_name)
+        };
+        let def = if i.is_default { r#"<span class="pill pill-ok">default</span>"# } else { "" };
+        rows.push_str(&format!(
+            r#"<tr><td>{addr}</td><td>{display} {def}</td><td>
+<form class="row-actions" method="post" action="/settings/identities">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="id" value="{id}">
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+</form></td></tr>"#,
+            addr = esc(&i.from_addr),
+            id = esc(&i.id),
+            token = esc(token),
+        ));
+    }
+    format!(
+        r#"<section class="card pad">
+  <h2>Send identities</h2>
+  <p class="muted">Extra "From" addresses you may send as (must be at this mail domain so outgoing mail stays signed). Pick one in the compose "From" selector.</p>
+  <table class="data admin-table">
+    <thead><tr><th>From address</th><th>Display / default</th><th></th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <form method="post" action="/settings/identities">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="idn_addr">From address</label><input id="idn_addr" name="from_addr" placeholder="info@w33d.xyz"></div>
+    <div class="field"><label for="idn_name">Display name</label><input id="idn_name" name="display_name" placeholder="HOLDFAST Info"></div>
+    <div class="field"><label><input type="checkbox" name="is_default" value="on"> Make this my default From</label></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Add identity</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+/// The Contacts settings card: the mailbox's contacts (auto-harvested + manual, with delete) and a
+/// manual add form.
+fn render_contacts_section(contacts: &[Contact], token: &str) -> String {
+    let mut rows = String::new();
+    if contacts.is_empty() {
+        rows.push_str(r#"<tr><td colspan="4" class="muted">No contacts yet — they build up as you send and receive mail.</td></tr>"#);
+    }
+    for c in contacts {
+        let kind = if c.manual { "manual" } else { "auto" };
+        rows.push_str(&format!(
+            r#"<tr><td>{addr}</td><td>{name}</td><td class="muted">{kind}</td><td>
+<form class="row-actions" method="post" action="/settings/contacts">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="addr" value="{addr}">
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+</form></td></tr>"#,
+            addr = esc(&c.addr),
+            name = esc(&c.name),
+            kind = kind,
+            token = esc(token),
+        ));
+    }
+    format!(
+        r#"<section class="card pad">
+  <h2>Contacts</h2>
+  <p class="muted">Correspondents power the To/Cc autocomplete. Addresses are harvested automatically; you can add your own here.</p>
+  <table class="data admin-table">
+    <thead><tr><th>Address</th><th>Name</th><th>Source</th><th></th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <form method="post" action="/settings/contacts">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="ct_addr">Address</label><input id="ct_addr" name="addr" placeholder="friend@example.com"></div>
+    <div class="field"><label for="ct_name">Name</label><input id="ct_name" name="name" placeholder="Friend"></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add contact</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+/// Form body for `POST /settings/labels`: CSRF, `cmd` (`add`|`delete`), and the label `name` (add)
+/// or `id` (delete).
+#[derive(Deserialize, Default)]
+struct LabelForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST /settings/labels` — create/delete a label, scoped to the signed-in mailbox. CSRF-guarded.
+async fn settings_labels_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<LabelForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let result = match form.cmd.as_str() {
+        "delete" => state.store.delete_label(&mb.addr, form.id.trim()).await,
+        _ => {
+            let name = form.name.trim();
+            if name.is_empty() {
+                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A label name is required.");
+            }
+            let label = Label {
+                id: new_id("lbl"),
+                mailbox: mb.addr.clone(),
+                name: name.to_string(),
+                color: String::new(),
+            };
+            state.store.add_label(&label).await
+        }
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        "label change",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/identities`: CSRF, `cmd` (`add`|`delete`), the `id` (delete), and
+/// the `from_addr`/`display_name`/`is_default` (add).
+#[derive(Deserialize, Default)]
+struct IdentityForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    from_addr: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    is_default: String,
+}
+
+/// `POST /settings/identities` — add/delete a send identity, scoped to the signed-in mailbox.
+/// CSRF-guarded. A new identity's `from_addr` must be at the mail domain (so outbound stays
+/// DKIM-signable — the same rule the internal send API enforces).
+async fn settings_identities_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<IdentityForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let result = match form.cmd.as_str() {
+        "delete" => state.store.delete_send_identity(&mb.addr, form.id.trim()).await,
+        _ => {
+            let from_addr = extract_addr(&form.from_addr).to_lowercase();
+            if from_addr.is_empty() || domain_of(&from_addr).as_deref() != Some(state.config.mail_domain.to_lowercase().as_str()) {
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "A send identity must be an address at this mail domain.",
+                );
+            }
+            let identity = crate::model::SendIdentity {
+                id: new_id("si"),
+                mailbox: mb.addr.clone(),
+                from_addr,
+                display_name: header_safe(form.display_name.trim()),
+                is_default: !form.is_default.trim().is_empty(),
+            };
+            state.store.add_send_identity(&identity).await
+        }
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        "send identity change",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/contacts`: CSRF, `cmd` (`add`|`delete`), the `addr`, and `name`.
+#[derive(Deserialize, Default)]
+struct ContactForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    addr: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST /settings/contacts` — add a manual contact or delete one, scoped to the signed-in mailbox.
+/// CSRF-guarded.
+async fn settings_contacts_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ContactForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let addr = extract_addr(&form.addr).to_lowercase();
+    let result = match form.cmd.as_str() {
+        "delete" => state.store.delete_contact(&mb.addr, &addr).await,
+        _ => {
+            if !addr.contains('@') {
+                return error_page(StatusCode::BAD_REQUEST, "Invalid request", "A valid contact address is required.");
+            }
+            state.store.upsert_contact(&mb.addr, &addr, form.name.trim(), true).await
+        }
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        "contact change",
+    );
+    Redirect::to("/settings").into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2131,14 +3017,15 @@ mod tests {
 
     #[test]
     fn build_rfc822_has_signed_headers() {
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Hi", "Body line", "", "", "w33d.xyz", &[]);
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "", "Hi", "Body line", "", "", "w33d.xyz", &[]);
         for h in ["From:", "To:", "Subject:", "Date:", "Message-ID:", "MIME-Version:", "Content-Type:"] {
             assert!(raw.contains(h), "missing {h}");
         }
         assert!(raw.contains("\r\n\r\nBody line\r\n"));
-        // No threading headers when none are supplied.
+        // No threading headers when none are supplied, and no Cc when unset.
         assert!(!raw.contains("In-Reply-To:"));
         assert!(!raw.contains("References:"));
+        assert!(!raw.contains("Cc:"));
     }
 
     #[test]
@@ -2146,6 +3033,7 @@ mod tests {
         let raw = build_rfc822(
             "w33d@w33d.xyz",
             "x@y.com",
+            "",
             "Re: Hi",
             "Body",
             "<orig@ex.com>",
@@ -2158,13 +3046,19 @@ mod tests {
     }
 
     #[test]
+    fn build_rfc822_includes_cc_when_present() {
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "cc@z.com", "Hi", "Body", "", "", "w33d.xyz", &[]);
+        assert!(raw.contains("Cc: cc@z.com\r\n"), "Cc header emitted");
+    }
+
+    #[test]
     fn build_rfc822_emits_multipart_mixed_with_attachment() {
         let att = Attachment {
             filename: "report.txt".to_string(),
             content_type: "text/plain".to_string(),
             data: b"hello attachment".to_vec(),
         };
-        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "Files", "See attached", "", "", "w33d.xyz", &[att]);
+        let raw = build_rfc822("w33d@w33d.xyz", "x@y.com", "", "Files", "See attached", "", "", "w33d.xyz", &[att]);
 
         assert!(raw.contains("Content-Type: multipart/mixed; boundary="), "top-level is multipart/mixed");
         assert!(raw.contains("Content-Disposition: attachment; filename=\"report.txt\""));
@@ -2205,6 +3099,8 @@ mod tests {
             seen: false,
             folder: "INBOX".to_string(),
             starred: false,
+            thread_id: String::new(),
+            message_id: String::new(),
         };
         let to = reply_all_to(&msg, "w33d@w33d.xyz");
         assert!(to.contains("alice@ex.com"));

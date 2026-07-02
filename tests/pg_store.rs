@@ -26,7 +26,7 @@ async fn pg_store_full_integration() {
     pg.migrate().await.expect("migrate idempotent");
 
     // Clean slate.
-    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "mailboxes"] {
+    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "send_identities", "contacts", "labels", "message_labels", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
 
@@ -57,6 +57,8 @@ async fn pg_store_full_integration() {
         seen: false,
         folder: "INBOX".into(),
         starred: false,
+        thread_id: String::new(),
+        message_id: String::new(),
     };
     pg.store_message(&msg).await.unwrap();
 
@@ -156,6 +158,7 @@ async fn pg_store_full_integration() {
         needle: needle.into(),
         action: action.into(),
         target_folder: folder.map(str::to_string),
+        target_label: None,
         enabled: true,
         created_at: now,
     };
@@ -208,10 +211,127 @@ async fn pg_store_full_integration() {
         "window elapsed -> allowed again"
     );
 
-    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "mailboxes"] {
+    // --- conversation threading ----------------------------------------------
+    // Fresh mailbox so the earlier Archive-moved rows don't interfere.
+    pg.upsert_mailbox(&Mailbox { addr: "thr@w33d.xyz".into(), owner_sub: "thr".into() }).await.unwrap();
+    let thr = |id: &str, tid: &str, mid: &str, subj: &str, at: i64| Message {
+        id: id.into(),
+        mailbox: "thr@w33d.xyz".into(),
+        msg_from: "peer@example.com".into(),
+        msg_to: "thr@w33d.xyz".into(),
+        subject: subj.into(),
+        raw_rfc822: "raw".into(),
+        body_text: "b".into(),
+        body_html: String::new(),
+        received_at: at,
+        seen: false,
+        folder: "INBOX".into(),
+        starred: false,
+        thread_id: tid.into(),
+        message_id: mid.into(),
+    };
+    pg.store_message(&thr("t_root", "<root@ex>", "<root@ex>", "Deploy", now)).await.unwrap();
+    pg.store_message(&thr("t_reply", "<root@ex>", "<reply@ex>", "Re: Deploy", now + 1)).await.unwrap();
+    pg.store_message(&thr("t_other", "subj:lunch", "<lunch@ex>", "Lunch", now + 2)).await.unwrap();
+
+    // A reference to the root (or the reply) resolves to the shared thread id.
+    assert_eq!(
+        pg.find_thread_for_refs("thr@w33d.xyz", &["<reply@ex>".into()]).await.unwrap().as_deref(),
+        Some("<root@ex>"),
+        "matches an existing message_id -> its thread_id"
+    );
+    assert!(pg.find_thread_for_refs("thr@w33d.xyz", &["<unknown@ex>".into()]).await.unwrap().is_none());
+
+    let convos = pg.list_folder_threads("thr@w33d.xyz", "INBOX", None, 50).await.unwrap();
+    assert_eq!(convos.len(), 2, "Deploy thread (2) + Lunch (1)");
+    assert_eq!(convos[0].thread_id, "subj:lunch", "newest activity first");
+    assert_eq!(convos[0].count, 1);
+    let deploy = convos.iter().find(|c| c.thread_id == "<root@ex>").unwrap();
+    assert_eq!(deploy.count, 2);
+    assert_eq!(deploy.unseen, 2);
+    assert!(deploy.latest.subject.contains("Re: Deploy"), "representative is the newest");
+    let msgs = pg.list_thread("thr@w33d.xyz", "<root@ex>", 50).await.unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].id, "t_root", "oldest first");
+
+    // --- send identities -----------------------------------------------------
+    use corvid::model::SendIdentity;
+    pg.add_send_identity(&SendIdentity { id: "si1".into(), mailbox: "w33d@w33d.xyz".into(), from_addr: "info@w33d.xyz".into(), display_name: "Info".into(), is_default: true }).await.unwrap();
+    pg.add_send_identity(&SendIdentity { id: "si2".into(), mailbox: "w33d@w33d.xyz".into(), from_addr: "sales@w33d.xyz".into(), display_name: String::new(), is_default: false }).await.unwrap();
+    let ids = pg.list_send_identities("w33d@w33d.xyz").await.unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0].id, "si1", "default first");
+    // Scoped get: only the owning mailbox resolves it.
+    assert!(pg.get_send_identity("w33d@w33d.xyz", "si1").await.unwrap().is_some());
+    assert!(pg.get_send_identity("alice@w33d.xyz", "si1").await.unwrap().is_none(), "cross-mailbox get denied");
+    pg.delete_send_identity("alice@w33d.xyz", "si1").await.unwrap();
+    assert_eq!(pg.list_send_identities("w33d@w33d.xyz").await.unwrap().len(), 2, "scoped delete is a no-op");
+    pg.delete_send_identity("w33d@w33d.xyz", "si2").await.unwrap();
+    assert_eq!(pg.list_send_identities("w33d@w33d.xyz").await.unwrap().len(), 1);
+
+    // --- contacts ------------------------------------------------------------
+    pg.upsert_contact("w33d@w33d.xyz", "Freq@Example.com", "Freq", false).await.unwrap();
+    pg.upsert_contact("w33d@w33d.xyz", "freq@example.com", "", false).await.unwrap(); // bumps seen_count; keeps name
+    pg.upsert_contact("w33d@w33d.xyz", "rare@example.com", "", false).await.unwrap();
+    pg.upsert_contact("w33d@w33d.xyz", "vip@example.com", "VIP", true).await.unwrap();
+    let sug = pg.suggest_contacts("w33d@w33d.xyz", "example.com", 10).await.unwrap();
+    assert_eq!(sug.len(), 3);
+    assert_eq!(sug[0].addr, "vip@example.com", "manual first");
+    assert!(sug[0].manual);
+    assert_eq!(sug[1].addr, "freq@example.com", "then by frequency");
+    assert_eq!(sug[1].seen_count, 2, "second harvest bumped the count");
+    assert_eq!(sug[1].name, "Freq", "blank harvest name never clobbers");
+    assert!(pg.suggest_contacts("alice@w33d.xyz", "example.com", 10).await.unwrap().is_empty(), "scoped");
+    // A LIKE metacharacter is literal in the query.
+    assert!(pg.suggest_contacts("w33d@w33d.xyz", "%", 10).await.unwrap().is_empty());
+    pg.delete_contact("w33d@w33d.xyz", "vip@example.com").await.unwrap();
+    assert_eq!(pg.suggest_contacts("w33d@w33d.xyz", "example.com", 10).await.unwrap().len(), 2);
+
+    // --- labels + assignments ------------------------------------------------
+    use corvid::model::Label;
+    pg.add_label(&Label { id: "lbl1".into(), mailbox: "w33d@w33d.xyz".into(), name: "Receipts".into(), color: String::new() }).await.unwrap();
+    // A message in w33d's mailbox to tag (the earlier `msg` was moved to Archive but still owned).
+    pg.assign_label("w33d@w33d.xyz", &msg.id, "lbl1").await.unwrap();
+    pg.assign_label("w33d@w33d.xyz", &msg.id, "lbl1").await.unwrap(); // idempotent
+    let on = pg.labels_for_message("w33d@w33d.xyz", &msg.id).await.unwrap();
+    assert_eq!(on.len(), 1);
+    assert_eq!(on[0].name, "Receipts");
+    let by = pg.list_by_label("w33d@w33d.xyz", "lbl1", None, 10).await.unwrap();
+    assert_eq!(by.len(), 1);
+    assert_eq!(by[0].id, msg.id);
+    // Ownership: a foreign mailbox's assign is a no-op; foreign message rejected too.
+    pg.assign_label("alice@w33d.xyz", &msg.id, "lbl1").await.unwrap();
+    assert!(pg.labels_for_message("alice@w33d.xyz", &msg.id).await.unwrap().is_empty());
+    // Remove one assignment; deleting the label cascades to the join.
+    pg.remove_label("w33d@w33d.xyz", &msg.id, "lbl1").await.unwrap();
+    assert!(pg.labels_for_message("w33d@w33d.xyz", &msg.id).await.unwrap().is_empty());
+    pg.assign_label("w33d@w33d.xyz", &msg.id, "lbl1").await.unwrap();
+    pg.delete_label("w33d@w33d.xyz", "lbl1").await.unwrap();
+    assert!(pg.list_labels("w33d@w33d.xyz").await.unwrap().is_empty());
+    assert!(pg.list_by_label("w33d@w33d.xyz", "lbl1", None, 10).await.unwrap().is_empty(), "label delete cascaded");
+
+    // A label-action filter rule round-trips its target_label.
+    let lbl_rule = FilterRule {
+        id: new_id("fr"),
+        mailbox: "w33d@w33d.xyz".into(),
+        position: 5,
+        field: "from".into(),
+        op: "contains".into(),
+        needle: "biller".into(),
+        action: "label".into(),
+        target_folder: None,
+        target_label: Some("lblZ".into()),
+        enabled: true,
+        created_at: now,
+    };
+    pg.add_rule(&lbl_rule).await.unwrap();
+    let loaded = pg.list_rules("w33d@w33d.xyz").await.unwrap();
+    assert!(loaded.iter().any(|r| r.action == "label" && r.target_label.as_deref() == Some("lblZ")));
+
+    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "send_identities", "contacts", "labels", "message_labels", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
-    println!("PG STORE INTEGRATION OK: mailboxes + messages (seen) + outbound queue (rcpts/reschedule/sent) + rules/settings/auto-reply");
+    println!("PG STORE INTEGRATION OK: mailboxes + messages + threading + identities + contacts + labels + rules/settings/auto-reply");
 }
 
 async fn sqlx_delete(url: &str, table: &str) {

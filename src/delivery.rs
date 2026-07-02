@@ -17,7 +17,7 @@ use crate::model::{FilterRule, MailboxSettings, Message};
 use crate::relay;
 use crate::rfc822;
 use crate::store::{Store, StoreError};
-use crate::util::{email_date, message_id, now_secs};
+use crate::util::{email_date, message_id, new_id, now_secs};
 
 /// Deliver one accepted inbound message: apply the mailbox's filter rules, store the (possibly
 /// adjusted) message, then run the auto-reply responder. A storage failure propagates (the SMTP
@@ -30,7 +30,14 @@ pub async fn process_inbound(
     msg: Message,
 ) -> Result<(), StoreError> {
     let mut msg = msg;
+    // Conversation threading: compute the message's own Message-ID + its thread id from the raw
+    // source BEFORE storage (the delivery hook, kept surgical — one helper call).
+    let (mid, tid) = resolve_thread(store, &msg.mailbox, &msg.raw_rfc822, &msg.subject).await?;
+    msg.message_id = mid;
+    msg.thread_id = tid;
+
     let rules = store.list_rules(&msg.mailbox).await?;
+    let mut labelled: Option<String> = None;
     if let Some(rule) = first_match(&rules, &msg) {
         tracing::info!(
             target: "corvid::audit",
@@ -51,12 +58,137 @@ pub async fn process_inbound(
             }
             "star" => msg.starred = true,
             "markread" => msg.seen = true,
+            // "add label": applied AFTER storage (the join references the stored message id).
+            "label" => labelled = rule.target_label.clone().filter(|l| !l.is_empty()),
             _ => {}
         }
     }
     store.store_message(&msg).await?;
+    if let Some(label_id) = labelled {
+        // Best effort: a stale/deleted label just no-ops (store enforces ownership).
+        if let Err(e) = store.assign_label(&msg.mailbox, &msg.id, &label_id).await {
+            tracing::warn!(error = %e, mailbox = %msg.mailbox, "filter label assignment failed");
+        }
+    }
+    // Harvest the inbound correspondent(s) into the mailbox's contacts (autocomplete). Best effort.
+    harvest_contacts(store, &msg.mailbox, &msg.msg_from, "").await;
     maybe_auto_reply(store, signer, mail_domain, env_from, &msg).await;
     Ok(())
+}
+
+/// Resolve `(own_message_id, thread_id)` for a message from its raw source + subject. Threading
+/// follows the `References`/`In-Reply-To` chain (adopting an existing conversation when any
+/// referenced id is already known), falling back to the normalised `Subject` when no thread headers
+/// are present. Pure except for the store lookup used to link to an existing thread.
+pub async fn resolve_thread(
+    store: &dyn Store,
+    mailbox: &str,
+    raw: &str,
+    subject: &str,
+) -> Result<(String, String), StoreError> {
+    let (hb, _) = rfc822::split_headers_body(raw);
+    let hdrs = rfc822::parse_headers(hb);
+    let own_mid = rfc822::header(&hdrs, "message-id").unwrap_or_default().trim().to_string();
+    let refs = reference_ids(&hdrs);
+
+    // Include our own Message-ID so a reply that arrived before its original still links up when the
+    // original lands (the earlier reply already carries the shared thread id).
+    let mut lookup: Vec<String> = refs.clone();
+    if !own_mid.is_empty() {
+        lookup.push(own_mid.clone());
+    }
+    if !lookup.is_empty() {
+        if let Some(tid) = store.find_thread_for_refs(mailbox, &lookup).await? {
+            return Ok((own_mid, tid));
+        }
+    }
+    // No existing thread matched: root a References/In-Reply-To chain at its earliest reference.
+    if let Some(root) = refs.first() {
+        return Ok((own_mid, root.clone()));
+    }
+    // No thread headers at all -> group by normalised subject (deterministic `subj:` key).
+    let norm = normalize_subject(subject);
+    if !norm.is_empty() {
+        return Ok((own_mid, format!("subj:{norm}")));
+    }
+    // Degenerate: no headers and no subject — the message is its own thread.
+    let tid = if own_mid.is_empty() { new_id("t") } else { own_mid.clone() };
+    Ok((own_mid, tid))
+}
+
+/// The `Message-ID`s a message references, earliest (root) first: every token of `References`
+/// followed by `In-Reply-To`, de-duplicated. Each `<...>` angle-addr is kept verbatim (trimmed).
+pub fn reference_ids(hdrs: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_tokens = |v: &str| {
+        for tok in v.split_whitespace() {
+            let tok = tok.trim();
+            if tok.starts_with('<') && tok.ends_with('>') && tok.len() > 2 && !out.iter().any(|e| e == tok) {
+                out.push(tok.to_string());
+            }
+        }
+    };
+    if let Some(refs) = rfc822::header(hdrs, "references") {
+        push_tokens(&refs);
+    }
+    if let Some(irt) = rfc822::header(hdrs, "in-reply-to") {
+        push_tokens(&irt);
+    }
+    out
+}
+
+/// Normalise a subject for the header-absent threading fallback: strip any run of leading
+/// `Re:`/`Fwd:`/`Fw:` prefixes (case-insensitive), collapse internal whitespace, lowercase, trim.
+pub fn normalize_subject(subject: &str) -> String {
+    let mut s = subject.trim();
+    loop {
+        let low = s.to_ascii_lowercase();
+        let stripped = if let Some(r) = low.strip_prefix("re:") {
+            &s[s.len() - r.len()..]
+        } else if let Some(r) = low.strip_prefix("fwd:") {
+            &s[s.len() - r.len()..]
+        } else if let Some(r) = low.strip_prefix("fw:") {
+            &s[s.len() - r.len()..]
+        } else {
+            break;
+        };
+        s = stripped.trim_start();
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Harvest correspondents from a message's `From`/`To` header strings into the mailbox's contacts
+/// (skips the mailbox's own address). Best effort — a store failure is logged, never propagated.
+pub async fn harvest_contacts(store: &dyn Store, mailbox: &str, from: &str, to: &str) {
+    for field in [from, to] {
+        for part in field.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (name, addr) = split_name_addr(part);
+            let addr_l = addr.to_lowercase();
+            if !addr_l.contains('@') || addr_l.eq_ignore_ascii_case(mailbox) {
+                continue;
+            }
+            if let Err(e) = store.upsert_contact(mailbox, &addr_l, &name, false).await {
+                tracing::warn!(error = %e, mailbox, "contact harvest failed");
+            }
+        }
+    }
+}
+
+/// Split a `Name <addr>` (or bare `addr`) correspondent into `(display_name, address)`.
+fn split_name_addr(s: &str) -> (String, String) {
+    let s = s.trim();
+    if let Some(lt) = s.find('<') {
+        if let Some(gt) = s[lt..].find('>') {
+            let addr = s[lt + 1..lt + gt].trim().to_string();
+            let name = s[..lt].trim().trim_matches('"').trim().to_string();
+            return (name, addr);
+        }
+    }
+    (String::new(), s.to_string())
 }
 
 /// The first ENABLED rule (position order) matching `msg`, if any — first match wins.
@@ -217,6 +349,8 @@ mod tests {
             seen: false,
             folder: "INBOX".to_string(),
             starred: false,
+            thread_id: String::new(),
+            message_id: String::new(),
         }
     }
 
@@ -230,6 +364,7 @@ mod tests {
             needle: needle.to_string(),
             action: "star".to_string(),
             target_folder: None,
+            target_label: None,
             enabled: true,
             created_at: 0,
         }

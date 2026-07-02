@@ -481,6 +481,9 @@ impl Session {
                 seen: false,
                 folder: "INBOX".to_string(),
                 starred: false,
+                // Threading is computed inside the delivery hook (keeps this path surgical).
+                thread_id: String::new(),
+                message_id: String::new(),
             };
             // Delivery-time pipeline (filter rules + auto-reply), then storage — one call keeps
             // this path surgical. `from` is the envelope return-path the responder guards on.

@@ -37,6 +37,7 @@ fn rule(field: &str, op: &str, needle: &str, action: &str, folder: Option<&str>)
         needle: needle.to_string(),
         action: action.to_string(),
         target_folder: folder.map(str::to_string),
+        target_label: None,
         enabled: true,
         created_at: now_secs(),
     }
@@ -327,6 +328,8 @@ async fn signature_prefills_compose_and_reply() {
         seen: false,
         folder: "INBOX".to_string(),
         starred: false,
+        thread_id: String::new(),
+        message_id: String::new(),
     };
     state.store.store_message(&msg).await.unwrap();
     let req = Request::builder()

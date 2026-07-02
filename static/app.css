@@ -371,3 +371,36 @@ input::placeholder, textarea::placeholder { color:var(--ink-4); }
   .msg-meta { grid-template-columns:1fr; gap:2px; }
   .msg-meta b { margin-top:6px; }
 }
+
+/* ---- Conversation threading -------------------------------------------- */
+/* Reuses .pill; a compact count badge on collapsed conversation rows + the convo header. */
+.thread-count { background:var(--accent-soft); color:var(--accent-ink); margin-right:2px; }
+.convo-msg { margin-bottom:14px; }
+.convo-msg + .convo-msg { margin-top:0; }
+
+/* ---- Labels ------------------------------------------------------------- */
+/* Label pills in the tab strip + on messages; reuses .pill sizing. */
+.label-pill { background:var(--surface-3); color:var(--ink-2); }
+a.label-pill:hover { color:var(--accent-ink); }
+.msg-labels { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+.label-chip { display:inline-flex; align-items:center; gap:2px; }
+.label-chip .label-x {
+  border:none; background:none; cursor:pointer; color:var(--ink-3); font-size:15px; line-height:1;
+  padding:0 2px; border-radius:var(--r-xs);
+}
+.label-chip .label-x:hover { color:var(--down-ink); background:var(--down-soft); }
+
+/* ---- To/Cc autocomplete combobox --------------------------------------- */
+.combo { position:relative; }
+.combo__list {
+  list-style:none; margin:4px 0 0; padding:4px; position:absolute; z-index:20; left:0; right:0;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm);
+  box-shadow:var(--sh-pop); max-height:260px; overflow:auto;
+}
+.combo__opt {
+  display:flex; align-items:baseline; gap:8px; padding:7px 10px; border-radius:var(--r-xs);
+  cursor:pointer; font-size:13px;
+}
+.combo__opt.is-active, .combo__opt:hover { background:var(--accent-soft); }
+.combo__addr { color:var(--ink); font-weight:550; }
+.combo__name { color:var(--ink-3); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
