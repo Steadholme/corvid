@@ -21,6 +21,8 @@
 //! - `filter_rules(id TEXT PK, mailbox TEXT, position BIGINT, field TEXT, op TEXT, needle TEXT,
 //!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
+//! - `sender_lists(id TEXT PK, user TEXT, address_or_domain TEXT, kind TEXT, created_at BIGINT)`
+//! - `spam_annotations(message_id TEXT PK, mailbox TEXT, score BIGINT, reason TEXT)`
 //! - settings columns on `mailboxes` (signature, auto_reply_*), added idempotently.
 
 use std::sync::Mutex;
@@ -31,7 +33,7 @@ use thiserror::Error;
 use crate::model::{
     Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
     OutboundItem, SearchPredicate, SearchPredicateKind, SearchQuery, SearchState, SendIdentity,
-    ThreadSummary,
+    SenderListEntry, SpamAnnotation, ThreadSummary,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -274,6 +276,29 @@ pub trait Store: Send + Sync {
         before: Option<(i64, String)>,
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError>;
+
+    // --- Spam controls ---------------------------------------------------------
+    /// Every safe/blocked sender entry for a mailbox, ordered by kind then address/domain.
+    async fn list_sender_lists(&self, mailbox: &str) -> Result<Vec<SenderListEntry>, StoreError>;
+    /// Idempotently add a safe/blocked sender entry. Adding one kind removes the opposite kind for
+    /// the same address/domain so safe-vs-blocked conflicts do not accumulate.
+    async fn upsert_sender_list(&self, entry: &SenderListEntry) -> Result<(), StoreError>;
+    /// Delete one safe/blocked sender entry, scoped to `mailbox`.
+    async fn delete_sender_list(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
+    /// Store/update a spam score explanation for a message.
+    async fn set_spam_annotation(&self, annotation: &SpamAnnotation) -> Result<(), StoreError>;
+    /// Fetch the spam score explanation for a message, scoped to `mailbox`.
+    async fn spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<Option<SpamAnnotation>, StoreError>;
+    /// Remove a spam score explanation for a message, scoped to `mailbox`.
+    async fn delete_spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<(), StoreError>;
 }
 
 // --------------------------------------------------------------------------------------
@@ -296,6 +321,8 @@ pub struct InMemoryStore {
     labels: Mutex<Vec<Label>>,
     /// Message↔label assignments: `(mailbox, message_id, label_id)`.
     message_labels: Mutex<Vec<(String, String, String)>>,
+    sender_lists: Mutex<Vec<SenderListEntry>>,
+    spam_annotations: Mutex<Vec<SpamAnnotation>>,
 }
 
 impl InMemoryStore {
@@ -320,6 +347,7 @@ fn summary(m: &Message) -> MessageSummary {
         received_at: m.received_at,
         seen: m.seen,
         starred: m.starred,
+        folder: m.folder.clone(),
     }
 }
 
@@ -1254,6 +1282,96 @@ impl Store for InMemoryStore {
         v.truncate(limit.max(0) as usize);
         Ok(v.iter().map(summary).collect())
     }
+
+    async fn list_sender_lists(&self, mailbox: &str) -> Result<Vec<SenderListEntry>, StoreError> {
+        let mut v: Vec<SenderListEntry> = self
+            .sender_lists
+            .lock()
+            .expect("sender_lists lock poisoned")
+            .iter()
+            .filter(|e| e.user == mailbox)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| {
+            a.kind
+                .cmp(&b.kind)
+                .then_with(|| a.address_or_domain.cmp(&b.address_or_domain))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(v)
+    }
+
+    async fn upsert_sender_list(&self, entry: &SenderListEntry) -> Result<(), StoreError> {
+        let mut v = self
+            .sender_lists
+            .lock()
+            .expect("sender_lists lock poisoned");
+        v.retain(|e| {
+            !(e.user == entry.user
+                && e.address_or_domain == entry.address_or_domain
+                && e.kind != entry.kind)
+        });
+        if let Some(existing) = v.iter_mut().find(|e| {
+            e.user == entry.user
+                && e.address_or_domain == entry.address_or_domain
+                && e.kind == entry.kind
+        }) {
+            existing.created_at = entry.created_at;
+        } else {
+            v.push(entry.clone());
+        }
+        Ok(())
+    }
+
+    async fn delete_sender_list(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        self.sender_lists
+            .lock()
+            .expect("sender_lists lock poisoned")
+            .retain(|e| !(e.user == mailbox && e.id == id));
+        Ok(())
+    }
+
+    async fn set_spam_annotation(&self, annotation: &SpamAnnotation) -> Result<(), StoreError> {
+        let mut v = self
+            .spam_annotations
+            .lock()
+            .expect("spam_annotations lock poisoned");
+        if let Some(existing) = v
+            .iter_mut()
+            .find(|a| a.mailbox == annotation.mailbox && a.message_id == annotation.message_id)
+        {
+            *existing = annotation.clone();
+        } else {
+            v.push(annotation.clone());
+        }
+        Ok(())
+    }
+
+    async fn spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<Option<SpamAnnotation>, StoreError> {
+        Ok(self
+            .spam_annotations
+            .lock()
+            .expect("spam_annotations lock poisoned")
+            .iter()
+            .find(|a| a.mailbox == mailbox && a.message_id == message_id)
+            .cloned())
+    }
+
+    async fn delete_spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<(), StoreError> {
+        self.spam_annotations
+            .lock()
+            .expect("spam_annotations lock poisoned")
+            .retain(|a| !(a.mailbox == mailbox && a.message_id == message_id));
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -1449,6 +1567,45 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS sender_lists (\
+                 id TEXT PRIMARY KEY, \
+                 \"user\" TEXT NOT NULL, \
+                 address_or_domain TEXT NOT NULL, \
+                 kind TEXT NOT NULL, \
+                 created_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sender_lists_unique \
+             ON sender_lists (\"user\", address_or_domain, kind)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_sender_lists_user \
+             ON sender_lists (\"user\", kind, address_or_domain)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS spam_annotations (\
+                 message_id TEXT PRIMARY KEY, \
+                 mailbox TEXT NOT NULL, \
+                 score BIGINT NOT NULL DEFAULT 0, \
+                 reason TEXT NOT NULL DEFAULT ''\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_spam_annotations_mailbox \
+             ON spam_annotations (mailbox, message_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         // User-defined labels + the message↔label join (labels are orthogonal to folders).
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS labels (\
@@ -1610,6 +1767,27 @@ impl PgStore {
             color: row.try_get("color")?,
         })
     }
+
+    fn sender_list_from_row(row: &sqlx::postgres::PgRow) -> Result<SenderListEntry, sqlx::Error> {
+        Ok(SenderListEntry {
+            id: row.try_get("id")?,
+            user: row.try_get("user")?,
+            address_or_domain: row.try_get("address_or_domain")?,
+            kind: row.try_get("kind")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn spam_annotation_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<SpamAnnotation, sqlx::Error> {
+        Ok(SpamAnnotation {
+            mailbox: row.try_get("mailbox")?,
+            message_id: row.try_get("message_id")?,
+            score: row.try_get("score")?,
+            reason: row.try_get("reason")?,
+        })
+    }
 }
 
 #[async_trait]
@@ -1730,7 +1908,7 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
              WHERE mailbox = $1 ORDER BY received_at DESC, id DESC LIMIT $2",
         )
         .bind(mailbox)
@@ -1753,7 +1931,7 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
              WHERE mailbox = $1 AND folder = $2 \
                AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
              ORDER BY received_at DESC, id DESC LIMIT $5",
@@ -1780,7 +1958,7 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred FROM messages \
+            "SELECT id, msg_from, subject, received_at, seen, starred, folder FROM messages \
              WHERE mailbox = $1 AND starred = TRUE \
                AND (received_at < $2 OR (received_at = $2 AND id < $3)) \
              ORDER BY received_at DESC, id DESC LIMIT $4",
@@ -1808,7 +1986,7 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let mut sql =
-            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred FROM messages m WHERE m.mailbox = $1");
+            String::from("SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder FROM messages m WHERE m.mailbox = $1");
         let mut binds = Vec::new();
         let mut next_param = 2_usize;
 
@@ -2209,7 +2387,7 @@ impl Store for PgStore {
         // keyset-paginated on that representative's (received_at, id). Correlated COUNTs give the
         // thread size + unread tally. All standard SQL (|| concat, NULLIF/COALESCE, subqueries).
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, \
+            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder, \
                     COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id) AS gk, \
                     (SELECT COUNT(*) FROM messages c WHERE c.mailbox = m.mailbox AND c.folder = m.folder \
                        AND COALESCE(NULLIF(c.thread_id, ''), 'm:' || c.id) = COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id)) AS cnt, \
@@ -2518,7 +2696,7 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred \
+            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.folder \
              FROM messages m JOIN message_labels ml ON ml.message_id = m.id \
              WHERE m.mailbox = $1 AND ml.mailbox = $1 AND ml.label_id = $2 \
                AND (m.received_at < $3 OR (m.received_at = $3 AND m.id < $4)) \
@@ -2537,9 +2715,114 @@ impl Store for PgStore {
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(backend)
     }
+
+    async fn list_sender_lists(&self, mailbox: &str) -> Result<Vec<SenderListEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, \"user\", address_or_domain, kind, created_at FROM sender_lists \
+             WHERE \"user\" = $1 ORDER BY kind ASC, address_or_domain ASC, id ASC",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::sender_list_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn upsert_sender_list(&self, entry: &SenderListEntry) -> Result<(), StoreError> {
+        sqlx::query(
+            "DELETE FROM sender_lists \
+             WHERE \"user\" = $1 AND address_or_domain = $2 AND kind <> $3",
+        )
+        .bind(&entry.user)
+        .bind(&entry.address_or_domain)
+        .bind(&entry.kind)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        sqlx::query(
+            "INSERT INTO sender_lists (id, \"user\", address_or_domain, kind, created_at) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (\"user\", address_or_domain, kind) \
+             DO UPDATE SET created_at = EXCLUDED.created_at",
+        )
+        .bind(&entry.id)
+        .bind(&entry.user)
+        .bind(&entry.address_or_domain)
+        .bind(&entry.kind)
+        .bind(entry.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_sender_list(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM sender_lists WHERE \"user\" = $1 AND id = $2")
+            .bind(mailbox)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_spam_annotation(&self, annotation: &SpamAnnotation) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO spam_annotations (message_id, mailbox, score, reason) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (message_id) DO UPDATE SET \
+               mailbox = EXCLUDED.mailbox, score = EXCLUDED.score, reason = EXCLUDED.reason",
+        )
+        .bind(&annotation.message_id)
+        .bind(&annotation.mailbox)
+        .bind(annotation.score)
+        .bind(&annotation.reason)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<Option<SpamAnnotation>, StoreError> {
+        let row = sqlx::query(
+            "SELECT message_id, mailbox, score, reason FROM spam_annotations \
+             WHERE mailbox = $1 AND message_id = $2",
+        )
+        .bind(mailbox)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.as_ref()
+            .map(Self::spam_annotation_from_row)
+            .transpose()
+            .map_err(backend)
+    }
+
+    async fn delete_spam_annotation(
+        &self,
+        mailbox: &str,
+        message_id: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM spam_annotations WHERE mailbox = $1 AND message_id = $2")
+            .bind(mailbox)
+            .bind(message_id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
 }
 
-/// Map a summary row (id, msg_from, subject, received_at, seen, starred) into a [`MessageSummary`].
+/// Map a summary row (id, msg_from, subject, received_at, seen, starred, folder) into a
+/// [`MessageSummary`].
 fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::Error> {
     Ok(MessageSummary {
         id: r.try_get("id")?,
@@ -2548,6 +2831,7 @@ fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::E
         received_at: r.try_get("received_at")?,
         seen: r.try_get("seen")?,
         starred: r.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
+        folder: r.try_get("folder")?,
     })
 }
 
@@ -2724,5 +3008,54 @@ mod tests {
             ["m_a", "m_z"],
             "same-ts rows tie-break on id, older ts always kept"
         );
+    }
+
+    #[tokio::test]
+    async fn sender_lists_replace_opposite_kind_and_annotations_roundtrip() {
+        let store = InMemoryStore::new();
+        let blocked = SenderListEntry {
+            id: "sl_block".to_string(),
+            user: "w33d@w33d.xyz".to_string(),
+            address_or_domain: "bad.example".to_string(),
+            kind: "blocked".to_string(),
+            created_at: 1,
+        };
+        store.upsert_sender_list(&blocked).await.unwrap();
+        assert_eq!(
+            store.list_sender_lists("w33d@w33d.xyz").await.unwrap(),
+            vec![blocked.clone()]
+        );
+
+        let safe = SenderListEntry {
+            id: "sl_safe".to_string(),
+            user: "w33d@w33d.xyz".to_string(),
+            address_or_domain: "bad.example".to_string(),
+            kind: "safe".to_string(),
+            created_at: 2,
+        };
+        store.upsert_sender_list(&safe).await.unwrap();
+        let entries = store.list_sender_lists("w33d@w33d.xyz").await.unwrap();
+        assert_eq!(entries, vec![safe.clone()], "opposite kind is replaced");
+
+        let annotation = SpamAnnotation {
+            mailbox: "w33d@w33d.xyz".to_string(),
+            message_id: "m_1".to_string(),
+            score: 6,
+            reason: "SPF fail; DKIM fail".to_string(),
+        };
+        store.set_spam_annotation(&annotation).await.unwrap();
+        assert_eq!(
+            store.spam_annotation("w33d@w33d.xyz", "m_1").await.unwrap(),
+            Some(annotation)
+        );
+        store
+            .delete_spam_annotation("w33d@w33d.xyz", "m_1")
+            .await
+            .unwrap();
+        assert!(store
+            .spam_annotation("w33d@w33d.xyz", "m_1")
+            .await
+            .unwrap()
+            .is_none());
     }
 }

@@ -7,7 +7,7 @@
 //!
 //! Views:
 //! - `GET /healthz`  liveness (container HEALTHCHECK)
-//! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts`, newest first: from / subject / date)
+//! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts|Spam`, newest first: from / subject / date)
 //!                   or `?q=` full-text search (subject/from/to/body, optional `?folder=` scope);
 //!                   both keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
@@ -31,15 +31,23 @@ use time::OffsetDateTime;
 
 use crate::model::{
     parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, SearchQuery,
+    SenderListEntry, SpamAnnotation,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
 
 /// The real (column-backed) folders the webmail surfaces: INBOX for received mail, the two
-/// locally-authored ones, plus Archive/Trash that message actions move mail into. These are the
-/// legal targets for a move and the values stored in `Message.folder`.
-const FOLDERS: [&str; 5] = ["INBOX", "Sent", "Drafts", "Archive", "Trash"];
+/// locally-authored ones, plus Archive/Spam/Trash that message actions move mail into. These are
+/// the legal targets for a move and the values stored in `Message.folder`.
+const FOLDERS: [&str; 6] = [
+    "INBOX",
+    "Sent",
+    "Drafts",
+    "Archive",
+    crate::delivery::SPAM_FOLDER,
+    "Trash",
+];
 
 /// A virtual, cross-folder view of the starred/flagged messages. Selected via `?folder=Starred`
 /// but never stored in `Message.folder`.
@@ -156,9 +164,9 @@ window.__corvidToast = function (msg, kind) {
 
 /// Webmail progressive-enhancement layer (inbox list + read/conversation views). Everything here
 /// is ADDITIVE: with JS off, the original `<form>` POSTs still work. It provides:
-/// - optimistic per-message actions (star / mark-read / archive / delete / move) via `fetch()` to
+/// - optimistic per-message actions (star / mark-read / archive / spam / delete / move) via `fetch()` to
 ///   the JSON siblings of the form routes, rolling back + toasting on failure;
-/// - checkbox multi-select + a sticky bulk toolbar (mark-read / archive / move / delete);
+/// - checkbox multi-select + a sticky bulk toolbar (mark-read / archive / spam / move / delete);
 /// - keyboard nav (j/k prev-next, e archive, # delete, r reply, x select, Enter open);
 /// - collapse/expand for older messages in a conversation.
 ///
@@ -229,7 +237,7 @@ const WEBMAIL_JS: &str = r#"
         }).catch(function () { applyToggle(row, form, inverse(op)); toast('Action failed', 'err'); });
         return;
       }
-      if (op === 'archive' || op === 'delete' || op === 'move') {
+      if (op === 'archive' || op === 'delete' || op === 'move' || op === 'report_spam' || op === 'not_spam') {
         var folder = op === 'move' ? field(form, 'folder') : '';
         if (op === 'move' && !folder) { e.preventDefault(); toast('Choose a folder to move to', 'err'); return; }
         if (inList && row) {
@@ -237,7 +245,7 @@ const WEBMAIL_JS: &str = r#"
           var parent = row.parentNode, next = row.nextSibling;
           row.remove();
           post(url, { csrf: field(form, 'csrf'), op: op, folder: folder }).then(function (ok) {
-            if (ok) { toast(op === 'delete' ? 'Moved to Trash' : op === 'archive' ? 'Archived' : 'Moved', 'ok'); }
+            if (ok) { toast(op === 'delete' ? 'Moved to Trash' : op === 'archive' ? 'Archived' : op === 'report_spam' ? 'Reported spam' : op === 'not_spam' ? 'Moved to Inbox' : 'Moved', 'ok'); }
             else { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); }
           }).catch(function () { if (next) parent.insertBefore(row, next); else parent.appendChild(row); toast('Action failed', 'err'); });
         }
@@ -283,7 +291,7 @@ const WEBMAIL_JS: &str = r#"
         var det = rows.map(function (r) { return { row: r, parent: r.parentNode, next: r.nextSibling }; });
         det.forEach(function (d) { d.row.remove(); });
         post('/api/m/bulk', { csrf: csrf, op: op, folder: folder, ids: ids.join(',') }).then(function (ok) {
-          if (ok) { toast(ids.length + ' ' + (op === 'delete' ? 'deleted' : op === 'archive' ? 'archived' : 'moved'), 'ok'); clearAll(); }
+          if (ok) { toast(ids.length + ' ' + (op === 'delete' ? 'deleted' : op === 'archive' ? 'archived' : op === 'report_spam' ? 'reported spam' : op === 'not_spam' ? 'moved to Inbox' : 'moved'), 'ok'); clearAll(); }
           else { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); }
         }).catch(function () { det.forEach(function (d) { if (d.next) d.parent.insertBefore(d.row, d.next); else d.parent.appendChild(d.row); }); toast('Bulk action failed', 'err'); });
       });
@@ -510,6 +518,7 @@ pub fn app(state: AppState) -> Router {
         .route("/settings/identities", post(settings_identities_post))
         .route("/settings/labels", post(settings_labels_post))
         .route("/settings/contacts", post(settings_contacts_post))
+        .route("/settings/senders", post(settings_senders_post))
         .merge(admin)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
@@ -851,8 +860,8 @@ async fn inbox(
 }
 
 /// Render one inbox/search row: the message link plus a per-row action form (star, mark-unread,
-/// archive, delete, move-to-folder). `token` is the CSRF token; `return_to` is where each action
-/// redirects back to.
+/// archive, spam/not-spam, delete, move-to-folder). `token` is the CSRF token; `return_to` is where
+/// each action redirects back to.
 fn render_row(m: &crate::model::MessageSummary, token: &str, return_to: &str) -> String {
     render_row_inner(m, token, return_to, None)
 }
@@ -888,13 +897,14 @@ fn render_row_inner(
         .unwrap_or_else(|| esc(&from_display));
     let star = star_mark(m.starred);
     format!(
-        r#"<li class="mailrow-wrap" data-id="{id}" data-starred="{starred}" data-seen="{seen}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {folder_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls}" href="/m/{id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         starred = m.starred,
         seen = m.seen,
+        folder_cls = folder_class(&m.folder),
         from = from,
         date = fmt_date(m.received_at),
-        actions = row_actions(&m.id, m.starred, m.seen, token, return_to),
+        actions = row_actions(&m.id, m.starred, m.seen, &m.folder, token, return_to),
     )
 }
 
@@ -964,11 +974,37 @@ fn star_mark(starred: bool) -> &'static str {
     }
 }
 
+fn folder_class(folder: &str) -> String {
+    let mut slug = String::new();
+    for ch in folder.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "folder-unknown".to_string()
+    } else {
+        format!("folder-{slug}")
+    }
+}
+
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
 /// button submits the same form with a distinct `op`. The read/unread button reflects the current
 /// `seen` state (so a read row offers "Unread" and an unread row offers "Read" — the optimistic
 /// mark-read affordance). No-JS users still POST this form; the enhancement layer intercepts it.
-fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str) -> String {
+fn row_actions(
+    id: &str,
+    starred: bool,
+    seen: bool,
+    folder: &str,
+    token: &str,
+    return_to: &str,
+) -> String {
     let (star_op, star_label, star_glyph) = if starred {
         ("unstar", "Unstar", "★")
     } else {
@@ -978,6 +1014,11 @@ fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str
         ("unread", "Unread")
     } else {
         ("read", "Read")
+    };
+    let spam_button = if folder.eq_ignore_ascii_case(crate::delivery::SPAM_FOLDER) {
+        r#"<button class="btn btn-ghost btn-sm btn-not-spam" type="submit" name="op" value="not_spam" title="Move to Inbox and trust sender">Not spam</button>"#
+    } else {
+        r#"<button class="btn btn-ghost btn-sm btn-report-spam" type="submit" name="op" value="report_spam" title="Move to Spam and block sender">Report spam</button>"#
     };
     let mut opts = String::new();
     for f in FOLDERS {
@@ -990,6 +1031,7 @@ fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{star_op}" title="{star_label}">{star_glyph}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{seen_op}" title="Mark {seen_label_lc}">{seen_label}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="archive" title="Archive">Archive</button>
+  {spam_button}
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
   <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Move…</option>{opts}</select>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="move">Move</button>
@@ -997,6 +1039,7 @@ fn row_actions(id: &str, starred: bool, seen: bool, token: &str, return_to: &str
         id = esc(id),
         token = esc(token),
         ret = esc(return_to),
+        spam_button = spam_button,
         seen_label_lc = seen_label.to_ascii_lowercase(),
     )
 }
@@ -1029,6 +1072,8 @@ fn bulk_toolbar(token: &str) -> String {
   <div class="bulkbar__actions">
     <button class="btn btn-ghost btn-sm" type="button" data-bulk="read">Mark read</button>
     <button class="btn btn-ghost btn-sm" type="button" data-bulk="archive">Archive</button>
+    <button class="btn btn-ghost btn-sm btn-report-spam" type="button" data-bulk="report_spam">Report spam</button>
+    <button class="btn btn-ghost btn-sm btn-not-spam" type="button" data-bulk="not_spam">Not spam</button>
     <select class="move-select" data-bulk-folder aria-label="Move selected to folder"><option value="" selected disabled>Move…</option>{opts}</select>
     <button class="btn btn-ghost btn-sm" type="button" data-bulk="move">Move</button>
     <button class="btn btn-danger btn-sm" type="button" data-bulk="delete">Delete</button>
@@ -1118,7 +1163,8 @@ fn folder_tabs(t: &FolderTabs) -> String {
         };
         let label = if f == "INBOX" { "Inbox" } else { f };
         out.push_str(&format!(
-            r#"<a class="{cls}" href="/?folder={f}">{label}</a>"#
+            r#"<a class="{cls} {folder_cls}" href="/?folder={f}">{label}</a>"#,
+            folder_cls = folder_class(f),
         ));
     }
     // Threads/Messages toggle — meaningful for a real folder view (never the Starred/search view).
@@ -1254,6 +1300,16 @@ async fn read_message(
         .await
         .unwrap_or_default();
     let labels_html = render_message_labels(&msg.id, &all_labels, &msg_labels, &token);
+    let spam_banner = render_spam_banner(
+        msg.folder
+            .eq_ignore_ascii_case(crate::delivery::SPAM_FOLDER),
+        state
+            .store
+            .spam_annotation(&mb.addr, &id)
+            .await
+            .unwrap_or_default()
+            .as_ref(),
+    );
 
     // "View conversation" link when this message is part of a multi-message thread.
     let convo_html = if !msg.thread_id.is_empty() {
@@ -1299,6 +1355,7 @@ async fn read_message(
     {actions}
     {labels}
   </header>
+  {spam_banner}
   {attachments}
   {body}
 </section>"#,
@@ -1314,11 +1371,13 @@ async fn read_message(
         id = esc(&msg.id),
         convo = convo_html,
         labels = labels_html,
+        spam_banner = spam_banner,
         // Read-view actions return to the message so a star/unread toggle stays in context.
         actions = row_actions(
             &msg.id,
             msg.starred,
             msg.seen,
+            &msg.folder,
             &token,
             &format!("/m/{}", esc(&msg.id))
         ),
@@ -1366,6 +1425,20 @@ fn render_message_labels(id: &str, all: &[Label], applied: &[Label], token: &str
         )
     };
     format!(r#"<div class="msg-labels">{pills}{add_form}</div>"#)
+}
+
+fn render_spam_banner(in_spam: bool, annotation: Option<&SpamAnnotation>) -> String {
+    if !in_spam {
+        return String::new();
+    }
+    let detail = annotation
+        .filter(|a| !a.reason.trim().is_empty())
+        .map(|a| format!(" Score {}: {}", a.score, a.reason.trim()))
+        .unwrap_or_else(|| " Marked as spam.".to_string());
+    format!(
+        r#"<div class="spam-banner" role="note"><b>Spam</b><span>{detail}</span></div>"#,
+        detail = esc(&detail),
+    )
 }
 
 /// Query for `GET /t`: the conversation (thread) id.
@@ -1536,8 +1609,8 @@ async fn message_labels_post(
 }
 
 /// Form body for `POST /m/{id}/action`: a double-submit CSRF token, the operation `op`
-/// (`star|unstar|read|unread|archive|delete|move`), a target `folder` (only for `op=move`), and a
-/// safe local `return` path to redirect back to.
+/// (`star|unstar|read|unread|archive|report_spam|not_spam|delete|move`), a target `folder` (only
+/// for `op=move`), and a safe local `return` path to redirect back to.
 #[derive(Deserialize, Default)]
 struct ActionForm {
     csrf: String,
@@ -1584,37 +1657,11 @@ async fn message_action(
         return error_page(StatusCode::NOT_FOUND, "Not found", "No such message.");
     }
 
-    let result = match form.op.as_str() {
-        "delete" => state.store.set_folder(&id, "Trash").await,
-        "archive" => state.store.set_folder(&id, "Archive").await,
-        "move" => {
-            let Some(folder) = real_folder(&form.folder) else {
-                return error_page(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid request",
-                    "Unknown target folder.",
-                );
-            };
-            state.store.set_folder(&id, folder).await
+    if let Err((code, message)) = apply_message_op(&state, &msg, &form.op, &form.folder).await {
+        if code == StatusCode::BAD_REQUEST {
+            return error_page(StatusCode::BAD_REQUEST, "Invalid request", &message);
         }
-        "unread" => state.store.mark_unseen(&id).await,
-        "read" => state.store.mark_seen(&id).await,
-        "star" => state.store.set_starred(&id, true).await,
-        "unstar" => state.store.set_starred(&id, false).await,
-        _ => {
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                "Invalid request",
-                "Unknown action.",
-            )
-        }
-    };
-    if let Err(e) = result {
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Storage error",
-            &e.to_string(),
-        );
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &message);
     }
     tracing::info!(
         target: "corvid::audit",
@@ -1634,12 +1681,13 @@ async fn message_action(
 /// `Err((status, message))` marks an invalid op / target folder or a storage failure.
 async fn apply_message_op(
     state: &AppState,
-    id: &str,
+    msg: &Message,
     op: &str,
     folder: &str,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     use serde_json::json;
     let err500 = |e: crate::store::StoreError| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let id = msg.id.as_str();
     match op {
         "delete" => state
             .store
@@ -1663,6 +1711,43 @@ async fn apply_message_op(
                 .await
                 .map(|_| json!({"ok": true, "id": id, "op": op, "folder": f}))
                 .map_err(err500)
+        }
+        "report_spam" => {
+            state
+                .store
+                .set_folder(id, crate::delivery::SPAM_FOLDER)
+                .await
+                .map_err(err500)?;
+            let listed = upsert_sender_for_message(state, msg, "blocked")
+                .await
+                .map_err(err500)?;
+            let reason = listed
+                .as_deref()
+                .map(|addr| format!("User reported as spam; blocked sender list match: {addr}"))
+                .unwrap_or_else(|| "User reported as spam".to_string());
+            state
+                .store
+                .set_spam_annotation(&SpamAnnotation {
+                    mailbox: msg.mailbox.clone(),
+                    message_id: msg.id.clone(),
+                    score: 100,
+                    reason,
+                })
+                .await
+                .map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "folder": crate::delivery::SPAM_FOLDER}))
+        }
+        "not_spam" => {
+            state.store.set_folder(id, "INBOX").await.map_err(err500)?;
+            upsert_sender_for_message(state, msg, "safe")
+                .await
+                .map_err(err500)?;
+            state
+                .store
+                .delete_spam_annotation(&msg.mailbox, id)
+                .await
+                .map_err(err500)?;
+            Ok(json!({"ok": true, "id": id, "op": op, "folder": "INBOX"}))
         }
         "unread" => state
             .store
@@ -1692,6 +1777,50 @@ async fn apply_message_op(
     }
 }
 
+async fn upsert_sender_for_message(
+    state: &AppState,
+    msg: &Message,
+    kind: &str,
+) -> Result<Option<String>, crate::store::StoreError> {
+    let Some(address_or_domain) = normalize_sender_list_value(&msg.msg_from) else {
+        return Ok(None);
+    };
+    let entry = SenderListEntry {
+        id: new_id("sl"),
+        user: msg.mailbox.clone(),
+        address_or_domain: address_or_domain.clone(),
+        kind: kind.to_string(),
+        created_at: now_secs(),
+    };
+    state.store.upsert_sender_list(&entry).await?;
+    Ok(Some(address_or_domain))
+}
+
+fn normalize_sender_list_value(raw: &str) -> Option<String> {
+    let extracted = extract_addr(raw);
+    let mut value = extracted
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    value.retain(|c| !c.is_whitespace() && !c.is_control());
+    if value.is_empty() {
+        return None;
+    }
+    if value.contains('@') {
+        let (local, domain) = value.split_once('@')?;
+        if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+            return None;
+        }
+        return Some(value);
+    }
+    if value.contains('.') {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// `POST /api/m/{id}/action` — the JSON sibling of [`message_action`] powering the optimistic,
 /// no-reload row/read actions. IDENTICAL guard rails: double-submit CSRF, the SAME owner
 /// authorisation (a message is only actionable from its own mailbox), the SAME store mutation, and
@@ -1716,7 +1845,7 @@ async fn api_message_action(
     if msg.mailbox != mb.addr {
         return json_status(StatusCode::NOT_FOUND, "no such message");
     }
-    match apply_message_op(&state, &id, &form.op, &form.folder).await {
+    match apply_message_op(&state, &msg, &form.op, &form.folder).await {
         Ok(body) => {
             tracing::info!(
                 target: "corvid::audit",
@@ -1746,7 +1875,7 @@ struct BulkForm {
     ids: String,
 }
 
-/// `POST /api/m/bulk` — apply one `op` (`read|unread|archive|delete|move`) to a batch of the
+/// `POST /api/m/bulk` — apply one `op` (`read|unread|archive|report_spam|not_spam|delete|move`) to a batch of the
 /// signed-in mailbox's messages, for the multi-select bulk toolbar. Double-submit CSRF; EACH id is
 /// re-checked to belong to this mailbox (a forged/foreign id in the batch is skipped, never
 /// actioned), reusing the SAME per-message store mutations via [`apply_message_op`]. Returns the
@@ -1765,7 +1894,7 @@ async fn api_bulk_action(
     // A deliberately narrow (non-star) bulk op set; `move` still needs a real target folder.
     if !matches!(
         form.op.as_str(),
-        "read" | "unread" | "archive" | "delete" | "move"
+        "read" | "unread" | "archive" | "report_spam" | "not_spam" | "delete" | "move"
     ) {
         return json_status(StatusCode::BAD_REQUEST, "unknown bulk action");
     }
@@ -1781,11 +1910,11 @@ async fn api_bulk_action(
     let mut applied = 0i64;
     for id in ids {
         // Cross-mailbox safety: only act on ids this mailbox actually owns.
-        match state.store.get_message(id).await {
-            Ok(Some(m)) if m.mailbox == mb.addr => {}
+        let msg = match state.store.get_message(id).await {
+            Ok(Some(m)) if m.mailbox == mb.addr => m,
             _ => continue,
-        }
-        if apply_message_op(&state, id, &form.op, &form.folder)
+        };
+        if apply_message_op(&state, &msg, &form.op, &form.folder)
             .await
             .is_ok()
         {
@@ -3053,6 +3182,16 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         .suggest_contacts(&mb.addr, "", 200)
         .await
         .unwrap_or_default();
+    let sender_lists = match state.store.list_sender_lists(&mb.addr).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
 
     let mut rule_rows = String::new();
     if rules.is_empty() {
@@ -3104,6 +3243,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     <div class="form-actions"><button class="btn btn-primary" type="submit">Add rule</button></div>
   </form>
 </section>
+{senders_section}
 {labels_section}
 {identities_section}
 {contacts_section}
@@ -3132,6 +3272,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
         labels_section = render_labels_section(&labels, &token),
+        senders_section = render_sender_lists_section(&sender_lists, &token),
         identities_section = render_identities_section(&identities, &mb.addr, &token),
         contacts_section = render_contacts_section(&contacts, &token),
     );
@@ -3562,6 +3703,143 @@ fn fmt_until(ts: i64) -> String {
 // ---------------------------------------------------------------------------
 // Settings — labels / send identities / contacts (per-mailbox, self-managed)
 // ---------------------------------------------------------------------------
+
+fn render_sender_lists_section(entries: &[SenderListEntry], token: &str) -> String {
+    let mut rows = String::new();
+    if entries.is_empty() {
+        rows.push_str(
+            r#"<tr><td colspan="3" class="muted">No safe or blocked senders yet.</td></tr>"#,
+        );
+    }
+    for e in entries {
+        let kind_cls = if e.kind == "safe" {
+            "sender-list-safe"
+        } else {
+            "sender-list-blocked"
+        };
+        rows.push_str(&format!(
+            r#"<tr class="{kind_cls}"><td>{addr}</td><td><span class="pill">{kind}</span></td><td>
+<form class="row-actions" method="post" action="/settings/senders">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="id" value="{id}">
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+</form></td></tr>"#,
+            addr = esc(&e.address_or_domain),
+            kind = sender_kind_label(&e.kind),
+            id = esc(&e.id),
+            token = esc(token),
+        ));
+    }
+    format!(
+        r#"<section class="card pad sender-lists">
+  <h2>Safe and blocked senders</h2>
+  <table class="data admin-table">
+    <thead><tr><th>Address or domain</th><th>List</th><th></th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <form method="post" action="/settings/senders">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="sender_addr">Address or domain</label><input id="sender_addr" name="address_or_domain" placeholder="sender@example.com"></div>
+    <div class="field"><label for="sender_kind">List</label><select id="sender_kind" name="kind"><option value="blocked">Blocked</option><option value="safe">Safe</option></select></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add sender</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+fn sender_kind_label(kind: &str) -> String {
+    match kind {
+        "safe" => "Safe".to_string(),
+        "blocked" => "Blocked".to_string(),
+        other => esc(other),
+    }
+}
+
+/// Form body for `POST /settings/senders`: CSRF, `cmd` (`add`|`delete`), `id` (delete), plus
+/// `address_or_domain` and `kind` (`blocked`|`safe`) for add.
+#[derive(Deserialize, Default)]
+struct SenderForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    address_or_domain: String,
+    #[serde(default)]
+    kind: String,
+}
+
+async fn settings_senders_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SenderForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+
+    let result = match form.cmd.as_str() {
+        "delete" => {
+            state
+                .store
+                .delete_sender_list(&mb.addr, form.id.trim())
+                .await
+        }
+        _ => {
+            let kind = match form.kind.as_str() {
+                "safe" => "safe",
+                "" | "blocked" => "blocked",
+                _ => {
+                    return error_page(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid request",
+                        "Unknown sender list kind.",
+                    )
+                }
+            };
+            let Some(address_or_domain) = normalize_sender_list_value(&form.address_or_domain)
+            else {
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid request",
+                    "A valid sender address or domain is required.",
+                );
+            };
+            let entry = SenderListEntry {
+                id: new_id("sl"),
+                user: mb.addr.clone(),
+                address_or_domain,
+                kind: kind.to_string(),
+                created_at: now_secs(),
+            };
+            state.store.upsert_sender_list(&entry).await
+        }
+    };
+    if let Err(e) = result {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        "sender list change",
+    );
+    Redirect::to("/settings").into_response()
+}
 
 /// The Labels settings card: existing labels (with delete) + an add form.
 fn render_labels_section(labels: &[Label], token: &str) -> String {
@@ -4608,6 +4886,7 @@ mod tests {
     fn canonical_folder_clamps_unknown() {
         assert_eq!(canonical_folder(Some("Sent")), "Sent");
         assert_eq!(canonical_folder(Some("sent")), "Sent");
+        assert_eq!(canonical_folder(Some("spam")), "Spam");
         assert_eq!(canonical_folder(Some("bogus")), "INBOX");
         assert_eq!(canonical_folder(None), "INBOX");
     }
@@ -4615,6 +4894,7 @@ mod tests {
     #[test]
     fn real_folder_accepts_only_real_folders() {
         assert_eq!(real_folder("sent"), Some("Sent"));
+        assert_eq!(real_folder("spam"), Some("Spam"));
         assert_eq!(real_folder(" Trash "), Some("Trash"));
         assert_eq!(
             real_folder("Starred"),
@@ -4622,6 +4902,12 @@ mod tests {
             "the virtual view is not a folder"
         );
         assert_eq!(real_folder("bogus"), None);
+    }
+
+    #[test]
+    fn folder_class_exposes_spam_hook() {
+        assert_eq!(folder_class("Spam"), "folder-spam");
+        assert_eq!(folder_class("INBOX"), "folder-inbox");
     }
 
     #[test]
@@ -4654,6 +4940,7 @@ mod tests {
             received_at: ts,
             seen: false,
             starred: false,
+            folder: "INBOX".to_string(),
         };
         // Short page (or empty) -> nothing older -> no link.
         assert_eq!(next_page_link(&[], 2, "/?folder=Sent&limit=2"), "");

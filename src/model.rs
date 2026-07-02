@@ -80,6 +80,30 @@ impl MailboxSettings {
     }
 }
 
+/// A per-mailbox sender allow/block entry used by delivery-time spam placement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SenderListEntry {
+    /// Opaque id, primary key.
+    pub id: String,
+    /// The mailbox/user this entry belongs to.
+    pub user: String,
+    /// Lowercase exact address (`alice@example.com`) or domain (`example.com`).
+    pub address_or_domain: String,
+    /// Entry kind (`blocked` | `safe`).
+    pub kind: String,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
+}
+
+/// Stored explanation for why a message was considered spam-like at delivery/action time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SpamAnnotation {
+    pub mailbox: String,
+    pub message_id: String,
+    pub score: i64,
+    pub reason: String,
+}
+
 /// A stored message (one row per delivered/received message).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Message {
@@ -103,7 +127,7 @@ pub struct Message {
     pub received_at: i64,
     /// Read flag.
     pub seen: bool,
-    /// Folder (`INBOX` | `Sent` | `Drafts` | `Archive` | `Trash`).
+    /// Folder (`INBOX` | `Sent` | `Drafts` | `Archive` | `Spam` | `Trash`).
     pub folder: String,
     /// Star/flag: surfaced in the cross-folder `Starred` view.
     pub starred: bool,
@@ -125,6 +149,7 @@ pub struct MessageSummary {
     pub received_at: i64,
     pub seen: bool,
     pub starred: bool,
+    pub folder: String,
 }
 
 /// Parsed search input: free text terms plus structured predicates. Positive clauses are ANDed by

@@ -396,6 +396,38 @@ async fn filter_rule_add_label_action_applies_at_delivery() {
     assert_eq!(applied[0].name, "Bills");
 }
 
+#[tokio::test]
+async fn settings_sender_lists_add_replace_and_delete() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_csrf(&state).await;
+
+    let resp = app(state.clone())
+        .oneshot(post("/settings/senders", &cookie, format!("csrf={token}&kind=blocked&address_or_domain=%40bad.example")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let entries = state.store.list_sender_lists(MAILBOX).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, "blocked");
+    assert_eq!(entries[0].address_or_domain, "bad.example");
+
+    let resp = app(state.clone())
+        .oneshot(post("/settings/senders", &cookie, format!("csrf={token}&kind=safe&address_or_domain=bad.example")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let entries = state.store.list_sender_lists(MAILBOX).await.unwrap();
+    assert_eq!(entries.len(), 1, "safe replaces blocked for the same domain");
+    assert_eq!(entries[0].kind, "safe");
+
+    let resp = app(state.clone())
+        .oneshot(post("/settings/senders", &cookie, format!("csrf={token}&cmd=delete&id={}", entries[0].id)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(state.store.list_sender_lists(MAILBOX).await.unwrap().is_empty());
+}
+
 /// Minimal percent-encoding matching the webmail's own (unreserved chars pass through).
 fn urlencode(s: &str) -> String {
     let mut out = String::new();
