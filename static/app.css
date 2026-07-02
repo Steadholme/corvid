@@ -847,3 +847,67 @@ mark.search-hit {
 .btn-cancel-scheduled:hover {
   background:var(--down-soft); border-color:var(--down); color:var(--down-ink);
 }
+
+/* Undo send bar — post-send confirmation strip, server-rendered after
+   /send redirects with ?undo=&undo_until= (render_undo_bar in webmail.rs).
+   Reuses the site's dark toast idiom (--ink surface, #fff ink, --sh-pop)
+   as a fixed, bottom-centered strip à la Gmail. The action button ships
+   with .btn.btn-primary.btn-sm but is re-cast here as a bright accent text
+   link so it reads clearly against the dark bar. Countdown is muted-but-
+   legible with tabular figures so it never reflows on each tick. Entrance
+   slide uses --dur/--ease (globally stilled by the prefers-reduced-motion
+   reset above); .is-expired is toggled by the webmail JS at 0s. */
+.undo-bar {
+  position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+  z-index:90;                        /* below .toast-host (100) so live toasts sit on top */
+  display:inline-flex; align-items:center; gap:14px;
+  max-width:min(560px, calc(100vw - 32px));
+  padding:11px 12px 11px 16px;
+  background:var(--ink); color:#fff;
+  border-radius:var(--r); box-shadow:var(--sh-pop);
+  font-size:13px; font-weight:500; line-height:1.3;
+  animation:undo-bar-in calc(var(--dur) * 2) var(--ease);
+}
+.undo-bar__message { color:#fff; }
+.undo-bar__countdown {
+  color:rgba(255,255,255,.62);       /* weakened but readable */
+  font-variant-numeric:tabular-nums;
+  font-size:12px; margin-inline-start:-6px;
+}
+.undo-bar__form { display:flex; margin:0; }
+
+/* Undo action — override the inherited .btn.btn-primary fill into a bright
+   accent text link (--accent-soft reads well above 7:1 on --ink). */
+.undo-bar .btn-undo-send {
+  background:transparent; border:none; box-shadow:none;
+  min-height:auto; padding:4px 6px;
+  color:var(--accent-soft); font-weight:600; font-size:13px;
+  text-decoration:none; cursor:pointer;
+}
+.undo-bar .btn-undo-send:hover { color:#fff; text-decoration:underline; }
+.undo-bar .btn-undo-send:disabled {
+  color:var(--ink-4); cursor:default; text-decoration:none;
+}
+
+/* Expired window — fade the strip back and neutralise the countdown. */
+.undo-bar.is-expired {
+  opacity:.5;
+  transition:opacity var(--dur) var(--ease);
+}
+.undo-bar.is-expired .undo-bar__countdown { color:rgba(255,255,255,.4); }
+
+/* Subtle rise on entry — animates `bottom` only so it never fights the
+   translateX(-50%) centering (and stays valid when centering is dropped
+   on narrow screens). */
+@keyframes undo-bar-in {
+  from { opacity:0; bottom:16px; }
+  to   { opacity:1; bottom:24px; }
+}
+
+/* Narrow screens — span the width with a gutter so nothing overflows. */
+@media (max-width:520px) {
+  .undo-bar {
+    left:12px; right:12px; transform:none;
+    max-width:none; width:auto;
+  }
+}
