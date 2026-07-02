@@ -290,7 +290,7 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .mailrow-wrap { display:flex; align-items:center; gap:6px; }
 .mailrow-wrap .mailrow { flex:1; min-width:0; }
 .mailrow {
-  display:flex; align-items:center; gap:14px; padding:13px 14px; border-radius:var(--r-sm);
+  display:flex; align-items:center; gap:14px; padding:9px 14px; border-radius:var(--r-sm);
   color:var(--ink-2); transition:background var(--dur) var(--ease);
 }
 .mailrow:hover { background:var(--surface-2); text-decoration:none; }
@@ -428,20 +428,24 @@ a.label-pill:hover { color:var(--accent-ink); }
 .maillist-empty { border-top:none !important; }
 .maillist-empty .empty { padding:40px 20px; }
 
-/* ---- Sticky bulk toolbar ----------------------------------------------- */
+/* ---- Bulk toolbar: a full-width bar pinned to the viewport bottom, shown
+   only while >=1 row is selected. The enhancement layer toggles [hidden];
+   the [hidden] rule below must win over the base display so 0 selected hides. */
 .bulkbar {
-  position:sticky; bottom:16px; z-index:30; margin:14px auto 0; width:fit-content; max-width:100%;
-  display:flex; gap:8px; align-items:center; flex-wrap:wrap;
-  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-pill);
-  box-shadow:var(--sh-pop); padding:8px 12px;
+  position:sticky; bottom:14px; z-index:30; margin:14px 0 0;
+  display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;
+  padding:10px 14px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r);
+  box-shadow:var(--sh-md);
 }
-.bulkbar__count { font-size:13px; font-weight:600; color:var(--ink-2); margin-right:4px; }
+.bulkbar[hidden] { display:none; }
+.bulkbar__lead { display:flex; align-items:center; gap:10px; }
+.bulkbar__actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.bulkbar__count { font-size:13px; font-weight:600; color:var(--ink-2); }
 .bulkbar .move-select {
   font:inherit; font-size:12px; height:32px; padding:0 8px; color:var(--ink-2);
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs);
 }
-.bulkbar__del { color:var(--down-ink); }
-.bulkbar__del:hover { background:var(--down-soft); }
 
 /* ---- In-flight / busy affordances -------------------------------------- */
 .is-inflight { opacity:.5; pointer-events:none; }
@@ -478,6 +482,6 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
 
 /* ---- Responsive (<=720px) ---------------------------------------------- */
 @media (max-width:720px) {
-  .bulkbar { position:fixed; left:14px; right:14px; bottom:14px; margin:0; width:auto; justify-content:center; }
+  .bulkbar { position:fixed; left:14px; right:14px; bottom:14px; margin:0; }
   .mailcheck { opacity:1 !important; }
 }

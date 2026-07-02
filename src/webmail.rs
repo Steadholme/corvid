@@ -775,13 +775,17 @@ fn bulk_toolbar(token: &str) -> String {
     }
     format!(
         r#"<div class="bulkbar" role="toolbar" aria-label="Bulk actions" data-bulkbar data-csrf="{token}" hidden>
-  <span class="bulkbar__count" data-bulk-count>0 selected</span>
-  <button class="btn btn-ghost btn-sm" type="button" data-bulk="read">Mark read</button>
-  <button class="btn btn-ghost btn-sm" type="button" data-bulk="archive">Archive</button>
-  <select class="move-select" data-bulk-folder aria-label="Move selected to folder"><option value="" selected disabled>Move…</option>{opts}</select>
-  <button class="btn btn-ghost btn-sm" type="button" data-bulk="move">Move</button>
-  <button class="btn btn-ghost btn-sm bulkbar__del" type="button" data-bulk="delete">Delete</button>
-  <button class="btn btn-ghost btn-sm" type="button" data-bulk-clear>Clear</button>
+  <div class="bulkbar__lead">
+    <span class="bulkbar__count" data-bulk-count>0 selected</span>
+    <button class="btn btn-ghost btn-sm" type="button" data-bulk-clear>Clear</button>
+  </div>
+  <div class="bulkbar__actions">
+    <button class="btn btn-ghost btn-sm" type="button" data-bulk="read">Mark read</button>
+    <button class="btn btn-ghost btn-sm" type="button" data-bulk="archive">Archive</button>
+    <select class="move-select" data-bulk-folder aria-label="Move selected to folder"><option value="" selected disabled>Move…</option>{opts}</select>
+    <button class="btn btn-ghost btn-sm" type="button" data-bulk="move">Move</button>
+    <button class="btn btn-danger btn-sm" type="button" data-bulk="delete">Delete</button>
+  </div>
 </div>"#,
         token = esc(token),
     )
