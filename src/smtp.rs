@@ -482,7 +482,17 @@ impl Session {
                 folder: "INBOX".to_string(),
                 starred: false,
             };
-            if let Err(e) = self.ctx.store.store_message(&msg).await {
+            // Delivery-time pipeline (filter rules + auto-reply), then storage — one call keeps
+            // this path surgical. `from` is the envelope return-path the responder guards on.
+            if let Err(e) = crate::delivery::process_inbound(
+                self.ctx.store.as_ref(),
+                self.ctx.signer.as_deref(),
+                &self.ctx.config.mail_domain,
+                &from,
+                msg,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "inbound store failed");
                 return Reply::say("451 4.3.0 Temporary storage failure\r\n");
             }

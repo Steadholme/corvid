@@ -10,8 +10,8 @@
 //! docker rm -f corvid-testpg
 //! ```
 
-use corvid::model::{Mailbox, Message, OutboundItem};
-use corvid::store::{PgStore, Store};
+use corvid::model::{FilterRule, Mailbox, Message, OutboundItem};
+use corvid::store::{PgStore, Store, AUTO_REPLY_DEDUPE_SECS};
 use corvid::{new_id, now_secs};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -26,7 +26,7 @@ async fn pg_store_full_integration() {
     pg.migrate().await.expect("migrate idempotent");
 
     // Clean slate.
-    for tbl in ["messages", "outbound_queue", "aliases", "mailboxes"] {
+    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
 
@@ -146,10 +146,72 @@ async fn pg_store_full_integration() {
 
     pg.mark_outbound_sent(&item.id).await.unwrap();
 
-    for tbl in ["messages", "outbound_queue", "aliases", "mailboxes"] {
+    // --- filter rules --------------------------------------------------------
+    let mk_rule = |pos: i64, needle: &str, action: &str, folder: Option<&str>| FilterRule {
+        id: new_id("fr"),
+        mailbox: "w33d@w33d.xyz".into(),
+        position: pos,
+        field: "from".into(),
+        op: "contains".into(),
+        needle: needle.into(),
+        action: action.into(),
+        target_folder: folder.map(str::to_string),
+        enabled: true,
+        created_at: now,
+    };
+    let r1 = mk_rule(2, "alice", "move", Some("Archive"));
+    let r2 = mk_rule(1, "bob", "discard", None);
+    pg.add_rule(&r1).await.unwrap();
+    pg.add_rule(&r2).await.unwrap();
+
+    let rules = pg.list_rules("w33d@w33d.xyz").await.unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].id, r2.id, "ordered by position ascending");
+    assert_eq!(rules[1].target_folder.as_deref(), Some("Archive"), "nullable folder round-trips");
+    assert!(rules[0].target_folder.is_none());
+
+    pg.set_rule_enabled("w33d@w33d.xyz", &r2.id, false).await.unwrap();
+    assert!(!pg.list_rules("w33d@w33d.xyz").await.unwrap()[0].enabled);
+    pg.set_rule_position("w33d@w33d.xyz", &r2.id, 9).await.unwrap();
+    assert_eq!(pg.list_rules("w33d@w33d.xyz").await.unwrap()[1].id, r2.id, "repositioned last");
+    // Wrong-mailbox scoping: a foreign mailbox can neither toggle nor delete the rule.
+    pg.delete_rule("other@w33d.xyz", &r1.id).await.unwrap();
+    assert_eq!(pg.list_rules("w33d@w33d.xyz").await.unwrap().len(), 2, "scoped delete is a no-op");
+    pg.delete_rule("w33d@w33d.xyz", &r1.id).await.unwrap();
+    assert_eq!(pg.list_rules("w33d@w33d.xyz").await.unwrap().len(), 1);
+
+    // --- mailbox settings (signature + auto-reply) ---------------------------
+    let s = pg.get_settings("w33d@w33d.xyz").await.unwrap();
+    assert_eq!(s.signature, "", "pre-migration/unsaved row reads as defaults");
+    assert!(!s.auto_reply_enabled);
+    assert_eq!(s.auto_reply_until, 0);
+
+    pg.set_signature("w33d@w33d.xyz", "-- w33d").await.unwrap();
+    pg.set_auto_reply("w33d@w33d.xyz", true, "OOO", "away until Monday", now + 3600)
+        .await
+        .unwrap();
+    let s = pg.get_settings("w33d@w33d.xyz").await.unwrap();
+    assert_eq!(s.signature, "-- w33d");
+    assert!(s.auto_reply_enabled);
+    assert_eq!(s.auto_reply_subject, "OOO");
+    assert_eq!(s.auto_reply_body, "away until Monday");
+    assert_eq!(s.auto_reply_until, now + 3600);
+    // An unknown mailbox yields the defaults instead of an error.
+    assert!(!pg.get_settings("ghost@w33d.xyz").await.unwrap().auto_reply_enabled);
+
+    // --- auto-reply dedupe log ------------------------------------------------
+    assert!(pg.mark_auto_replied("w33d@w33d.xyz", "a@b.com", now).await.unwrap(), "first send allowed");
+    assert!(!pg.mark_auto_replied("w33d@w33d.xyz", "a@b.com", now + 60).await.unwrap(), "deduped within 24h");
+    assert!(pg.mark_auto_replied("w33d@w33d.xyz", "other@b.com", now).await.unwrap(), "per-sender");
+    assert!(
+        pg.mark_auto_replied("w33d@w33d.xyz", "a@b.com", now + AUTO_REPLY_DEDUPE_SECS).await.unwrap(),
+        "window elapsed -> allowed again"
+    );
+
+    for tbl in ["messages", "outbound_queue", "aliases", "filter_rules", "auto_reply_log", "mailboxes"] {
         sqlx_delete(&url, tbl).await;
     }
-    println!("PG STORE INTEGRATION OK: mailboxes + messages (seen) + outbound queue (rcpts/reschedule/sent)");
+    println!("PG STORE INTEGRATION OK: mailboxes + messages (seen) + outbound queue (rcpts/reschedule/sent) + rules/settings/auto-reply");
 }
 
 async fn sqlx_delete(url: &str, table: &str) {

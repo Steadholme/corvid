@@ -10,6 +10,7 @@
 //! state machine + webmail render are driven in-process by the tests.
 
 pub mod config;
+pub mod delivery;
 pub mod dkim;
 pub mod dns;
 pub mod model;

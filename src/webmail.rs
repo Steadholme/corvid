@@ -14,6 +14,8 @@
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue + relay + file a Sent copy;
 //!                   `action=draft`: persist into the Drafts folder without sending
+//! - `GET /settings` mailbox settings: filter rules / signature / auto-reply sections
+//! - `POST /settings/rules|signature|autoreply`  the three settings mutations (CSRF-guarded)
 
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -27,7 +29,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use crate::model::{Alias, Mailbox, Message};
+use crate::model::{Alias, FilterRule, Mailbox, Message};
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
@@ -61,6 +63,7 @@ const ICO_GRID: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentCo
 const ICO_CARET: &str = r#"<svg class="usermenu__caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>"#;
 const ICO_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
 const ICO_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>"#;
+const ICO_SETTINGS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 
 /// Build the webmail router.
 pub fn app(state: AppState) -> Router {
@@ -82,6 +85,10 @@ pub fn app(state: AppState) -> Router {
         .route("/compose", get(compose_form))
         .route("/send", post(send))
         .route("/api/send", post(api_send))
+        .route("/settings", get(settings_page))
+        .route("/settings/rules", get(settings_rules_redirect).post(settings_rules_post))
+        .route("/settings/signature", post(settings_signature))
+        .route("/settings/autoreply", post(settings_autoreply))
         .merge(admin)
         // Reject a forged gateway identity (spoofed X-Auth-* from a rogue in-network peer):
         // when GATEWAY_HMAC_KEY is set, an injected identity MUST carry a valid X-Auth-Sig.
@@ -608,7 +615,15 @@ async fn compose_form(
     let (token, set_cookie) = ensure_csrf(&headers);
 
     // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
-    let pre = build_prefill(&state, &mb, &q).await;
+    let mut pre = build_prefill(&state, &mb, &q).await;
+    // Per-mailbox signature: appended to every draft (blank compose, reply, forward) as the
+    // conventional `--` delimited block. Best effort — a settings read failure just skips it.
+    if let Ok(settings) = state.store.get_settings(&mb.addr).await {
+        let sig = settings.signature.trim();
+        if !sig.is_empty() {
+            pre.body.push_str(&format!("\n\n--\n{sig}"));
+        }
+    }
 
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
@@ -1306,6 +1321,418 @@ async fn admin_add_alias(
 }
 
 // ---------------------------------------------------------------------------
+// Settings — filter rules / signature / auto-reply (per-mailbox)
+// ---------------------------------------------------------------------------
+
+/// The legal rule match fields / operators / actions (the settings selects + POST validation).
+const RULE_FIELDS: [&str; 3] = ["from", "to", "subject"];
+const RULE_OPS: [&str; 2] = ["contains", "equals"];
+const RULE_ACTIONS: [&str; 4] = ["move", "star", "markread", "discard"];
+
+/// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, and
+/// auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
+async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let email = email_display(&headers);
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email);
+    };
+    let (token, set_cookie) = ensure_csrf(&headers);
+
+    let rules = match state.store.list_rules(&mb.addr).await {
+        Ok(r) => r,
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+    let settings = match state.store.get_settings(&mb.addr).await {
+        Ok(s) => s,
+        Err(e) => return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string()),
+    };
+
+    let mut rule_rows = String::new();
+    if rules.is_empty() {
+        rule_rows.push_str(r#"<tr><td colspan="5" class="muted">No filter rules yet — incoming mail lands in the Inbox.</td></tr>"#);
+    }
+    for (i, r) in rules.iter().enumerate() {
+        rule_rows.push_str(&render_rule_row(i, rules.len(), r, &token));
+    }
+
+    let field_opts = select_options(&RULE_FIELDS, |f| field_label(f));
+    let op_opts = select_options(&RULE_OPS, |o| o.to_string());
+    let action_opts = select_options(&RULE_ACTIONS, |a| action_label(a));
+    let mut folder_opts = String::new();
+    for f in FOLDERS {
+        folder_opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
+    }
+
+    let ar_checked = if settings.auto_reply_enabled { " checked" } else { "" };
+    let content = format!(
+        r#"<div class="page-head"><h1>Settings</h1></div>
+<section class="card pad">
+  <h2>Filter rules</h2>
+  <p class="muted">Applied to incoming mail at delivery, top to bottom — the first matching rule wins.</p>
+  <table class="data admin-table">
+    <thead><tr><th>#</th><th>Match</th><th>Action</th><th>Status</th><th></th></tr></thead>
+    <tbody>{rule_rows}</tbody>
+  </table>
+  <form method="post" action="/settings/rules">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="rule_field">Field</label><select id="rule_field" name="field">{field_opts}</select></div>
+    <div class="field"><label for="rule_op">Condition</label><select id="rule_op" name="op">{op_opts}</select></div>
+    <div class="field"><label for="rule_needle">Text to match</label><input id="rule_needle" name="needle" placeholder="newsletter@example.com"></div>
+    <div class="field"><label for="rule_action">Action</label><select id="rule_action" name="action">{action_opts}</select></div>
+    <div class="field"><label for="rule_folder">Target folder (for Move)</label><select id="rule_folder" name="folder">{folder_opts}</select></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Add rule</button></div>
+  </form>
+</section>
+<section class="card pad">
+  <h2>Signature</h2>
+  <form method="post" action="/settings/signature">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="signature">Signature</label><textarea id="signature" name="signature">{sig}</textarea><p class="hint">Appended to new messages and replies below a "--" delimiter. Leave empty for none.</p></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Save signature</button></div>
+  </form>
+</section>
+<section class="card pad">
+  <h2>Auto-reply (vacation)</h2>
+  <form method="post" action="/settings/autoreply">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label><input type="checkbox" name="enabled" value="on"{ar_checked}> Enable auto-reply</label></div>
+    <div class="field"><label for="ar_subject">Subject</label><input id="ar_subject" name="subject" value="{ar_subject}" placeholder="Out of office"></div>
+    <div class="field"><label for="ar_body">Message</label><textarea id="ar_body" name="body">{ar_body}</textarea></div>
+    <div class="field"><label for="ar_until">Until (UTC)</label><input id="ar_until" name="until" type="date" value="{ar_until}"><p class="hint">Leave empty for no end date. Each sender receives at most one auto-reply per 24 hours.</p></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Save auto-reply</button></div>
+  </form>
+</section>"#,
+        token = esc(&token),
+        sig = esc(&settings.signature),
+        ar_subject = esc(&settings.auto_reply_subject),
+        ar_body = esc(&settings.auto_reply_body),
+        ar_until = fmt_until(settings.auto_reply_until),
+    );
+    let html = render_page("Settings", &email, &content, "settings");
+    match set_cookie {
+        Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
+        None => Html(html).into_response(),
+    }
+}
+
+/// One filter-rule table row: the match/action summary plus its inline control form
+/// (up/down/enable-disable/delete), all POSTing back to `/settings/rules` with the CSRF token.
+fn render_rule_row(index: usize, total: usize, r: &FilterRule, token: &str) -> String {
+    let status = if r.enabled {
+        r#"<span class="pill pill-ok">Enabled</span>"#
+    } else {
+        r#"<span class="pill">Disabled</span>"#
+    };
+    let toggle = if r.enabled { ("disable", "Disable") } else { ("enable", "Enable") };
+    let action = match r.action.as_str() {
+        "move" => format!("Move to {}", esc(r.target_folder.as_deref().unwrap_or("?"))),
+        other => action_label(other),
+    };
+    let up = if index > 0 {
+        r#"<button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="up" title="Move up">↑</button>"#
+    } else {
+        ""
+    };
+    let down = if index + 1 < total {
+        r#"<button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="down" title="Move down">↓</button>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<tr><td class="mono">{n}</td><td>{field} {op} &ldquo;{needle}&rdquo;</td><td>{action}</td><td>{status}</td><td>
+<form class="row-actions" method="post" action="/settings/rules">
+  <input type="hidden" name="csrf" value="{token}">
+  <input type="hidden" name="id" value="{id}">
+  {up}{down}
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="{toggle_cmd}">{toggle_label}</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+</form></td></tr>"#,
+        n = index + 1,
+        field = field_label(&r.field),
+        op = esc(&r.op),
+        needle = esc(&r.needle),
+        id = esc(&r.id),
+        token = esc(token),
+        toggle_cmd = toggle.0,
+        toggle_label = toggle.1,
+    )
+}
+
+/// `<option>` list for a settings select, labelled by `label`.
+fn select_options(values: &[&str], label: impl Fn(&str) -> String) -> String {
+    let mut out = String::new();
+    for v in values {
+        out.push_str(&format!(r#"<option value="{v}">{}</option>"#, label(v)));
+    }
+    out
+}
+
+fn field_label(field: &str) -> String {
+    match field {
+        "from" => "From".to_string(),
+        "to" => "To".to_string(),
+        "subject" => "Subject".to_string(),
+        other => esc(other),
+    }
+}
+
+fn action_label(action: &str) -> String {
+    match action {
+        "move" => "Move to folder".to_string(),
+        "star" => "Star".to_string(),
+        "markread" => "Mark read".to_string(),
+        "discard" => "Discard".to_string(),
+        other => esc(other),
+    }
+}
+
+/// `GET /settings/rules` — the rules live on the one settings page.
+async fn settings_rules_redirect() -> Response {
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/rules`: `cmd` empty/`add` creates a rule from the
+/// field/op/needle/action(/folder) selects; `up|down|enable|disable|delete` operate on `id`.
+#[derive(Deserialize, Default)]
+struct RuleForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    needle: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    folder: String,
+}
+
+/// `POST /settings/rules` — add/reorder/toggle/delete a filter rule. CSRF-guarded; every store
+/// call is scoped to the signed-in user's own mailbox. Emits a tracing audit line and redirects
+/// back to `/settings`.
+async fn settings_rules_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+
+    let result = match form.cmd.as_str() {
+        "" | "add" => add_rule_from_form(&state, &mb.addr, &form).await,
+        "up" | "down" => reorder_rule(&state, &mb.addr, &form.id, form.cmd == "up").await,
+        "enable" => state.store.set_rule_enabled(&mb.addr, &form.id, true).await.map_err(|e| e.to_string()),
+        "disable" => state.store.set_rule_enabled(&mb.addr, &form.id, false).await.map_err(|e| e.to_string()),
+        "delete" => state.store.delete_rule(&mb.addr, &form.id).await.map_err(|e| e.to_string()),
+        _ => return error_page(StatusCode::BAD_REQUEST, "Invalid request", "Unknown rule command."),
+    };
+    if let Err(e) = result {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid request", &e);
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        rule = %form.id,
+        "filter rule change",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Validate + persist a new rule from the add form (appended at the end of the order).
+async fn add_rule_from_form(state: &AppState, mailbox: &str, form: &RuleForm) -> Result<(), String> {
+    let field = form.field.trim().to_lowercase();
+    let op = form.op.trim().to_lowercase();
+    let action = form.action.trim().to_lowercase();
+    let needle = form.needle.trim().to_string();
+    if !RULE_FIELDS.contains(&field.as_str()) {
+        return Err("Unknown match field.".to_string());
+    }
+    if !RULE_OPS.contains(&op.as_str()) {
+        return Err("Unknown match condition.".to_string());
+    }
+    if !RULE_ACTIONS.contains(&action.as_str()) {
+        return Err("Unknown rule action.".to_string());
+    }
+    if needle.is_empty() {
+        return Err("The text to match is required.".to_string());
+    }
+    let target_folder = if action == "move" {
+        let Some(f) = real_folder(&form.folder) else {
+            return Err("A Move rule needs a real target folder.".to_string());
+        };
+        Some(f.to_string())
+    } else {
+        None
+    };
+    let existing = state.store.list_rules(mailbox).await.map_err(|e| e.to_string())?;
+    let position = existing.iter().map(|r| r.position).max().unwrap_or(0) + 1;
+    let rule = FilterRule {
+        id: new_id("fr"),
+        mailbox: mailbox.to_string(),
+        position,
+        field,
+        op,
+        needle,
+        action,
+        target_folder,
+        enabled: true,
+        created_at: now_secs(),
+    };
+    state.store.add_rule(&rule).await.map_err(|e| e.to_string())
+}
+
+/// Move a rule one slot up/down: renumber the whole order with the two neighbours swapped
+/// (robust against legacy position ties). A no-op at either edge.
+async fn reorder_rule(state: &AppState, mailbox: &str, id: &str, up: bool) -> Result<(), String> {
+    let rules = state.store.list_rules(mailbox).await.map_err(|e| e.to_string())?;
+    let Some(idx) = rules.iter().position(|r| r.id == id) else {
+        return Err("No such rule.".to_string());
+    };
+    let other = if up {
+        idx.checked_sub(1)
+    } else {
+        (idx + 1 < rules.len()).then_some(idx + 1)
+    };
+    let Some(oidx) = other else {
+        return Ok(()); // already at the edge
+    };
+    let mut order: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+    order.swap(idx, oidx);
+    for (i, rid) in order.iter().enumerate() {
+        state
+            .store
+            .set_rule_position(mailbox, rid, (i + 1) as i64)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Form body for `POST /settings/signature`.
+#[derive(Deserialize, Default)]
+struct SignatureForm {
+    csrf: String,
+    #[serde(default)]
+    signature: String,
+}
+
+/// `POST /settings/signature` — save the compose signature (empty clears it). CSRF-guarded;
+/// emits a tracing audit line and redirects back to `/settings`.
+async fn settings_signature(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SignatureForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    if let Err(e) = state.store.set_signature(&mb.addr, form.signature.trim()).await {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cleared = %form.signature.trim().is_empty(),
+        "signature updated",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/autoreply`. `enabled` is a checkbox (absent = off); `until` is
+/// an optional `YYYY-MM-DD` (empty = no expiry).
+#[derive(Deserialize, Default)]
+struct AutoReplyForm {
+    csrf: String,
+    #[serde(default)]
+    enabled: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    until: String,
+}
+
+/// `POST /settings/autoreply` — save the auto-reply (vacation) configuration. CSRF-guarded;
+/// emits a tracing audit line and redirects back to `/settings`.
+async fn settings_autoreply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AutoReplyForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(StatusCode::FORBIDDEN, "Request blocked", "CSRF token missing or mismatched.");
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let Some(until) = parse_until(&form.until) else {
+        return error_page(StatusCode::BAD_REQUEST, "Invalid request", "The end date must be YYYY-MM-DD (or empty).");
+    };
+    let enabled = !form.enabled.trim().is_empty();
+    if let Err(e) = state
+        .store
+        .set_auto_reply(&mb.addr, enabled, form.subject.trim(), &form.body, until)
+        .await
+    {
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR, "Storage error", &e.to_string());
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        enabled,
+        until,
+        "auto-reply updated",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Parse the auto-reply end date: empty = `Some(0)` (no expiry), `YYYY-MM-DD` = that day's
+/// midnight UTC, anything else = `None` (rejected).
+fn parse_until(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    let mut it = s.split('-');
+    let y: i32 = it.next()?.parse().ok()?;
+    let m: u8 = it.next()?.parse().ok()?;
+    let d: u8 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    let date = time::Date::from_calendar_date(y, time::Month::try_from(m).ok()?, d).ok()?;
+    Some(date.midnight().assume_utc().unix_timestamp())
+}
+
+/// Format a stored `auto_reply_until` back into the date input's `YYYY-MM-DD` (empty for 0).
+fn fmt_until(ts: i64) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
+    match OffsetDateTime::from_unix_timestamp(ts) {
+        Ok(dt) => format!("{:04}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day()),
+        Err(_) => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Identity + CSRF + mailbox resolution
 // ---------------------------------------------------------------------------
 
@@ -1537,9 +1964,10 @@ fn nav_bar(active: &str) -> String {
         format!(r#"<a class="{cls}" href="{href}">{icon}{label}</a>"#)
     };
     format!(
-        "{}{}",
+        "{}{}{}",
         link("inbox", "/", "Inbox", ICO_INBOX),
         link("compose", "/compose", "Compose", ICO_COMPOSE),
+        link("settings", "/settings", "Settings", ICO_SETTINGS),
     )
 }
 
@@ -1840,6 +2268,19 @@ mod tests {
         assert_eq!(extract_addr("no-reply@w33d.xyz"), "no-reply@w33d.xyz");
         assert_eq!(extract_addr("HOLDFAST <no-reply@w33d.xyz>"), "no-reply@w33d.xyz");
         assert_eq!(extract_addr("  bare@x.com  "), "bare@x.com");
+    }
+
+    #[test]
+    fn parse_until_roundtrips_and_rejects_junk() {
+        assert_eq!(parse_until(""), Some(0), "empty = no expiry");
+        assert_eq!(parse_until("  "), Some(0));
+        let ts = parse_until("2026-07-15").expect("valid date");
+        assert!(ts > 0);
+        assert_eq!(fmt_until(ts), "2026-07-15", "round-trips through the date input");
+        assert_eq!(fmt_until(0), "");
+        assert_eq!(parse_until("2026-13-01"), None, "no month 13");
+        assert_eq!(parse_until("soon"), None);
+        assert_eq!(parse_until("2026-07-15-99"), None);
     }
 
     #[test]

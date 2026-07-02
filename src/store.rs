@@ -18,13 +18,20 @@
 //!    seen BOOLEAN DEFAULT FALSE, folder TEXT DEFAULT 'INBOX')`
 //! - `outbound_queue(id TEXT PK, raw TEXT, env_from TEXT, rcpts TEXT, to_domain TEXT,
 //!    attempts BIGINT, next_at BIGINT, status TEXT)`
+//! - `filter_rules(id TEXT PK, mailbox TEXT, position BIGINT, field TEXT, op TEXT, needle TEXT,
+//!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
+//! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
+//! - settings columns on `mailboxes` (signature, auto_reply_*), added idempotently.
 
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::model::{Alias, Mailbox, Message, MessageSummary, OutboundItem};
+use crate::model::{Alias, FilterRule, Mailbox, MailboxSettings, Message, MessageSummary, OutboundItem};
+
+/// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
+pub const AUTO_REPLY_DEDUPE_SECS: i64 = 86_400;
 
 /// Storage failure surfaced to the caller (mapped to a 500 in the webmail layer).
 #[derive(Debug, Error)]
@@ -103,6 +110,38 @@ pub trait Store: Send + Sync {
     /// Unread count for the app-bar badge.
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError>;
 
+    /// Every filter rule of a mailbox (enabled AND disabled), ordered by position ascending.
+    /// Delivery filters on `enabled`; the settings UI lists them all.
+    async fn list_rules(&self, mailbox: &str) -> Result<Vec<FilterRule>, StoreError>;
+    /// Persist a new filter rule.
+    async fn add_rule(&self, rule: &FilterRule) -> Result<(), StoreError>;
+    /// Delete a rule by id, scoped to `mailbox` (a user only ever touches their own rules).
+    async fn delete_rule(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
+    /// Enable/disable a rule, scoped to `mailbox`.
+    async fn set_rule_enabled(&self, mailbox: &str, id: &str, enabled: bool)
+        -> Result<(), StoreError>;
+    /// Reposition a rule, scoped to `mailbox` (the settings reorder renumbers via these).
+    async fn set_rule_position(&self, mailbox: &str, id: &str, position: i64)
+        -> Result<(), StoreError>;
+
+    /// Per-mailbox settings (signature + auto-reply). All-defaults when never saved.
+    async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError>;
+    /// Set the compose signature (empty clears it).
+    async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError>;
+    /// Set the auto-reply (vacation) configuration (`until` of 0 = no expiry).
+    async fn set_auto_reply(
+        &self,
+        mailbox: &str,
+        enabled: bool,
+        subject: &str,
+        body: &str,
+        until: i64,
+    ) -> Result<(), StoreError>;
+    /// Auto-reply dedupe check-and-record: returns `true` (and records `now`) when NO auto-reply
+    /// went to `sender` within [`AUTO_REPLY_DEDUPE_SECS`]; `false` means the caller must not send.
+    async fn mark_auto_replied(&self, mailbox: &str, sender: &str, now: i64)
+        -> Result<bool, StoreError>;
+
     /// Enqueue an outbound message for relay.
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError>;
     /// Queued items whose `next_at <= now`, capped (the relay worker's work list).
@@ -130,6 +169,10 @@ pub struct InMemoryStore {
     messages: Mutex<Vec<Message>>,
     outbound: Mutex<Vec<OutboundItem>>,
     aliases: Mutex<Vec<Alias>>,
+    rules: Mutex<Vec<FilterRule>>,
+    settings: Mutex<Vec<MailboxSettings>>,
+    /// Auto-reply dedupe log entries: `(mailbox, sender, sent_at)`.
+    auto_replies: Mutex<Vec<(String, String, i64)>>,
 }
 
 impl InMemoryStore {
@@ -376,6 +419,127 @@ impl Store for InMemoryStore {
             .count() as i64)
     }
 
+    async fn list_rules(&self, mailbox: &str) -> Result<Vec<FilterRule>, StoreError> {
+        let mut v: Vec<FilterRule> = self
+            .rules
+            .lock()
+            .expect("rules lock poisoned")
+            .iter()
+            .filter(|r| r.mailbox == mailbox)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.id.cmp(&b.id)));
+        Ok(v)
+    }
+
+    async fn add_rule(&self, rule: &FilterRule) -> Result<(), StoreError> {
+        self.rules
+            .lock()
+            .expect("rules lock poisoned")
+            .push(rule.clone());
+        Ok(())
+    }
+
+    async fn delete_rule(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        self.rules
+            .lock()
+            .expect("rules lock poisoned")
+            .retain(|r| !(r.mailbox == mailbox && r.id == id));
+        Ok(())
+    }
+
+    async fn set_rule_enabled(
+        &self,
+        mailbox: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        let mut v = self.rules.lock().expect("rules lock poisoned");
+        if let Some(r) = v.iter_mut().find(|r| r.mailbox == mailbox && r.id == id) {
+            r.enabled = enabled;
+        }
+        Ok(())
+    }
+
+    async fn set_rule_position(
+        &self,
+        mailbox: &str,
+        id: &str,
+        position: i64,
+    ) -> Result<(), StoreError> {
+        let mut v = self.rules.lock().expect("rules lock poisoned");
+        if let Some(r) = v.iter_mut().find(|r| r.mailbox == mailbox && r.id == id) {
+            r.position = position;
+        }
+        Ok(())
+    }
+
+    async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError> {
+        Ok(self
+            .settings
+            .lock()
+            .expect("settings lock poisoned")
+            .iter()
+            .find(|s| s.mailbox == mailbox)
+            .cloned()
+            .unwrap_or_else(|| MailboxSettings::default_for(mailbox)))
+    }
+
+    async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError> {
+        let mut v = self.settings.lock().expect("settings lock poisoned");
+        if let Some(s) = v.iter_mut().find(|s| s.mailbox == mailbox) {
+            s.signature = signature.to_string();
+        } else {
+            let mut s = MailboxSettings::default_for(mailbox);
+            s.signature = signature.to_string();
+            v.push(s);
+        }
+        Ok(())
+    }
+
+    async fn set_auto_reply(
+        &self,
+        mailbox: &str,
+        enabled: bool,
+        subject: &str,
+        body: &str,
+        until: i64,
+    ) -> Result<(), StoreError> {
+        let mut v = self.settings.lock().expect("settings lock poisoned");
+        let s = match v.iter_mut().find(|s| s.mailbox == mailbox) {
+            Some(s) => s,
+            None => {
+                v.push(MailboxSettings::default_for(mailbox));
+                v.last_mut().expect("just pushed")
+            }
+        };
+        s.auto_reply_enabled = enabled;
+        s.auto_reply_subject = subject.to_string();
+        s.auto_reply_body = body.to_string();
+        s.auto_reply_until = until;
+        Ok(())
+    }
+
+    async fn mark_auto_replied(
+        &self,
+        mailbox: &str,
+        sender: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut v = self.auto_replies.lock().expect("auto_replies lock poisoned");
+        if let Some((_, _, sent_at)) =
+            v.iter_mut().find(|(m, s, _)| m == mailbox && s == sender)
+        {
+            if now - *sent_at < AUTO_REPLY_DEDUPE_SECS {
+                return Ok(false);
+            }
+            *sent_at = now;
+        } else {
+            v.push((mailbox.to_string(), sender.to_string(), now));
+        }
+        Ok(true)
+    }
+
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError> {
         self.outbound
             .lock()
@@ -525,6 +689,47 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
+        // Per-mailbox settings (signature + auto-reply): added out-of-band (idempotent) so an
+        // already-provisioned `mailboxes` table gains the columns without a destructive rebuild.
+        // Nullable — pre-migration rows read as the defaults (empty / off / no expiry).
+        for stmt in [
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS signature TEXT",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_enabled BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_subject TEXT",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_body TEXT",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_until BIGINT",
+        ] {
+            sqlx::query(stmt).execute(&self.pool).await?;
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS filter_rules (\
+                 id TEXT PRIMARY KEY, \
+                 mailbox TEXT NOT NULL, \
+                 position BIGINT NOT NULL DEFAULT 0, \
+                 field TEXT NOT NULL, \
+                 op TEXT NOT NULL, \
+                 needle TEXT NOT NULL DEFAULT '', \
+                 action TEXT NOT NULL, \
+                 target_folder TEXT, \
+                 enabled BOOLEAN NOT NULL DEFAULT TRUE, \
+                 created_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_filter_rules_mailbox ON filter_rules (mailbox, position)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS auto_reply_log (\
+                 mailbox TEXT NOT NULL, \
+                 sender TEXT NOT NULL, \
+                 sent_at BIGINT NOT NULL, \
+                 PRIMARY KEY (mailbox, sender)\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -539,6 +744,44 @@ impl PgStore {
         Ok(Alias {
             local_part: row.try_get("local_part")?,
             mailbox: row.try_get("mailbox")?,
+        })
+    }
+
+    fn rule_from_row(row: &sqlx::postgres::PgRow) -> Result<FilterRule, sqlx::Error> {
+        Ok(FilterRule {
+            id: row.try_get("id")?,
+            mailbox: row.try_get("mailbox")?,
+            position: row.try_get("position")?,
+            field: row.try_get("field")?,
+            op: row.try_get("op")?,
+            needle: row.try_get("needle")?,
+            action: row.try_get("action")?,
+            target_folder: row.try_get("target_folder")?,
+            enabled: row.try_get("enabled")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+
+    /// Map the (nullable, post-migration) settings columns of a `mailboxes` row.
+    fn settings_from_row(
+        mailbox: &str,
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<MailboxSettings, sqlx::Error> {
+        Ok(MailboxSettings {
+            mailbox: mailbox.to_string(),
+            signature: row.try_get::<Option<String>, _>("signature")?.unwrap_or_default(),
+            auto_reply_enabled: row
+                .try_get::<Option<bool>, _>("auto_reply_enabled")?
+                .unwrap_or(false),
+            auto_reply_subject: row
+                .try_get::<Option<String>, _>("auto_reply_subject")?
+                .unwrap_or_default(),
+            auto_reply_body: row
+                .try_get::<Option<String>, _>("auto_reply_body")?
+                .unwrap_or_default(),
+            auto_reply_until: row
+                .try_get::<Option<i64>, _>("auto_reply_until")?
+                .unwrap_or(0),
         })
     }
 
@@ -856,6 +1099,161 @@ impl Store for PgStore {
             .await
             .map_err(backend)?;
         row.try_get("n").map_err(backend)
+    }
+
+    async fn list_rules(&self, mailbox: &str) -> Result<Vec<FilterRule>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, mailbox, position, field, op, needle, action, target_folder, enabled, \
+                    created_at \
+             FROM filter_rules WHERE mailbox = $1 ORDER BY position ASC, id ASC",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::rule_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn add_rule(&self, rule: &FilterRule) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO filter_rules \
+                 (id, mailbox, position, field, op, needle, action, target_folder, enabled, \
+                  created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&rule.id)
+        .bind(&rule.mailbox)
+        .bind(rule.position)
+        .bind(&rule.field)
+        .bind(&rule.op)
+        .bind(&rule.needle)
+        .bind(&rule.action)
+        .bind(&rule.target_folder)
+        .bind(rule.enabled)
+        .bind(rule.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_rule(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM filter_rules WHERE mailbox = $1 AND id = $2")
+            .bind(mailbox)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_rule_enabled(
+        &self,
+        mailbox: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE filter_rules SET enabled = $1 WHERE mailbox = $2 AND id = $3")
+            .bind(enabled)
+            .bind(mailbox)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_rule_position(
+        &self,
+        mailbox: &str,
+        id: &str,
+        position: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query("UPDATE filter_rules SET position = $1 WHERE mailbox = $2 AND id = $3")
+            .bind(position)
+            .bind(mailbox)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError> {
+        let row = sqlx::query(
+            "SELECT signature, auto_reply_enabled, auto_reply_subject, auto_reply_body, \
+                    auto_reply_until \
+             FROM mailboxes WHERE addr = $1",
+        )
+        .bind(mailbox)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        match row {
+            Some(r) => Self::settings_from_row(mailbox, &r).map_err(backend),
+            None => Ok(MailboxSettings::default_for(mailbox)),
+        }
+    }
+
+    async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE mailboxes SET signature = $1 WHERE addr = $2")
+            .bind(signature)
+            .bind(mailbox)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_auto_reply(
+        &self,
+        mailbox: &str,
+        enabled: bool,
+        subject: &str,
+        body: &str,
+        until: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE mailboxes SET auto_reply_enabled = $1, auto_reply_subject = $2, \
+                    auto_reply_body = $3, auto_reply_until = $4 \
+             WHERE addr = $5",
+        )
+        .bind(enabled)
+        .bind(subject)
+        .bind(body)
+        .bind(until)
+        .bind(mailbox)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn mark_auto_replied(
+        &self,
+        mailbox: &str,
+        sender: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        // Atomic check-and-record: the upsert only lands when no reply was recorded within the
+        // dedupe window, so concurrent deliveries never double-send. `rows_affected` is the
+        // verdict.
+        let res = sqlx::query(
+            "INSERT INTO auto_reply_log (mailbox, sender, sent_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (mailbox, sender) DO UPDATE SET sent_at = EXCLUDED.sent_at \
+             WHERE auto_reply_log.sent_at <= $4",
+        )
+        .bind(mailbox)
+        .bind(sender)
+        .bind(now)
+        .bind(now - AUTO_REPLY_DEDUPE_SECS)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError> {
