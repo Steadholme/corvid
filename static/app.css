@@ -1201,3 +1201,82 @@ mark.search-hit {
   border-left:2px solid var(--border-2);
   color:var(--ink-2);
 }
+
+/* ============================================================
+   Multi-signature / per-identity signatures zone
+   Pure styling over existing SSR hooks (webmail.rs):
+   · .signature-list  — the #signatures settings section, already a
+     .card.pad, holding an <h2>, a .signature-list__items grid of
+     per-signature inline edit forms, and a trailing .signature-create
+     add-new form. (Empty state is a shared <p class="muted">.)
+   · .signature-item  — one stored signature editing inline: a Name
+     <input>, a "From identity" <select>, a Plain-text + a Rich-HTML
+     <textarea>, a "Default for this identity" checkbox, and Save /
+     Delete actions.
+   · .signature-item.signature-default — the signature currently marked
+     default for its identity.
+   This deliberately MIRRORS the .template-list / .template-item /
+   .template-create idiom above: the same surface-2 + hairline
+   nested-panel look, the same compact-textarea move, and the shared
+   .field / .form-actions / .btn / .muted kit — so the two settings
+   lists read as one system. The rich-HTML field is a raw <textarea>
+   here (NOT the compose contenteditable), so .compose-rich is left
+   untouched; it only gains the shared --mono face for editing HTML.
+   Tokens only — no new fonts/libs/external links. Motion rides
+   --dur/--ease (globally stilled by the prefers-reduced-motion reset
+   near the top); every colour is token-driven so light/dark track the
+   same way the template + snooze/schedule zones do. */
+
+/* List rhythm + inline edit panel — identical idiom to
+   .template-list__items / .template-item so both settings lists share
+   one rhythm: a soft surface-2 fill + hairline border sets each entry
+   off from the parent .card.pad. */
+.signature-list__items { display:grid; gap:12px; margin:0 0 6px; }
+.signature-item {
+  position:relative;
+  padding:14px 16px;
+  background:var(--surface-2);
+  border:1px solid var(--hairline);
+  border-radius:var(--r-sm);
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.signature-item:hover { border-color:var(--border-2); }
+.signature-item form { margin:0; }
+
+/* The global `.field textarea { min-height:220px }` is huge for a
+   stacked list of signatures (each carries TWO textareas); compact both
+   bodies so the list stays scannable — same move as
+   .template-list .field textarea. The Rich-HTML box gets the shared
+   monospace face so raw markup reads cleanly. */
+.signature-list .field { margin-bottom:12px; }
+.signature-list .field textarea { min-height:88px; }
+.signature-list .field textarea[name="body_html"] { font:13px/1.6 var(--mono); }
+
+/* Add-new form — divide it from the list so "Add signature" reads as a
+   distinct affordance below the existing entries (mirrors
+   .template-create). */
+.signature-create {
+  margin-top:16px; padding-top:16px;
+  border-top:1px solid var(--hairline);
+}
+
+/* Default marker — the signature in use for its identity. A soft accent
+   left rail (the same inset idiom as .mailrow-wrap.is-cursor) plus a
+   tinted border sets the whole panel apart at a glance. */
+.signature-item.signature-default {
+  border-color:var(--accent-soft-2);
+  box-shadow:inset 3px 0 0 var(--accent);
+}
+/* …and a small positive-hue pill makes the state unmistakable. The
+   item's ::before is the first flow child (it sits before the <form>),
+   so it leads the panel with no absolute positioning and no overlap —
+   no extra markup class is needed. The ✓ glyph renders in the shared
+   Inter/system stack, so no new font is pulled. */
+.signature-item.signature-default::before {
+  content:"\2713  Default";
+  display:inline-flex; align-items:center;
+  margin-bottom:12px;
+  padding:3px 10px; border-radius:var(--r-pill);
+  font-size:11px; font-weight:650; letter-spacing:.02em;
+  color:var(--ok-ink); background:var(--ok-soft);
+}
