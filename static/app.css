@@ -485,3 +485,24 @@ select:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
   .bulkbar { position:fixed; left:14px; right:14px; bottom:14px; margin:0; }
   .mailcheck { opacity:1 !important; }
 }
+
+/* ---- Search: match highlight + operator hint --------------------------- */
+/* Highlighted match inside a mail row (from / subject). Overrides the raw
+   browser <mark> yellow with a soft accent wash; keeps the row's own ink
+   colour so contrast stays AA (ink/ink-2 on --accent-soft-2 is >=7:1). */
+mark.search-hit {
+  background:var(--accent-soft-2); color:inherit;
+  border-radius:var(--r-xs); padding:0 2px;
+  -webkit-box-decoration-break:clone; box-decoration-break:clone;
+}
+
+/* Operator cheat-sheet under the search field. Drops onto its own full-width
+   row beneath the input/button and reads as a restrained code hint. */
+.folder-tabs .search-box { flex-wrap:wrap; }
+.folder-tabs .search-hint {
+  flex-basis:100%; max-width:320px; margin-top:8px;
+  padding:7px 11px; word-spacing:3px;
+  font:11.5px/1.85 var(--mono); color:var(--ink-2);
+  background:var(--surface-2); border:1px solid var(--border);
+  border-radius:var(--r-sm);
+}
