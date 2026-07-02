@@ -8,8 +8,8 @@
 //! 2. Keeps only an allow-list of structural/formatting tags; any other tag's delimiters are
 //!    removed (its text content is preserved as plain text).
 //! 3. Strips every attribute except a tiny safe set (`href`/`src` scheme-checked the same way
-//!    as the forum markdown renderer, plus `alt`/`title`), so `onerror=`, `style=`, etc. never
-//!    reach the output.
+//!    as the forum markdown renderer, plus `alt`/`title` and colour-only `span style`), so
+//!    `onerror=` and layout/scriptable style never reach the output.
 //! 4. Escapes stray `<` that do not start a recognised tag.
 //!
 //! This is deliberately strict rather than clever: unknown markup degrades to text, never to
@@ -17,13 +17,48 @@
 
 /// Tags whose start/end delimiters are preserved (their content is always kept as text).
 const ALLOWED_TAGS: &[&str] = &[
-    "a", "b", "i", "u", "em", "strong", "p", "br", "hr", "span", "div", "blockquote", "pre",
-    "code", "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody",
-    "tr", "td", "th", "img", "small", "sub", "sup", "dl", "dt", "dd",
+    "a",
+    "b",
+    "i",
+    "u",
+    "em",
+    "strong",
+    "p",
+    "br",
+    "hr",
+    "span",
+    "div",
+    "blockquote",
+    "pre",
+    "code",
+    "ul",
+    "ol",
+    "li",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "table",
+    "thead",
+    "tbody",
+    "tr",
+    "td",
+    "th",
+    "img",
+    "small",
+    "sub",
+    "sup",
+    "dl",
+    "dt",
+    "dd",
 ];
 
 /// Blocks dropped wholesale (tag + everything up to the matching close tag).
-const DROP_BLOCKS: &[&str] = &["script", "style", "title", "head", "iframe", "object", "embed"];
+const DROP_BLOCKS: &[&str] = &[
+    "script", "style", "title", "head", "iframe", "object", "embed",
+];
 
 /// Sanitise `html`, returning a string safe to embed directly inside page markup.
 pub fn sanitize_html(html: &str) -> String {
@@ -152,9 +187,15 @@ fn rebuild_open_tag(name: &str, raw: &str, self_closing: bool) -> String {
         let keep = match attr.as_str() {
             "href" | "src" => is_safe_url(&val),
             "alt" | "title" => true,
+            "style" if name == "span" => sanitize_style(&val).is_some(),
             _ => false,
         };
         if keep {
+            let val = if attr == "style" {
+                sanitize_style(&val).unwrap_or_default()
+            } else {
+                val
+            };
             out.push_str(&format!(" {}=\"{}\"", attr, esc_attr(&val)));
         }
     }
@@ -247,9 +288,186 @@ pub fn is_safe_url(url: &str) -> bool {
     }
 }
 
+/// Keep only colour declarations in a `span style`. Everything layout-affecting or scriptable is
+/// dropped, and an empty result removes the style attribute entirely.
+fn sanitize_style(style: &str) -> Option<String> {
+    let mut kept = Vec::new();
+    for decl in style.split(';') {
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
+        let prop = prop.trim().to_ascii_lowercase();
+        if !matches!(prop.as_str(), "color" | "background-color") {
+            continue;
+        }
+        let val = val.trim();
+        if is_safe_css_color(val) {
+            kept.push(format!("{prop}: {val}"));
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join("; "))
+}
+
+fn is_safe_css_color(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    let lower = v.to_ascii_lowercase();
+    if lower.contains("url")
+        || lower.contains("expression")
+        || lower.contains('@')
+        || lower.contains('\\')
+        || lower.contains('<')
+        || lower.contains('>')
+        || lower.contains('&')
+        || lower.contains('"')
+        || lower.contains('\'')
+    {
+        return false;
+    }
+    if let Some(hex) = lower.strip_prefix('#') {
+        return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    if lower.chars().all(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    for prefix in ["rgb(", "rgba(", "hsl(", "hsla("] {
+        if lower.starts_with(prefix)
+            && lower.ends_with(')')
+            && lower[prefix.len()..lower.len() - 1].chars().all(|c| {
+                c.is_ascii_digit() || c.is_ascii_whitespace() || matches!(c, ',' | '.' | '%' | '/')
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Escape a value for safe inclusion inside a double-quoted attribute.
 fn esc_attr(s: &str) -> String {
-    s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Strip HTML to a readable plain-text fallback for outbound `multipart/alternative`.
+pub fn html_to_text(html: &str) -> String {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            let next = html[i..].find('<').map(|p| i + p).unwrap_or(bytes.len());
+            out.push_str(&decode_html_entities(&html[i..next]));
+            i = next;
+            continue;
+        }
+        let Some(end) = find_tag_end(bytes, i) else {
+            out.push('<');
+            i += 1;
+            continue;
+        };
+        let raw_tag = &html[i + 1..end];
+        let (name, is_close) = tag_name(raw_tag);
+        match (name.as_str(), is_close) {
+            ("br", _) => out.push('\n'),
+            ("li", false) => {
+                ensure_newline(&mut out);
+                out.push_str("- ");
+            }
+            ("p" | "div" | "blockquote" | "h1" | "h2" | "h3" | "tr", false) => {
+                ensure_newline(&mut out);
+            }
+            ("p" | "div" | "blockquote" | "h1" | "h2" | "h3" | "li" | "tr", true) => {
+                out.push('\n');
+            }
+            _ => {}
+        }
+        i = end + 1;
+    }
+    normalise_text(&out)
+}
+
+fn ensure_newline(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn normalise_text(text: &str) -> String {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank += 1;
+            if blank <= 1 && !out.is_empty() {
+                out.push('\n');
+            }
+            continue;
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+        blank = 0;
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn decode_html_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let after_amp = &rest[pos + 1..];
+        let Some(end) = after_amp.find(';') else {
+            out.push('&');
+            rest = after_amp;
+            continue;
+        };
+        let entity = &after_amp[..end];
+        if let Some(ch) = decode_entity(entity) {
+            out.push(ch);
+            rest = &after_amp[end + 1..];
+        } else {
+            out.push('&');
+            rest = after_amp;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            if let Some(hex) = entity
+                .strip_prefix("#x")
+                .or_else(|| entity.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = entity.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Escape plain text (e.g. a text/plain body rendered into HTML).
@@ -296,6 +514,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_only_safe_span_colour_style() {
+        let out = sanitize_html(
+            r#"<span style="color:#336699; position:absolute; background-color: rgb(1, 2, 3)">x</span>"#,
+        );
+        assert_eq!(
+            out,
+            r#"<span style="color: #336699; background-color: rgb(1, 2, 3)">x</span>"#
+        );
+        assert!(!out.contains("position"));
+    }
+
+    #[test]
+    fn drops_dangerous_or_non_span_style() {
+        let out = sanitize_html(
+            r#"<span style="color:url(javascript:alert(1)); width:10px">x</span><p style="color:red">y</p>"#,
+        );
+        assert_eq!(out, "<span>x</span><p>y</p>");
+    }
+
+    #[test]
     fn drops_unknown_tags_keeps_text() {
         let out = sanitize_html("<marquee>scrolling</marquee>");
         assert_eq!(out, "scrolling");
@@ -313,5 +551,13 @@ mod tests {
     fn escapes_stray_lt() {
         let out = sanitize_html("a < b and c");
         assert!(out.contains("a &lt; b and c"));
+    }
+
+    #[test]
+    fn html_to_text_keeps_readable_blocks_lists_and_entities() {
+        let out = html_to_text(
+            "<p>Hello&nbsp;<strong>rich</strong></p><ul><li>One</li><li>Two &amp; three</li></ul>",
+        );
+        assert_eq!(out, "Hello rich\n- One\n- Two & three");
     }
 }

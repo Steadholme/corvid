@@ -336,6 +336,81 @@ const COMPOSE_UX_JS: &str = r#"
   var toast = window.__corvidToast || function () {};
   var form = document.querySelector('form[action="/send"]'); if (!form) return;
 
+  var body = form.querySelector('#body');
+  var rich = form.querySelector('#body-rich');
+  var bodyHtml = form.querySelector('#body_html');
+  var toolbar = form.querySelector('[data-compose-toolbar]');
+  function escapeHtml(s) {
+    return (s || '').replace(/[&<>"']/g, function (c) {
+      return c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;';
+    });
+  }
+  function textToHtml(s) {
+    var lines = (s || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    var html = [], para = [], quote = [];
+    function flushPara() {
+      if (!para.length) return;
+      html.push('<p>' + para.map(escapeHtml).join('<br>') + '</p>');
+      para = [];
+    }
+    function flushQuote() {
+      if (!quote.length) return;
+      html.push('<blockquote>' + quote.map(escapeHtml).join('<br>') + '</blockquote>');
+      quote = [];
+    }
+    lines.forEach(function (line) {
+      if (/^>\s?/.test(line)) {
+        flushPara();
+        quote.push(line.replace(/^>\s?/, ''));
+        return;
+      }
+      if (line.trim() === '') {
+        flushPara(); flushQuote();
+        return;
+      }
+      flushQuote();
+      para.push(line);
+    });
+    flushPara(); flushQuote();
+    return html.join('');
+  }
+  function syncRich() {
+    if (!rich || !body || !bodyHtml) return;
+    bodyHtml.value = rich.innerHTML;
+    var text = rich.innerText != null ? rich.innerText : (rich.textContent || '');
+    body.value = text.replace(/\u00a0/g, ' ');
+  }
+  if (body && rich && bodyHtml && toolbar) {
+    rich.innerHTML = bodyHtml.value || textToHtml(body.value);
+    toolbar.hidden = false;
+    rich.hidden = false;
+    body.hidden = true;
+    rich.addEventListener('input', syncRich);
+    toolbar.querySelectorAll('[data-cmd]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        rich.focus();
+        var cmd = btn.getAttribute('data-cmd');
+        if (cmd === 'createLink') {
+          var href = window.prompt('Link URL');
+          if (href === null) return;
+          href = href.trim();
+          if (href) document.execCommand('createLink', false, href);
+          else document.execCommand('unlink', false, null);
+        } else if (cmd === 'blockquote') {
+          document.execCommand('formatBlock', false, 'blockquote');
+        } else if (cmd === 'clear') {
+          document.execCommand('removeFormat', false, null);
+          document.execCommand('unlink', false, null);
+        } else {
+          document.execCommand(cmd, false, null);
+        }
+        syncRich();
+      });
+    });
+    syncRich();
+  }
+
   var subject = form.querySelector('#subject');
   if (subject) {
     var cc = document.createElement('span'); cc.className = 'charcount';
@@ -371,6 +446,7 @@ const COMPOSE_UX_JS: &str = r#"
   chipify(form.querySelector('#cc'));
 
   form.addEventListener('submit', function (e) {
+    syncRich();
     var btn = e.submitter, action = btn ? btn.value : 'send';
     if (action === 'send') {
       var to = form.querySelector('#to');
@@ -1909,7 +1985,24 @@ async fn compose_form(
       <div class="combo"><input id="cc" name="cc" value="{cc}" placeholder="(optional)" role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="cc-list" autocomplete="off" data-autocomplete><ul class="combo__list" id="cc-list" role="listbox" hidden></ul></div>
     </div>
     <div class="field"><label for="subject">Subject</label><input id="subject" name="subject" value="{subject}" placeholder="Subject"></div>
-    <div class="field"><label for="body">Message</label><textarea id="body" name="body">{body}</textarea></div>
+    <div class="field compose-field"><label for="body">Message</label>
+      <input type="hidden" id="body_html" name="body_html" value="">
+      <div class="compose-toolbar" data-compose-toolbar role="toolbar" aria-label="Formatting tools" hidden>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="bold" title="Bold" aria-label="Bold"><strong>B</strong></button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="italic" title="Italic" aria-label="Italic"><em>I</em></button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="underline" title="Underline" aria-label="Underline"><u>U</u></button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="insertUnorderedList" title="Bulleted list" aria-label="Bulleted list">UL</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="insertOrderedList" title="Numbered list" aria-label="Numbered list">OL</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="outdent" title="Outdent" aria-label="Outdent">Out</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="indent" title="Indent" aria-label="Indent">In</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="blockquote" title="Quote" aria-label="Quote">Quote</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="createLink" title="Insert or edit link" aria-label="Insert or edit link">Link</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="unlink" title="Remove link" aria-label="Remove link">Unlink</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-cmd="clear" title="Clear formatting" aria-label="Clear formatting">Tx</button>
+      </div>
+      <div id="body-rich" class="compose-rich" role="textbox" aria-multiline="true" contenteditable="true" data-source="body" hidden></div>
+      <textarea id="body" name="body">{body}</textarea>
+    </div>
     <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple></div>
     <div class="form-actions">
       <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
@@ -2075,6 +2168,9 @@ struct SendForm {
     subject: String,
     #[serde(default)]
     body: String,
+    /// Sanitised server-side before it is used. Empty means legacy plain-text compose.
+    #[serde(default)]
+    body_html: String,
     /// Thread headers carried from a reply draft (empty for a fresh compose).
     #[serde(default)]
     in_reply_to: String,
@@ -2119,13 +2215,15 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             Ok(v) => v,
             Err(resp) => return *resp,
         };
+    let (body_text, body_html) = compose_body_parts(&form.body, &form.body_html);
 
     let raw = build_rfc822(
         &from_header,
         &form.to,
         &form.cc,
         &form.subject,
-        &form.body,
+        &body_text,
+        &body_html,
         &form.in_reply_to,
         &form.references,
         &state.config.mail_domain,
@@ -2140,7 +2238,8 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             &from_header,
             &form.to,
             &form.subject,
-            &form.body,
+            &body_text,
+            &body_html,
             &raw,
             "Drafts",
         )
@@ -2177,7 +2276,8 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
                 &from_header,
                 &form.to,
                 &form.subject,
-                &form.body,
+                &body_text,
+                &body_html,
                 &signed,
                 "Sent",
             )
@@ -2229,6 +2329,23 @@ fn header_safe(s: &str) -> String {
     s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
+/// Server-side representation of a compose body. Rich HTML is sanitised before MIME assembly and
+/// the plain alternative is derived from that clean HTML; an empty HTML field preserves the legacy
+/// plain-text path exactly.
+fn compose_body_parts(body: &str, body_html: &str) -> (String, String) {
+    let clean_html = crate::sanitize::sanitize_html(body_html);
+    if clean_html.trim().is_empty() {
+        return (body.to_string(), String::new());
+    }
+    let html_text = crate::sanitize::html_to_text(&clean_html);
+    let plain = if html_text.trim().is_empty() && !body.trim().is_empty() {
+        body.to_string()
+    } else {
+        html_text
+    };
+    (plain, clean_html)
+}
+
 /// Persist a locally-authored message (a Sent copy or a Draft) into `mailbox`'s `folder`, from the
 /// chosen `from` identity. Best effort: a storage error is logged but never fails the user's
 /// send/save (the mail already left). Threads the copy into its conversation and harvests the
@@ -2241,6 +2358,7 @@ async fn store_local_copy(
     to: &str,
     subject: &str,
     body: &str,
+    body_html: &str,
     raw: &str,
     folder: &str,
 ) {
@@ -2256,7 +2374,7 @@ async fn store_local_copy(
         subject: subject.to_string(),
         raw_rfc822: raw.to_string(),
         body_text: body.to_string(),
-        body_html: String::new(),
+        body_html: body_html.to_string(),
         received_at: now_secs(),
         seen: true,
         folder: folder.to_string(),
@@ -2328,10 +2446,13 @@ async fn parse_send(
                 match name.as_str() {
                     "csrf" => form.csrf = text,
                     "to" => form.to = text,
+                    "cc" => form.cc = text,
                     "subject" => form.subject = text,
                     "body" => form.body = text,
+                    "body_html" => form.body_html = text,
                     "in_reply_to" => form.in_reply_to = text,
                     "references" => form.references = text,
+                    "identity" => form.identity = text,
                     "action" => form.action = text,
                     _ => {}
                 }
@@ -2416,6 +2537,7 @@ async fn api_send(
         &req.body,
         "",
         "",
+        "",
         &state.config.mail_domain,
         &[],
     );
@@ -2432,6 +2554,7 @@ async fn api_send(
                 &req.to,
                 &req.subject,
                 &req.body,
+                "",
                 &signed,
                 "Sent",
             )
@@ -2504,10 +2627,10 @@ fn json_status(status: StatusCode, message: &str) -> Response {
 }
 
 /// Build an RFC822 message for an outbound compose. `in_reply_to`/`references` (empty to omit)
-/// carry the reply threading headers built from the original's stored raw source. With no
-/// `attachments` the body is a single `text/plain` part (unchanged wire format); with attachments
-/// it becomes a `multipart/mixed` — a `text/plain` body part followed by one base64
-/// `Content-Disposition: attachment` part per file.
+/// carry the reply threading headers built from the original's stored raw source. With no HTML and
+/// no `attachments` the body is a single `text/plain` part (unchanged wire format). Rich compose
+/// sends a `multipart/alternative`; when files are present that alternative becomes the first part
+/// of a `multipart/mixed`, followed by one base64 `Content-Disposition: attachment` part per file.
 #[allow(clippy::too_many_arguments)]
 fn build_rfc822(
     from: &str,
@@ -2515,12 +2638,15 @@ fn build_rfc822(
     cc: &str,
     subject: &str,
     body: &str,
+    body_html: &str,
     in_reply_to: &str,
     references: &str,
     domain: &str,
     attachments: &[Attachment],
 ) -> String {
-    let body_norm = body.replace("\r\n", "\n").replace('\n', "\r\n");
+    let body_norm = mime_text(body);
+    let html_norm = mime_text(body_html);
+    let has_html = !body_html.trim().is_empty();
     let mut thread = String::new();
     if !in_reply_to.trim().is_empty() {
         thread.push_str(&format!("In-Reply-To: {}\r\n", in_reply_to.trim()));
@@ -2541,20 +2667,40 @@ fn build_rfc822(
         mid = message_id(domain),
     );
 
-    if attachments.is_empty() {
+    if attachments.is_empty() && !has_html {
         return format!(
             "{head}Content-Type: text/plain; charset=utf-8\r\n\
              Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
         );
     }
 
+    if attachments.is_empty() {
+        let boundary = mime_boundary();
+        let mut out = format!(
+            "{head}Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
+             This is a multi-part message in MIME format.\r\n",
+        );
+        push_alternative_body(&mut out, &boundary, &body_norm, &html_norm);
+        return out;
+    }
+
     let boundary = mime_boundary();
     let mut out = format!(
         "{head}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
-         This is a multi-part message in MIME format.\r\n\
-         --{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
-         Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
+         This is a multi-part message in MIME format.\r\n",
     );
+    if has_html {
+        let alt_boundary = mime_boundary();
+        out.push_str(&format!(
+            "--{boundary}\r\nContent-Type: multipart/alternative; boundary=\"{alt_boundary}\"\r\n\r\n",
+        ));
+        push_alternative_body(&mut out, &alt_boundary, &body_norm, &html_norm);
+    } else {
+        out.push_str(&format!(
+            "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n",
+        ));
+    }
     for a in attachments {
         let name = crate::rfc822::sanitize_filename(&a.filename);
         let ctype = crate::rfc822::content_type_base(&a.content_type);
@@ -2567,6 +2713,24 @@ fn build_rfc822(
     }
     out.push_str(&format!("--{boundary}--\r\n"));
     out
+}
+
+/// Normalise a MIME text part to CRLF without otherwise changing content.
+fn mime_text(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
+/// Append the two body alternatives in the order preferred by mail clients: plain, then HTML.
+fn push_alternative_body(out: &mut String, boundary: &str, body_norm: &str, html_norm: &str) {
+    out.push_str(&format!(
+        "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\n{body_norm}\r\n\
+         --{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Transfer-Encoding: 8bit\r\n\r\n{html_norm}\r\n\
+         --{boundary}--\r\n",
+    ));
 }
 
 /// A fresh MIME multipart boundary — random enough never to occur in a payload.
@@ -4149,6 +4313,88 @@ mod tests {
         assert_eq!(display_from("bare@x.com"), "bare@x.com");
     }
 
+    #[tokio::test]
+    async fn compose_form_renders_rich_editor_hooks() {
+        use tower::ServiceExt;
+
+        let state = crate::build_dev_state().await;
+        let req = Request::builder()
+            .uri("/compose")
+            .header("x-auth-subject", "w33d")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        for needle in [
+            r#"name="body_html""#,
+            r#"data-compose-toolbar"#,
+            r#"contenteditable="true""#,
+            r#"data-cmd="bold""#,
+            r#"data-cmd="createLink""#,
+            r#"<textarea id="body" name="body">"#,
+        ] {
+            assert!(html.contains(needle), "missing compose hook {needle}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rich_html_send_is_sanitised_and_enqueued_as_alternative() {
+        use tower::ServiceExt;
+
+        let state = crate::build_dev_state().await;
+        let req = Request::builder()
+            .uri("/compose")
+            .header("x-auth-subject", "w33d")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        let token = set_cookie
+            .split(';')
+            .next()
+            .and_then(|kv| kv.split_once('='))
+            .map(|(_, v)| v.to_string())
+            .unwrap();
+        let form = format!(
+            "csrf={token}&action=send&to=friend%40example.com&subject=Rich&body=fallback&body_html=%3Cp%3EHello%20%3Cstrong%3Erich%3C%2Fstrong%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E%3C%2Fp%3E"
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/send")
+            .header("x-auth-subject", "w33d")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, format!("__Host-csrf={token}"))
+            .body(axum::body::Body::from(form))
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+        let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0]
+            .raw
+            .contains("Content-Type: multipart/alternative; boundary="));
+        assert!(due[0]
+            .raw
+            .contains("Content-Type: text/html; charset=utf-8"));
+        assert!(due[0].raw.contains("<strong>rich</strong>"));
+        assert!(!due[0].raw.contains("<script"));
+        assert!(!due[0].raw.contains("alert(1)"));
+
+        let parsed = crate::rfc822::parse(&due[0].raw);
+        assert!(parsed.body_text.contains("Hello rich"));
+        assert!(parsed.body_html.contains("<strong>rich</strong>"));
+    }
+
     #[test]
     fn build_rfc822_has_signed_headers() {
         let raw = build_rfc822(
@@ -4157,6 +4403,7 @@ mod tests {
             "",
             "Hi",
             "Body line",
+            "",
             "",
             "",
             "w33d.xyz",
@@ -4188,6 +4435,7 @@ mod tests {
             "",
             "Re: Hi",
             "Body",
+            "",
             "<orig@ex.com>",
             "<root@ex.com> <orig@ex.com>",
             "w33d.xyz",
@@ -4207,10 +4455,50 @@ mod tests {
             "Body",
             "",
             "",
+            "",
             "w33d.xyz",
             &[],
         );
         assert!(raw.contains("Cc: cc@z.com\r\n"), "Cc header emitted");
+    }
+
+    #[test]
+    fn compose_body_parts_sanitises_html_and_derives_plain_text() {
+        let (plain, html) = compose_body_parts(
+            "fallback",
+            r#"<p>Hello <strong>rich</strong><script>alert(1)</script></p><span style="color:#336699;position:absolute">blue</span>"#,
+        );
+        assert!(plain.contains("Hello rich"));
+        assert!(plain.contains("blue"));
+        assert!(html.contains("<strong>rich</strong>"));
+        assert!(html.contains(r#"<span style="color: #336699">blue</span>"#));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("position"));
+        assert!(!html.contains("alert(1)"));
+    }
+
+    #[test]
+    fn build_rfc822_emits_multipart_alternative_with_html() {
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "",
+            "Rich",
+            "Hello rich",
+            "<p>Hello <strong>rich</strong></p>",
+            "",
+            "",
+            "w33d.xyz",
+            &[],
+        );
+        assert!(raw.contains("Content-Type: multipart/alternative; boundary="));
+        assert!(raw.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(raw.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(raw.contains("<p>Hello <strong>rich</strong></p>"));
+
+        let parsed = crate::rfc822::parse(&raw);
+        assert!(parsed.body_text.contains("Hello rich"));
+        assert!(parsed.body_html.contains("<strong>rich</strong>"));
     }
 
     #[test]
@@ -4226,6 +4514,7 @@ mod tests {
             "",
             "Files",
             "See attached",
+            "",
             "",
             "",
             "w33d.xyz",
@@ -4247,6 +4536,38 @@ mod tests {
         assert_eq!(metas[0].filename, "report.txt");
         let got = crate::rfc822::extract_attachment(&raw, 0).unwrap();
         assert_eq!(got.data, b"hello attachment");
+    }
+
+    #[test]
+    fn build_rfc822_nests_alternative_inside_mixed_with_attachment() {
+        let att = Attachment {
+            filename: "report.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: b"hello attachment".to_vec(),
+        };
+        let raw = build_rfc822(
+            "w33d@w33d.xyz",
+            "x@y.com",
+            "",
+            "Rich files",
+            "See attached",
+            "<p>See <strong>attached</strong></p>",
+            "",
+            "",
+            "w33d.xyz",
+            &[att],
+        );
+
+        assert!(raw.contains("Content-Type: multipart/mixed; boundary="));
+        assert!(raw.contains("Content-Type: multipart/alternative; boundary="));
+        assert!(raw.contains("Content-Type: text/html; charset=utf-8"));
+
+        let parsed = crate::rfc822::parse(&raw);
+        assert!(parsed.body_text.contains("See attached"));
+        assert!(parsed.body_html.contains("<strong>attached</strong>"));
+        let metas = crate::rfc822::list_attachments(&raw);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].filename, "report.txt");
     }
 
     #[test]
