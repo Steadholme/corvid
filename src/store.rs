@@ -25,7 +25,8 @@
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
 //! - `sender_lists(id TEXT PK, user TEXT, address_or_domain TEXT, kind TEXT, created_at BIGINT)`
 //! - `spam_annotations(message_id TEXT PK, mailbox TEXT, score BIGINT, reason TEXT)`
-//! - settings columns on `mailboxes` (signature, auto_reply_*), added idempotently.
+//! - settings columns on `mailboxes` (signature, undo_send_window_secs, auto_reply_*), added
+//!   idempotently.
 
 use std::sync::Mutex;
 
@@ -36,6 +37,7 @@ use crate::model::{
     Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
     OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
     SearchState, SendIdentity, SenderListEntry, SpamAnnotation, ThreadSummary,
+    DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 
 /// The auto-reply dedupe window: at most one auto-reply per `(mailbox, sender)` per 24 hours.
@@ -160,10 +162,12 @@ pub trait Store: Send + Sync {
         position: i64,
     ) -> Result<(), StoreError>;
 
-    /// Per-mailbox settings (signature + auto-reply). All-defaults when never saved.
+    /// Per-mailbox settings (signature + undo send + auto-reply). All-defaults when never saved.
     async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError>;
     /// Set the compose signature (empty clears it).
     async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError>;
+    /// Set the undo-send hold window in seconds (`0` keeps the legacy immediate-send path).
+    async fn set_undo_send_window(&self, mailbox: &str, secs: i64) -> Result<(), StoreError>;
     /// Set the auto-reply (vacation) configuration (`until` of 0 = no expiry).
     async fn set_auto_reply(
         &self,
@@ -1002,6 +1006,19 @@ impl Store for InMemoryStore {
             s.signature = signature.to_string();
             v.push(s);
         }
+        Ok(())
+    }
+
+    async fn set_undo_send_window(&self, mailbox: &str, secs: i64) -> Result<(), StoreError> {
+        let mut v = self.settings.lock().expect("settings lock poisoned");
+        let s = match v.iter_mut().find(|s| s.mailbox == mailbox) {
+            Some(s) => s,
+            None => {
+                v.push(MailboxSettings::default_for(mailbox));
+                v.last_mut().expect("just pushed")
+            }
+        };
+        s.undo_send_window_secs = secs;
         Ok(())
     }
 
@@ -1895,11 +1912,12 @@ impl PgStore {
         )
         .execute(&self.pool)
         .await?;
-        // Per-mailbox settings (signature + auto-reply): added out-of-band (idempotent) so an
-        // already-provisioned `mailboxes` table gains the columns without a destructive rebuild.
-        // Nullable — pre-migration rows read as the defaults (empty / off / no expiry).
+        // Per-mailbox settings (signature + undo send + auto-reply): added out-of-band
+        // (idempotent) so an already-provisioned `mailboxes` table gains the columns without a
+        // destructive rebuild. Nullable — pre-migration rows read as defaults.
         for stmt in [
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS signature TEXT",
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS undo_send_window_secs BIGINT DEFAULT 10",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_enabled BOOLEAN DEFAULT FALSE",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_subject TEXT",
             "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS auto_reply_body TEXT",
@@ -2080,6 +2098,9 @@ impl PgStore {
             signature: row
                 .try_get::<Option<String>, _>("signature")?
                 .unwrap_or_default(),
+            undo_send_window_secs: row
+                .try_get::<Option<i64>, _>("undo_send_window_secs")?
+                .unwrap_or(DEFAULT_UNDO_SEND_WINDOW_SECS),
             auto_reply_enabled: row
                 .try_get::<Option<bool>, _>("auto_reply_enabled")?
                 .unwrap_or(false),
@@ -2727,8 +2748,8 @@ impl Store for PgStore {
 
     async fn get_settings(&self, mailbox: &str) -> Result<MailboxSettings, StoreError> {
         let row = sqlx::query(
-            "SELECT signature, auto_reply_enabled, auto_reply_subject, auto_reply_body, \
-                    auto_reply_until \
+            "SELECT signature, undo_send_window_secs, auto_reply_enabled, auto_reply_subject, \
+                    auto_reply_body, auto_reply_until \
              FROM mailboxes WHERE addr = $1",
         )
         .bind(mailbox)
@@ -2744,6 +2765,16 @@ impl Store for PgStore {
     async fn set_signature(&self, mailbox: &str, signature: &str) -> Result<(), StoreError> {
         sqlx::query("UPDATE mailboxes SET signature = $1 WHERE addr = $2")
             .bind(signature)
+            .bind(mailbox)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn set_undo_send_window(&self, mailbox: &str, secs: i64) -> Result<(), StoreError> {
+        sqlx::query("UPDATE mailboxes SET undo_send_window_secs = $1 WHERE addr = $2")
+            .bind(secs)
             .bind(mailbox)
             .execute(&self.pool)
             .await

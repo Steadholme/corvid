@@ -151,14 +151,82 @@ async fn compose_then_send_enqueues_outbound() {
         StatusCode::SEE_OTHER,
         "send redirects on success"
     );
+    let location = resp
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/?folder=Sent&undo="),
+        "send redirect carries undo token"
+    );
 
-    // The message was enqueued for the recipient domain.
+    // The default undo-send window holds the message out of the relay due list.
     let due = state.store.due_outbound(now_secs() + 5, 10).await.unwrap();
-    assert_eq!(due.len(), 1);
-    assert_eq!(due[0].to_domain, "example.com");
-    assert_eq!(due[0].env_from, "w33d@w33d.xyz");
-    assert!(due[0].raw.contains("Subject: Hi there"));
-    assert!(due[0].raw.contains("Hello outbound"));
+    assert!(
+        due.is_empty(),
+        "held mail is not due before undo window closes"
+    );
+    let scheduled = state
+        .store
+        .list_scheduled_outbound("w33d@w33d.xyz", now_secs(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].status, "scheduled");
+    assert_eq!(scheduled[0].rcpts, vec!["friend@example.com".to_string()]);
+    assert_eq!(scheduled[0].env_from, "w33d@w33d.xyz");
+    assert!(scheduled[0].raw.contains("Subject: Hi there"));
+    assert!(scheduled[0].raw.contains("Hello outbound"));
+
+    let req = Request::builder()
+        .uri(location)
+        .header("x-auth-subject", "w33d")
+        .header(header::COOKIE, format!("__Host-csrf={token}"))
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains(r#"class="undo-bar""#), "undo bar rendered");
+    assert!(html.contains("btn-undo-send"), "undo button hook rendered");
+
+    let batch_id = scheduled[0].batch_id.clone();
+    let form = format!("csrf={token}&batch_id={batch_id}");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/send/undo")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, format!("__Host-csrf={token}"))
+        .body(Body::from(form))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(
+        state
+            .store
+            .list_scheduled_outbound("w33d@w33d.xyz", now_secs(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "undo removes held queue rows"
+    );
+    let drafts = state
+        .store
+        .list_folder("w33d@w33d.xyz", "Drafts", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(drafts.len(), 1, "undo restores the message to Drafts");
+    assert_eq!(drafts[0].subject, "Hi there");
+    assert!(
+        state
+            .store
+            .list_folder("w33d@w33d.xyz", "Sent", None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "held/undone send never files a Sent copy"
+    );
 }
 
 #[tokio::test]
@@ -309,6 +377,11 @@ async fn mint_csrf(state: &AppState) -> (String, String) {
 #[tokio::test]
 async fn reply_prefills_and_sets_thread_headers() {
     let state = build_dev_state().await;
+    state
+        .store
+        .set_undo_send_window("w33d@w33d.xyz", 0)
+        .await
+        .unwrap();
     let mut msg = seed_message(
         "w33d@w33d.xyz",
         "Project update",
@@ -693,6 +766,11 @@ fn multipart_body(boundary: &str, parts: &[(&str, Option<&str>, Option<&str>, &[
 #[tokio::test]
 async fn multipart_send_with_attachment_roundtrips_to_download() {
     let state = build_dev_state().await;
+    state
+        .store
+        .set_undo_send_window("w33d@w33d.xyz", 0)
+        .await
+        .unwrap();
     let (token, cookie) = mint_csrf(&state).await;
 
     // Compose a multipart send: text fields + one file part.

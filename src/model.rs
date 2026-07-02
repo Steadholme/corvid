@@ -48,14 +48,20 @@ pub struct FilterRule {
     pub created_at: i64,
 }
 
-/// Per-mailbox settings: the compose signature + the auto-reply (vacation) responder. Stored on
-/// the `mailboxes` row; every field defaults to "off"/empty for a mailbox that never saved any.
+/// Default Gmail-style undo-send hold window for new/unsaved mailbox settings.
+pub const DEFAULT_UNDO_SEND_WINDOW_SECS: i64 = 10;
+
+/// Per-mailbox settings: the compose signature, undo-send window, and the auto-reply (vacation)
+/// responder. Stored on the `mailboxes` row; every field defaults to "off"/empty except undo-send
+/// for a mailbox that never saved any.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MailboxSettings {
     /// The mailbox these settings belong to ([`Mailbox::addr`]).
     pub mailbox: String,
     /// Compose signature, appended to drafts as `\n\n--\n<signature>` (empty = none).
     pub signature: String,
+    /// Gmail-style undo-send hold window in seconds. `0` preserves immediate-send compatibility.
+    pub undo_send_window_secs: i64,
     /// Whether the auto-reply (vacation) responder is on.
     pub auto_reply_enabled: bool,
     /// Auto-reply subject (empty falls back to `Auto: <original subject>`).
@@ -72,6 +78,7 @@ impl MailboxSettings {
         MailboxSettings {
             mailbox: mailbox.to_string(),
             signature: String::new(),
+            undo_send_window_secs: DEFAULT_UNDO_SEND_WINDOW_SECS,
             auto_reply_enabled: false,
             auto_reply_subject: String::new(),
             auto_reply_body: String::new(),

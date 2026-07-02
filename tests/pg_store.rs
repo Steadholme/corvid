@@ -327,10 +327,12 @@ async fn pg_store_full_integration() {
         s.signature, "",
         "pre-migration/unsaved row reads as defaults"
     );
+    assert_eq!(s.undo_send_window_secs, 10);
     assert!(!s.auto_reply_enabled);
     assert_eq!(s.auto_reply_until, 0);
 
     pg.set_signature("w33d@w33d.xyz", "-- w33d").await.unwrap();
+    pg.set_undo_send_window("w33d@w33d.xyz", 20).await.unwrap();
     pg.set_auto_reply(
         "w33d@w33d.xyz",
         true,
@@ -342,6 +344,7 @@ async fn pg_store_full_integration() {
     .unwrap();
     let s = pg.get_settings("w33d@w33d.xyz").await.unwrap();
     assert_eq!(s.signature, "-- w33d");
+    assert_eq!(s.undo_send_window_secs, 20);
     assert!(s.auto_reply_enabled);
     assert_eq!(s.auto_reply_subject, "OOO");
     assert_eq!(s.auto_reply_body, "away until Monday");

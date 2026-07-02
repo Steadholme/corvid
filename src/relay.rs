@@ -26,6 +26,17 @@ const MAX_ATTEMPTS: i64 = 6;
 /// How often the worker scans the queue.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Result of an outbound enqueue that needs the user-facing batch reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnqueuedOutbound {
+    /// The DKIM-signed raw message that was queued.
+    pub raw: String,
+    /// Shared id across queue rows for this compose submission.
+    pub batch_id: String,
+    /// Effective future send time; `0` means immediate.
+    pub send_at: i64,
+}
+
 /// DKIM-sign `raw` (when the `From` domain matches the signer) and enqueue one outbound item
 /// per recipient domain. Returns the signed message (so callers/tests can inspect the
 /// `DKIM-Signature`). Null senders / malformed recipients are skipped.
@@ -50,6 +61,25 @@ pub async fn enqueue_outbound_at(
     mailbox: &str,
     send_at: i64,
 ) -> Result<String, String> {
+    Ok(
+        enqueue_outbound_at_with_batch(store, signer, raw, env_from, rcpts, mailbox, send_at)
+            .await?
+            .raw,
+    )
+}
+
+/// Enqueue one compose submission and return the batch id the webmail layer can expose as an
+/// undo/scheduled reference. This uses the same queue rows and `send_at` gate as
+/// [`enqueue_outbound_at`].
+pub async fn enqueue_outbound_at_with_batch(
+    store: &dyn Store,
+    signer: Option<&DkimSigner>,
+    raw: &str,
+    env_from: &str,
+    rcpts: &[String],
+    mailbox: &str,
+    send_at: i64,
+) -> Result<EnqueuedOutbound, String> {
     let signed = match signer {
         Some(s) if from_domain_matches(raw, &s.domain) => {
             s.sign(raw).map_err(|e| format!("dkim sign: {e}"))?
@@ -92,7 +122,11 @@ pub async fn enqueue_outbound_at(
             .await
             .map_err(|e| format!("enqueue: {e}"))?;
     }
-    Ok(signed)
+    Ok(EnqueuedOutbound {
+        raw: signed,
+        batch_id,
+        send_at: scheduled_at,
+    })
 }
 
 /// True when the message's `From:` header is at `domain` (so we should DKIM-sign it).

@@ -3,7 +3,8 @@
 //! It does NO login of its own: Sluice runs the OIDC browser login against Keystone, strips any
 //! inbound `X-Auth-*`, and injects the verified `X-Auth-Subject` / `X-Auth-Email`. The webmail
 //! TRUSTS those headers (it is internal-only) and selects the signed-in user's mailbox by
-//! `owner_sub`. State-changing POSTs (`/send`) are CSRF-guarded (double-submit `__Host-csrf`).
+//! `owner_sub`. State-changing POSTs (`/send`, `/send/undo`) are CSRF-guarded (double-submit
+//! `__Host-csrf`).
 //!
 //! Views:
 //! - `GET /healthz`  liveness (container HEALTHCHECK)
@@ -12,10 +13,11 @@
 //!                   both keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
-//! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue + relay + file a Sent copy;
+//! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue behind the undo-send window;
 //!                   `action=draft`: persist into the Drafts folder without sending
-//! - `GET /settings` mailbox settings: filter rules / signature / auto-reply sections
-//! - `POST /settings/rules|signature|autoreply`  the three settings mutations (CSRF-guarded)
+//! - `POST /send/undo` move a still-held send back to Drafts
+//! - `GET /settings` mailbox settings: filter rules / undo send / signature / auto-reply sections
+//! - `POST /settings/rules|undo-send|signature|autoreply` settings mutations (CSRF-guarded)
 
 use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -31,7 +33,7 @@ use time::OffsetDateTime;
 
 use crate::model::{
     parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
-    SearchQuery, SenderListEntry, SpamAnnotation,
+    SearchQuery, SenderListEntry, SpamAnnotation, DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -57,6 +59,9 @@ const STARRED_VIEW: &str = "Starred";
 const SNOOZED_VIEW: &str = "Snoozed";
 /// A virtual view of outbound queue batches scheduled for future delivery.
 const SCHEDULED_VIEW: &str = "Scheduled";
+
+const UNDO_SEND_WINDOW_CHOICES: [i64; 4] = [5, 10, 20, 30];
+const UNDO_SEND_MAX_WINDOW_SECS: i64 = 30;
 
 /// Default rows per folder/search page when `?limit=` is absent.
 const PAGE_DEFAULT: i64 = 50;
@@ -179,6 +184,23 @@ window.__corvidToast = function (msg, kind) {
 const WEBMAIL_JS: &str = r#"
 (function () {
   var toast = window.__corvidToast || function () {};
+  var undo = document.querySelector('[data-undo-send]');
+  if (undo) {
+    var until = parseInt(undo.getAttribute('data-undo-until') || '0', 10);
+    var countdown = undo.querySelector('[data-undo-countdown]');
+    var btn = undo.querySelector('.btn-undo-send');
+    function tickUndo() {
+      var left = Math.max(0, until - Math.floor(Date.now() / 1000));
+      if (countdown) countdown.textContent = left + 's';
+      if (left <= 0) {
+        undo.classList.add('is-expired');
+        if (btn) btn.disabled = true;
+        return;
+      }
+      setTimeout(tickUndo, 250);
+    }
+    tickUndo();
+  }
   function apiUrl(form) { try { return '/api' + new URL(form.action, location.origin).pathname; } catch (e) { return null; } }
   function field(form, name) { var el = form.querySelector('[name=' + name + ']'); return el ? el.value : ''; }
   function snoozeFields(root) { return { snooze_until: field(root, 'snooze_until'), snooze_custom: field(root, 'snooze_custom') }; }
@@ -534,6 +556,7 @@ pub fn app(state: AppState) -> Router {
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
         .route("/compose", get(compose_form))
         .route("/send", post(send))
+        .route("/send/undo", post(send_undo))
         .route("/scheduled/{batch_id}/action", post(scheduled_action))
         .route("/api/send", post(api_send))
         .route("/contacts/suggest", get(contacts_suggest))
@@ -546,6 +569,7 @@ pub fn app(state: AppState) -> Router {
             get(settings_rules_redirect).post(settings_rules_post),
         )
         .route("/settings/signature", post(settings_signature))
+        .route("/settings/undo-send", post(settings_undo_send))
         .route("/settings/autoreply", post(settings_autoreply))
         .route("/settings/identities", post(settings_identities_post))
         .route("/settings/labels", post(settings_labels_post))
@@ -640,6 +664,12 @@ struct InboxQuery {
     /// A label id to filter by (a flat cross-folder listing of that label's messages).
     #[serde(default)]
     label: Option<String>,
+    /// Opaque outbound batch reference for the post-send undo bar.
+    #[serde(default)]
+    undo: Option<String>,
+    /// Epoch seconds when the undo window closes.
+    #[serde(default)]
+    undo_until: Option<String>,
 }
 
 async fn inbox(
@@ -653,6 +683,7 @@ async fn inbox(
     };
     // Row action forms POST back a double-submit CSRF token; the inbox mints it (like compose).
     let (token, set_cookie) = ensure_csrf(&headers);
+    let undo_bar = render_undo_bar(q.undo.as_deref(), q.undo_until.as_deref(), &token);
 
     let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let parsed_search = search.map(parse_search_query);
@@ -698,6 +729,7 @@ async fn inbox(
             r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+{undo_bar}
 <script src="/assets/webmail.js"></script>"#,
             tabs = folder_tabs(&FolderTabs {
                 active: "",
@@ -708,6 +740,7 @@ async fn inbox(
                 threads_on: false
             }),
             bulk = bulk_toolbar(&token),
+            undo_bar = undo_bar,
         );
         let html = render_page(&label.name, &email, &content, "inbox");
         return match set_cookie {
@@ -756,6 +789,7 @@ async fn inbox(
                 r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+{undo_bar}
 <script src="/assets/webmail.js"></script>"#,
                 tabs = folder_tabs(&FolderTabs {
                     active: folder,
@@ -765,6 +799,7 @@ async fn inbox(
                     active_label: "",
                     threads_on: true
                 }),
+                undo_bar = undo_bar,
             );
             let html = render_page(folder, &email, &content, "inbox");
             return match set_cookie {
@@ -777,7 +812,12 @@ async fn inbox(
     if search.is_none() && canonical_folder(q.folder.as_deref()) == SCHEDULED_VIEW {
         let scheduled = match state
             .store
-            .list_scheduled_outbound(&mb.addr, now_secs(), cursor, limit)
+            .list_scheduled_outbound(
+                &mb.addr,
+                now_secs() + UNDO_SEND_MAX_WINDOW_SECS,
+                cursor,
+                limit,
+            )
             .await
         {
             Ok(s) => s,
@@ -805,6 +845,7 @@ async fn inbox(
             r#"<div class="page-head"><h1>Scheduled</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{next_link}
+{undo_bar}
 <script src="/assets/webmail.js"></script>"#,
             tabs = folder_tabs(&FolderTabs {
                 active: SCHEDULED_VIEW,
@@ -814,6 +855,7 @@ async fn inbox(
                 active_label: "",
                 threads_on: false,
             }),
+            undo_bar = undo_bar,
         );
         let html = render_page(SCHEDULED_VIEW, &email, &content, "inbox");
         return match set_cookie {
@@ -925,6 +967,7 @@ async fn inbox(
         r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
 {tabs}
 <section class="card"><ul class="maillist">{rows}</ul></section>{bulk}{next_link}
+{undo_bar}
 <script src="/assets/webmail.js"></script>"#,
         tabs = folder_tabs(&FolderTabs {
             active: folder,
@@ -935,6 +978,7 @@ async fn inbox(
             threads_on: false,
         }),
         bulk = bulk_toolbar(&token),
+        undo_bar = undo_bar,
     );
     let title = if folder.is_empty() { "Search" } else { folder };
     let html = render_page(title, &email, &content, "inbox");
@@ -942,6 +986,35 @@ async fn inbox(
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
     }
+}
+
+fn render_undo_bar(batch_id: Option<&str>, undo_until: Option<&str>, token: &str) -> String {
+    let Some(batch_id) = batch_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    let Some(until) = undo_until
+        .map(str::trim)
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return String::new();
+    };
+    let remaining = until - now_secs();
+    if remaining <= 0 {
+        return String::new();
+    }
+    format!(
+        r#"<div class="undo-bar" role="status" data-undo-send data-undo-until="{until}">
+  <span class="undo-bar__message">Message scheduled to send.</span>
+  <span class="undo-bar__countdown" data-undo-countdown>{remaining}s</span>
+  <form class="undo-bar__form" method="post" action="/send/undo">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="batch_id" value="{batch_id}">
+    <button class="btn btn-primary btn-sm btn-undo-send" type="submit">Undo</button>
+  </form>
+</div>"#,
+        token = esc(token),
+        batch_id = esc(batch_id),
+    )
 }
 
 /// Render one inbox/search row: the message link plus a per-row action form (star, mark-unread,
@@ -1182,6 +1255,18 @@ fn schedule_controls_for(now: i64, selected: i64) -> String {
   <input class="schedule-custom" type="number" name="schedule_custom" min="{min}" placeholder="Epoch" aria-label="Custom schedule epoch"{custom_value}>"#,
         min = now + 1,
     )
+}
+
+fn undo_send_window_options(selected: i64) -> String {
+    let mut opts = String::new();
+    let selected = effective_undo_send_window_secs(selected);
+    for secs in UNDO_SEND_WINDOW_CHOICES {
+        let sel = if secs == selected { " selected" } else { "" };
+        opts.push_str(&format!(
+            r#"<option value="{secs}"{sel}>{secs} seconds</option>"#
+        ));
+    }
+    opts
 }
 
 fn schedule_presets(now: i64) -> [(i64, &'static str); 3] {
@@ -2097,6 +2182,31 @@ fn parse_schedule_epoch(preset: &str, custom: &str) -> Result<i64, (StatusCode, 
     parse_future_epoch(preset, custom, "schedule")
 }
 
+fn parse_undo_send_window_secs(raw: &str) -> Result<i64, (StatusCode, String)> {
+    let secs = raw.trim().parse::<i64>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Undo send window must be 5, 10, 20, or 30 seconds.".to_string(),
+        )
+    })?;
+    if UNDO_SEND_WINDOW_CHOICES.contains(&secs) {
+        Ok(secs)
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "Undo send window must be 5, 10, 20, or 30 seconds.".to_string(),
+        ))
+    }
+}
+
+fn effective_undo_send_window_secs(secs: i64) -> i64 {
+    if secs == 0 || UNDO_SEND_WINDOW_CHOICES.contains(&secs) {
+        secs
+    } else {
+        DEFAULT_UNDO_SEND_WINDOW_SECS
+    }
+}
+
 fn parse_future_epoch(
     preset: &str,
     custom: &str,
@@ -2251,6 +2361,112 @@ async fn scheduled_action(
     } else {
         Redirect::to(&safe_return(&form.return_to)).into_response()
     }
+}
+
+#[derive(Deserialize, Default)]
+struct UndoSendForm {
+    csrf: String,
+    #[serde(default)]
+    batch_id: String,
+}
+
+async fn send_undo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UndoSendForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let batch_id = form.batch_id.trim();
+    if batch_id.is_empty() {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid request",
+            "Missing undo token.",
+        );
+    }
+    let now = now_secs();
+    let item = match state
+        .store
+        .get_scheduled_outbound(&mb.addr, batch_id, now)
+        .await
+    {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return error_page(
+                StatusCode::NOT_FOUND,
+                "Not found",
+                "Undo window has expired.",
+            )
+        }
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
+    let changed = match state
+        .store
+        .cancel_scheduled_outbound(&mb.addr, batch_id, now)
+        .await
+    {
+        Ok(changed) => changed,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
+    if !changed {
+        return error_page(
+            StatusCode::NOT_FOUND,
+            "Not found",
+            "Undo window has expired.",
+        );
+    }
+    let parsed = crate::rfc822::parse(&item.raw);
+    let from = if parsed.from.trim().is_empty() {
+        item.env_from.clone()
+    } else {
+        parsed.from
+    };
+    let to = if parsed.to.trim().is_empty() {
+        item.rcpts.join(", ")
+    } else {
+        parsed.to
+    };
+    store_local_copy(
+        &state,
+        &mb.addr,
+        &from,
+        &to,
+        &parsed.subject,
+        &parsed.body_text,
+        &parsed.body_html,
+        &item.raw,
+        "Drafts",
+    )
+    .await;
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        batch = %batch_id,
+        "send undone",
+    );
+    Redirect::to("/?folder=Drafts").into_response()
 }
 
 async fn cancel_replaced_scheduled(state: &AppState, mailbox: &str, batch_id: &str) {
@@ -2991,6 +3207,42 @@ async fn send(State(state): State<AppState>, req: Request) -> Response {
             Ok(_) => {
                 cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
                 Redirect::to("/?folder=Scheduled").into_response()
+            }
+            Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
+        };
+    }
+
+    let undo_window_secs = match state.store.get_settings(&mb.addr).await {
+        Ok(settings) => effective_undo_send_window_secs(settings.undo_send_window_secs),
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
+    if undo_window_secs > 0 {
+        let send_at = now_secs() + undo_window_secs;
+        return match crate::relay::enqueue_outbound_at_with_batch(
+            state.store.as_ref(),
+            signer,
+            &raw,
+            &env_from,
+            &rcpts,
+            &mb.addr,
+            send_at,
+        )
+        .await
+        {
+            Ok(enqueued) => {
+                cancel_replaced_scheduled(&state, &mb.addr, &form.scheduled_batch_id).await;
+                Redirect::to(&format!(
+                    "/?folder=Sent&undo={}&undo_until={}",
+                    url_encode(&enqueued.batch_id),
+                    enqueued.send_at
+                ))
+                .into_response()
             }
             Err(e) => error_page(StatusCode::INTERNAL_SERVER_ERROR, "Send failed", &e),
         };
@@ -3831,6 +4083,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     } else {
         ""
     };
+    let undo_window_opts = undo_send_window_options(settings.undo_send_window_secs);
     let content = format!(
         r#"<div class="page-head"><h1>Settings</h1></div>
 <section class="card pad">
@@ -3855,6 +4108,14 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
 {labels_section}
 {identities_section}
 {contacts_section}
+<section class="card pad undo-send-settings">
+  <h2>Undo send</h2>
+  <form method="post" action="/settings/undo-send">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="undo_send_window_secs">Cancellation period</label><select id="undo_send_window_secs" name="window_secs">{undo_window_opts}</select><p class="hint">Messages wait in the outbound queue for this period before delivery.</p></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit">Save undo send</button></div>
+  </form>
+</section>
 <section class="card pad">
   <h2>Signature</h2>
   <form method="post" action="/settings/signature">
@@ -3879,6 +4140,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
+        undo_window_opts = undo_window_opts,
         labels_section = render_labels_section(&labels, &token),
         senders_section = render_sender_lists_section(&sender_lists, &token),
         identities_section = render_identities_section(&identities, &mb.addr, &token),
@@ -4213,6 +4475,52 @@ async fn settings_signature(
         mailbox = %mb.addr,
         cleared = %form.signature.trim().is_empty(),
         "signature updated",
+    );
+    Redirect::to("/settings").into_response()
+}
+
+/// Form body for `POST /settings/undo-send`.
+#[derive(Deserialize, Default)]
+struct UndoSendSettingsForm {
+    csrf: String,
+    #[serde(default)]
+    window_secs: String,
+}
+
+/// `POST /settings/undo-send` — save the Gmail-style cancellation window. CSRF-guarded; emits a
+/// tracing audit line and redirects back to `/settings`.
+async fn settings_undo_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UndoSendSettingsForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+    let secs = match parse_undo_send_window_secs(&form.window_secs) {
+        Ok(secs) => secs,
+        Err((code, message)) => return error_page(code, "Invalid request", &message),
+    };
+    if let Err(e) = state.store.set_undo_send_window(&mb.addr, secs).await {
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            &e.to_string(),
+        );
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        secs,
+        "undo-send window updated",
     );
     Redirect::to("/settings").into_response()
 }
@@ -5204,6 +5512,11 @@ mod tests {
         use tower::ServiceExt;
 
         let state = crate::build_dev_state().await;
+        state
+            .store
+            .set_undo_send_window("w33d@w33d.xyz", 0)
+            .await
+            .unwrap();
         let req = Request::builder()
             .uri("/compose")
             .header("x-auth-subject", "w33d")
@@ -5235,6 +5548,11 @@ mod tests {
         use tower::ServiceExt;
 
         let state = crate::build_dev_state().await;
+        state
+            .store
+            .set_undo_send_window("w33d@w33d.xyz", 0)
+            .await
+            .unwrap();
         let req = Request::builder()
             .uri("/compose")
             .header("x-auth-subject", "w33d")
