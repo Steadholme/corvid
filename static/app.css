@@ -1280,3 +1280,192 @@ mark.search-hit {
   font-size:11px; font-weight:650; letter-spacing:.02em;
   color:var(--ok-ink); background:var(--ok-soft);
 }
+
+/* ============================================================
+   Contacts — enhanced cards, groups & vCard/CSV import-export
+   Pure styling over existing SSR hooks (webmail.rs
+   render_contacts_section / render_contact_card /
+   render_contact_group_card):
+   · .contacts-settings   — the #contacts settings section. UNLIKE its
+     siblings (#templates / #signatures are `card pad`), this section is
+     a BARE <section>, so it must adopt the same card container look
+     itself to sit level in the settings stack (mirrors `.card` +
+     `.pad`, incl. the `.card.pad h2` 15px override).
+   · .contact-actions     — the export row (`.btn-export-vcard` /
+     `.btn-export-csv`, already `.btn.btn-ghost.btn-sm`).
+   · .contact-grid        — auto-fill grid of `.contact-card` articles.
+   · .contact-card        — one correspondent as a nested panel (the
+     shared surface-2 + hairline idiom used by `.template-item` /
+     `.signature-item`, so the settings cards read as one system): a
+     strong <header> name (h3) + a small manual/auto `.muted` chip, then
+     de-emphasised name/phone/company/title `.field` inputs and a weaker
+     notes `<textarea>` — the requested strong→weak hierarchy.
+   · .contact-card.contact-create — the add-contact form (no header):
+     set apart with a dashed "new" affordance, like `.template-create`.
+   · .contact-duplicates / .contact-duplicate — the merge-duplicates
+     zone; a soft warn tint marks it as "needs attention".
+   · .contact-groups / .contact-group — groups are DISTINCT from contact
+     cards: a full `--surface` panel with an accent-2 left rail (the
+     inset idiom from `.signature-item.signature-default`). Members ride
+     in `.contact-group-members` as compact tag rows; the add-member
+     `.row-actions` <select> + button share the `.btn` / input kit.
+   · .contact-group.contact-group-create — add-group form, dashed like
+     `.contact-create`.
+   · .contact-import      — the vCard/CSV import form; `.btn-import-vcard`
+     stays on the shared `.btn` system, and the paste box takes the
+     shared --mono face so raw vCard/CSV reads cleanly.
+   Tokens only — no new fonts/libs/external links. Motion rides
+   --dur/--ease (globally stilled by the prefers-reduced-motion reset
+   near the top); every colour is token-driven so light/dark track the
+   same way the template + signature zones do. Export/import glyphs use
+   the shared Inter/system stack (no new font pulled). */
+
+/* Container — the section is NOT a `.card.pad` in markup, so replicate
+   that look here so it sits identically to its `#templates`/`#signatures`
+   neighbours in the settings column. */
+.contacts-settings {
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  box-shadow:var(--sh-sm);
+  padding:22px;
+}
+.contacts-settings h2 { font-size:15px; margin:0 0 6px; }         /* match `.card.pad h2` */
+.contacts-settings > p.muted { margin:0 0 16px; }                 /* intro line only (empty states nest deeper) */
+.contacts-settings > h3 { margin:0 0 12px; }
+
+/* Export row — the links are already `.btn.btn-ghost.btn-sm`; just lay
+   them out and add a subtle downward glyph so "export" reads at a glance
+   (same ::before glyph idiom as `.btn-insert-template`). */
+.contact-actions { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 18px; }
+.btn-export-vcard::before,
+.btn-export-csv::before { content:"\2193"; margin-right:2px; opacity:.7; font-weight:700; }
+.btn-import-vcard::before { content:"\2191"; margin-right:4px; opacity:.85; font-weight:700; }
+
+/* Card grid — responsive, collapses to a single column on narrow widths
+   via the minmax floor (no media query needed). */
+.contact-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(258px,1fr)); gap:14px; margin:0 0 4px; }
+.contact-empty { margin:0; padding:14px 2px; }                    /* the only child when empty */
+
+/* Contact card — the shared nested-panel look (surface-2 + hairline),
+   identical rhythm to `.template-item` / `.signature-item`. */
+.contact-card {
+  padding:16px;
+  background:var(--surface-2);
+  border:1px solid var(--hairline);
+  border-radius:var(--r-sm);
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.contact-card:hover { border-color:var(--border-2); box-shadow:var(--sh-xs); }
+.contact-card form { margin:0; }
+
+/* Header — the strongest thing in the card: the name+email label (h3),
+   with a small manual/auto chip pushed to the trailing edge. */
+.contact-card header { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin:0 0 14px; }
+.contact-card header h3 { font-size:14px; font-weight:650; color:var(--ink); overflow-wrap:anywhere; }
+.contact-card header .muted {
+  flex:none;
+  font-size:10.5px; font-weight:650; letter-spacing:.04em; text-transform:uppercase;
+  padding:2px 8px; border-radius:var(--r-pill);
+  background:var(--surface-3); color:var(--ink-3);
+}
+
+/* Fields — secondary to the name: compact rows with quieter, uppercase
+   micro-labels; the global `.field textarea{min-height:220px}` is far
+   too tall for a card, so both textareas shrink (same move as the
+   template/signature lists). Notes reads weakest of all. */
+.contact-card .field { margin-bottom:10px; }
+.contact-card .field:last-of-type { margin-bottom:0; }
+.contact-card .field > label {
+  font-size:11px; font-weight:600; letter-spacing:.03em; text-transform:uppercase;
+  color:var(--ink-3); margin-bottom:4px;
+}
+.contact-card .field textarea { min-height:60px; }
+.contact-card .field textarea[name="notes"] { min-height:54px; color:var(--ink-2); font-size:12.5px; }
+.contact-card .form-actions { margin-top:12px; }
+
+/* Add-contact form — a `.contact-card` with no header; a dashed border
+   marks it as the "new" affordance (mirrors `.template-create`). It is
+   full-width below the grid, so it reads as a distinct action. */
+.contact-card.contact-create {
+  margin-top:16px;
+  background:var(--surface);
+  border-style:dashed;
+  border-color:var(--border-2);
+}
+.contact-card.contact-create:hover { border-color:var(--accent-soft-2); box-shadow:none; }
+
+/* Duplicates — a soft warn zone that reads as "needs attention". Each
+   `.contact-duplicate` is a `.row-actions` form (label + Merge); recast
+   it as a full-width row. */
+.contact-duplicates {
+  margin:16px 0;
+  padding:14px 16px;
+  background:var(--warn-soft);
+  border:1px solid color-mix(in srgb, var(--warn) 22%, var(--border));
+  border-radius:var(--r-sm);
+}
+.contact-duplicates h3 { margin:0 0 8px; font-size:12.5px; color:var(--warn-ink); }
+.contact-duplicate {
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  width:100%; padding:6px 0;
+}
+.contact-duplicate + .contact-duplicate { border-top:1px solid color-mix(in srgb, var(--warn) 16%, transparent); }
+.contact-duplicate > span { font-size:13px; color:var(--ink-2); overflow-wrap:anywhere; }
+
+/* Groups — set off from the contacts above by a hairline divider. */
+.contact-groups { margin-top:20px; padding-top:20px; border-top:1px solid var(--hairline); }
+.contact-groups > h3 { margin:0 0 12px; }
+.contact-group-empty { margin:0 0 12px; }
+
+/* A group panel — deliberately DISTINCT from a contact card: a full
+   `--surface` fill with an accent-2 left rail (the inset idiom from
+   `.signature-item.signature-default`) so groups vs. correspondents are
+   unmistakable at a glance. */
+.contact-group {
+  padding:16px; margin-bottom:12px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r-sm);
+  box-shadow:inset 3px 0 0 var(--accent-2), var(--sh-xs);
+  transition:border-color var(--dur) var(--ease);
+}
+.contact-group:hover { border-color:var(--border-2); }
+.contact-group form { margin:0; }
+.contact-group .field { margin-bottom:10px; }
+.contact-group > form:first-of-type .form-actions { margin-top:0; }
+
+/* Members — compact tag rows. Each `<li>` wraps a `.row-actions` form
+   (name + Remove); the empty `<li class="muted">` stays quiet. */
+.contact-group-members { list-style:none; margin:12px 0; padding:0; display:grid; gap:6px; }
+.contact-group-members li.muted { padding:4px 2px; font-size:12.5px; }
+.contact-group-members .row-actions {
+  width:100%;
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding:5px 6px 5px 11px;
+  background:var(--surface-2); border:1px solid var(--hairline); border-radius:var(--r-xs);
+}
+.contact-group-members .row-actions > span { font-size:12.5px; color:var(--ink-2); overflow-wrap:anywhere; }
+
+/* Add-member row (the group's own trailing `.row-actions`: <select> +
+   button). The bare <select> is globally full-width, so let it flex to
+   fill and keep the button beside it. */
+.contact-group > .row-actions { margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.contact-group > .row-actions > select { flex:1 1 160px; width:auto; min-width:0; }
+
+/* Add-group form — dashed "new" affordance, like `.contact-create`; drop
+   the accent rail so it doesn't read as an existing group. */
+.contact-group.contact-group-create {
+  margin-top:4px;
+  border-style:dashed;
+  border-color:var(--border-2);
+  box-shadow:none;
+}
+.contact-group.contact-group-create:hover { border-color:var(--accent-soft-2); }
+
+/* Import — divided off below the groups; the paste box takes the shared
+   --mono face so raw vCard/CSV lines up. `.btn-import-vcard` stays on
+   the shared `.btn` system (styled above with an upward glyph). */
+.contact-import { margin-top:20px; padding-top:20px; border-top:1px solid var(--hairline); }
+.contact-import .field { margin-bottom:12px; }
+.contact-import textarea { min-height:96px; font:12.5px/1.55 var(--mono); }
