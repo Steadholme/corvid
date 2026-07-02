@@ -506,3 +506,97 @@ mark.search-hit {
   background:var(--surface-2); border:1px solid var(--border);
   border-radius:var(--r-sm);
 }
+
+/* ---- Rich compose editor -------------------------------------------------
+   Progressive-enhancement styling for the WYSIWYG composer. The server ships
+   a plain <textarea id="body"> plus a hidden toolbar + contenteditable region
+   (both carry the `hidden` attribute). Client JS drops `hidden`, hides the
+   textarea, and drives the toolbar/rich area. With no JS the textarea is the
+   only visible control and is left completely untouched here. All values reuse
+   the Odyssey v2 tokens so light/reduced-motion behaviour follows the rest of
+   the app for free. */
+
+/* Toolbar: a flat, grouped strip of formatting buttons sitting flush on top of
+   the editing surface. It shares the input/card border + radius so the toolbar
+   and text region read as one field. `[hidden]` is re-asserted below so the
+   author-level `display:flex` never leaks the toolbar into the no-JS view. */
+.compose-toolbar {
+  display:flex; flex-wrap:wrap; align-items:center; gap:4px;
+  padding:6px;
+  background:var(--surface-2);
+  border:1px solid var(--border-2);
+  border-bottom:0;
+  border-radius:var(--r-sm) var(--r-sm) 0 0;
+}
+.compose-toolbar[hidden] { display:none; }
+
+/* Toolbar buttons reuse .btn.btn-ghost.btn-sm from the markup, so we only
+   restyle for the grouped context: flat at rest, a crisp white chip on hover
+   (clear feedback against the surface-2 strip), and an accent-soft active/
+   pressed state. Keyboard focus rides the global button:focus-visible ring. */
+.compose-toolbar .btn {
+  min-width:34px;
+  background:transparent;
+  border-color:transparent;
+  box-shadow:none;
+  color:var(--ink-2);
+}
+.compose-toolbar .btn:hover {
+  background:var(--surface);
+  border-color:var(--border);
+  color:var(--ink);
+}
+.compose-toolbar .btn:active,
+.compose-toolbar .btn[aria-pressed="true"],
+.compose-toolbar .btn.is-active {
+  background:var(--accent-soft);
+  border-color:var(--accent-soft-2);
+  color:var(--accent-ink);
+}
+
+/* Editing surface: a contenteditable div styled to match a .textarea. Default
+   full radius; when it follows a visible toolbar the top corners square off so
+   the pair joins seamlessly. Focus mirrors the input pattern (accent border +
+   ring) with a keyboard-only outline for a11y, since the global focus-visible
+   list does not cover contenteditable regions. */
+.compose-rich {
+  min-height:220px;
+  padding:10px 12px;
+  font:inherit; font-size:14px; line-height:1.6;
+  color:var(--ink);
+  background:var(--surface);
+  border:1px solid var(--border-2);
+  border-radius:var(--r-sm);
+  outline:none;
+  overflow-wrap:break-word;
+  transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.compose-toolbar:not([hidden]) + .compose-rich {
+  border-top-left-radius:0;
+  border-top-right-radius:0;
+}
+.compose-rich:focus {
+  border-color:var(--accent);
+  box-shadow:0 0 0 4px var(--ring);
+}
+.compose-rich:focus-visible {
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+
+/* Keep the editor's own block spacing sane and readable. */
+.compose-rich p { margin:0 0 10px; }
+.compose-rich p:last-child { margin-bottom:0; }
+.compose-rich blockquote {
+  margin:0 0 10px; padding:2px 0 2px 12px;
+  border-left:3px solid var(--border-2); color:var(--ink-2);
+}
+.compose-rich a { color:var(--accent-ink); }
+
+/* Optional placeholder: only renders if the backend adds a data-placeholder
+   attribute, so it is inert with the current markup and cannot regress it. */
+.compose-rich:empty[data-placeholder]::before {
+  content:attr(data-placeholder);
+  color:var(--ink-4);
+  pointer-events:none;
+}
