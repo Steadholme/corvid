@@ -33,7 +33,7 @@ use time::OffsetDateTime;
 
 use crate::model::{
     parse_search_query, Alias, Contact, FilterRule, Label, Mailbox, Message, ScheduledOutbound,
-    SearchQuery, SenderListEntry, SpamAnnotation, DEFAULT_UNDO_SEND_WINDOW_SECS,
+    SearchQuery, SenderListEntry, SpamAnnotation, Template, DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
@@ -472,6 +472,45 @@ const COMPOSE_UX_JS: &str = r#"
     syncRich();
   }
 
+  function htmlToText(html) {
+    var tmp = document.createElement('div');
+    tmp.innerHTML = html || '';
+    return tmp.innerText != null ? tmp.innerText : (tmp.textContent || '');
+  }
+  function insertPlainText(text) {
+    if (!body) return;
+    var start = typeof body.selectionStart === 'number' ? body.selectionStart : body.value.length;
+    var end = typeof body.selectionEnd === 'number' ? body.selectionEnd : start;
+    body.value = body.value.slice(0, start) + text + body.value.slice(end);
+    body.selectionStart = body.selectionEnd = start + text.length;
+    body.focus();
+  }
+  function insertTemplate() {
+    var select = form.querySelector('[data-template-select]');
+    if (!select || !select.value) return;
+    var opt = select.options[select.selectedIndex];
+    if (!opt) return;
+    var html = opt.getAttribute('data-body-html') || '';
+    var text = opt.getAttribute('data-body-text') || '';
+    if (rich && !rich.hidden) {
+      rich.focus();
+      document.execCommand('insertHTML', false, html || textToHtml(text));
+      syncRich();
+    } else {
+      insertPlainText(text || htmlToText(html));
+    }
+    select.selectedIndex = 0;
+    toast('Template inserted', 'ok');
+  }
+  var templateSelect = form.querySelector('[data-template-select]');
+  if (templateSelect) {
+    templateSelect.addEventListener('change', function () { if (templateSelect.value) insertTemplate(); });
+  }
+  var templateButton = form.querySelector('[data-template-insert]');
+  if (templateButton) {
+    templateButton.addEventListener('click', function (e) { e.preventDefault(); insertTemplate(); });
+  }
+
   var subject = form.querySelector('#subject');
   if (subject) {
     var cc = document.createElement('span'); cc.className = 'charcount';
@@ -571,6 +610,10 @@ pub fn app(state: AppState) -> Router {
         .route("/settings/signature", post(settings_signature))
         .route("/settings/undo-send", post(settings_undo_send))
         .route("/settings/autoreply", post(settings_autoreply))
+        .route(
+            "/settings/templates",
+            get(settings_templates_redirect).post(settings_templates_post),
+        )
         .route("/settings/identities", post(settings_identities_post))
         .route("/settings/labels", post(settings_labels_post))
         .route("/settings/contacts", post(settings_contacts_post))
@@ -2842,6 +2885,11 @@ async fn compose_form(
             sel = if idn.is_default { " selected" } else { "" },
         ));
     }
+    let templates = state
+        .store
+        .list_templates(&mb.addr)
+        .await
+        .unwrap_or_default();
 
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
@@ -2875,6 +2923,7 @@ async fn compose_form(
         <button class="btn btn-ghost btn-sm" type="button" data-cmd="unlink" title="Remove link" aria-label="Remove link">Unlink</button>
         <button class="btn btn-ghost btn-sm" type="button" data-cmd="clear" title="Clear formatting" aria-label="Clear formatting">Tx</button>
       </div>
+      {template_controls}
       <div id="body-rich" class="compose-rich" role="textbox" aria-multiline="true" contenteditable="true" data-source="body" hidden></div>
       <textarea id="body" name="body">{body}</textarea>
     </div>
@@ -2900,12 +2949,38 @@ async fn compose_form(
         references = esc(&pre.references),
         scheduled_batch_id = esc(&pre.scheduled_batch_id),
         schedule_controls = schedule_controls_for(now_secs(), pre.schedule_at),
+        template_controls = render_compose_template_controls(&templates),
     );
     let html = render_page("Compose", &email, &content, "compose");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
     }
+}
+
+fn render_compose_template_controls(templates: &[Template]) -> String {
+    if templates.is_empty() {
+        return String::new();
+    }
+    let mut opts = String::from(r#"<option value="">Insert template...</option>"#);
+    for t in templates {
+        let body_html = crate::sanitize::sanitize_html(&t.body_html);
+        opts.push_str(&format!(
+            r#"<option value="{id}" data-body-html="{body_html}" data-body-text="{body_text}">{name}</option>"#,
+            id = esc(&t.id),
+            body_html = esc(&body_html),
+            body_text = esc(&t.body_text),
+            name = esc(&t.name),
+        ));
+    }
+    format!(
+        r#"<div class="template-menu" data-template-menu>
+        <label for="template_select">Template</label>
+        <select id="template_select" data-template-select>{opts}</select>
+        <button class="btn btn-ghost btn-sm btn-insert-template" type="button" data-template-insert>Insert</button>
+        <a class="btn btn-ghost btn-sm" href="/settings#templates">Manage</a>
+      </div>"#,
+    )
 }
 
 /// Build the reply/forward prefill from the original message referenced by `q`. Returns an empty
@@ -4052,6 +4127,16 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             )
         }
     };
+    let templates = match state.store.list_templates(&mb.addr).await {
+        Ok(list) => list,
+        Err(e) => {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            )
+        }
+    };
 
     let mut rule_rows = String::new();
     if rules.is_empty() {
@@ -4104,6 +4189,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
     <div class="form-actions"><button class="btn btn-primary" type="submit">Add rule</button></div>
   </form>
 </section>
+{templates_section}
 {senders_section}
 {labels_section}
 {identities_section}
@@ -4141,6 +4227,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         ar_body = esc(&settings.auto_reply_body),
         ar_until = fmt_until(settings.auto_reply_until),
         undo_window_opts = undo_window_opts,
+        templates_section = render_templates_section(&templates, &token),
         labels_section = render_labels_section(&labels, &token),
         senders_section = render_sender_lists_section(&sender_lists, &token),
         identities_section = render_identities_section(&identities, &mb.addr, &token),
@@ -4616,9 +4703,214 @@ fn fmt_until(ts: i64) -> String {
     }
 }
 
+/// `GET /settings/templates` — templates are managed on the main settings page.
+async fn settings_templates_redirect() -> Response {
+    Redirect::to("/settings#templates").into_response()
+}
+
 // ---------------------------------------------------------------------------
-// Settings — labels / send identities / contacts (per-mailbox, self-managed)
+// Settings — templates / labels / send identities / contacts (per-mailbox)
 // ---------------------------------------------------------------------------
+
+fn render_templates_section(templates: &[Template], token: &str) -> String {
+    let mut list = String::new();
+    if templates.is_empty() {
+        list.push_str(r#"<p class="muted">No templates yet.</p>"#);
+    }
+    for (i, t) in templates.iter().enumerate() {
+        list.push_str(&format!(
+            r#"<div class="template-item">
+  <form method="post" action="/settings/templates">
+    <input type="hidden" name="csrf" value="{token}">
+    <input type="hidden" name="id" value="{id}">
+    <div class="field"><label for="tpl_name_{i}">Name</label><input id="tpl_name_{i}" name="name" value="{name}"></div>
+    <div class="field"><label for="tpl_body_{i}">Body</label><textarea id="tpl_body_{i}" name="body_text">{body}</textarea></div>
+    <div class="form-actions">
+      <button class="btn btn-primary btn-sm" type="submit" name="cmd" value="update">Save template</button>
+      <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
+    </div>
+  </form>
+</div>"#,
+            token = esc(token),
+            id = esc(&t.id),
+            name = esc(&t.name),
+            body = esc(&t.body_text),
+            i = i,
+        ));
+    }
+    format!(
+        r#"<section id="templates" class="card pad template-list">
+  <h2>Templates</h2>
+  <div class="template-list__items">{list}</div>
+  <form class="template-create" method="post" action="/settings/templates">
+    <input type="hidden" name="csrf" value="{token}">
+    <div class="field"><label for="tpl_new_name">Name</label><input id="tpl_new_name" name="name" placeholder="Follow-up"></div>
+    <div class="field"><label for="tpl_new_body">Body</label><textarea id="tpl_new_body" name="body_text"></textarea></div>
+    <div class="form-actions"><button class="btn btn-primary" type="submit" name="cmd" value="add">Add template</button></div>
+  </form>
+</section>"#,
+        token = esc(token),
+    )
+}
+
+/// Form body for `POST /settings/templates`: add/update/delete a private compose template.
+#[derive(Deserialize, Default)]
+struct TemplateForm {
+    csrf: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    body_text: String,
+    #[serde(default)]
+    body_html: String,
+}
+
+enum TemplateFormError {
+    Invalid(String),
+    Store(crate::store::StoreError),
+}
+
+async fn settings_templates_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TemplateForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Request blocked",
+            "CSRF token missing or mismatched.",
+        );
+    }
+    let Some(mb) = resolve_mailbox(&state, &headers).await else {
+        return no_mailbox_page(&email_display(&headers));
+    };
+
+    let result = match form.cmd.as_str() {
+        "delete" => state
+            .store
+            .delete_template(&mb.addr, form.id.trim())
+            .await
+            .map_err(TemplateFormError::Store),
+        "update" => update_template_from_form(&state, &mb.addr, &form).await,
+        "" | "add" => create_template_from_form(&state, &mb.addr, &form).await,
+        _ => Err(TemplateFormError::Invalid(
+            "Unknown template command.".to_string(),
+        )),
+    };
+    if let Err(e) = result {
+        return match e {
+            TemplateFormError::Invalid(message) => {
+                error_page(StatusCode::BAD_REQUEST, "Invalid request", &message)
+            }
+            TemplateFormError::Store(e) => error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                &e.to_string(),
+            ),
+        };
+    }
+    tracing::info!(
+        target: "corvid::audit",
+        actor = %identity_subject(&headers).unwrap_or_default(),
+        mailbox = %mb.addr,
+        cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
+        template = %form.id,
+        "template change",
+    );
+    Redirect::to("/settings#templates").into_response()
+}
+
+async fn create_template_from_form(
+    state: &AppState,
+    mailbox: &str,
+    form: &TemplateForm,
+) -> Result<(), TemplateFormError> {
+    let name = template_name(&form.name)?;
+    let (body_text, body_html) = template_body_parts(&form.body_text, &form.body_html)?;
+    let now = now_secs();
+    let template = Template {
+        id: new_id("tpl"),
+        user: mailbox.to_string(),
+        name,
+        body_html,
+        body_text,
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .store
+        .create_template(&template)
+        .await
+        .map_err(TemplateFormError::Store)
+}
+
+async fn update_template_from_form(
+    state: &AppState,
+    mailbox: &str,
+    form: &TemplateForm,
+) -> Result<(), TemplateFormError> {
+    let id = form.id.trim();
+    let Some(existing) = state
+        .store
+        .get_template(mailbox, id)
+        .await
+        .map_err(TemplateFormError::Store)?
+    else {
+        return Err(TemplateFormError::Invalid("No such template.".to_string()));
+    };
+    let name = template_name(&form.name)?;
+    let (body_text, body_html) = template_body_parts(&form.body_text, &form.body_html)?;
+    let template = Template {
+        id: existing.id,
+        user: mailbox.to_string(),
+        name,
+        body_html,
+        body_text,
+        created_at: existing.created_at,
+        updated_at: now_secs(),
+    };
+    state
+        .store
+        .update_template(&template)
+        .await
+        .map_err(TemplateFormError::Store)
+}
+
+fn template_name(raw: &str) -> Result<String, TemplateFormError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(TemplateFormError::Invalid(
+            "A template name is required.".to_string(),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+fn template_body_parts(
+    body_text: &str,
+    body_html: &str,
+) -> Result<(String, String), TemplateFormError> {
+    let clean_html = crate::sanitize::sanitize_html(body_html);
+    if clean_html.trim().is_empty() {
+        if body_text.trim().is_empty() {
+            return Err(TemplateFormError::Invalid(
+                "A template body is required.".to_string(),
+            ));
+        }
+        return Ok((body_text.to_string(), String::new()));
+    }
+    let text = if body_text.trim().is_empty() {
+        crate::sanitize::html_to_text(&clean_html)
+    } else {
+        body_text.to_string()
+    };
+    Ok((text, clean_html))
+}
 
 fn render_sender_lists_section(entries: &[SenderListEntry], token: &str) -> String {
     let mut rows = String::new();

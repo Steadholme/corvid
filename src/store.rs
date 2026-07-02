@@ -24,6 +24,8 @@
 //!    action TEXT, target_folder TEXT NULL, enabled BOOLEAN, created_at BIGINT)`
 //! - `auto_reply_log(mailbox TEXT, sender TEXT, sent_at BIGINT, PK (mailbox, sender))`
 //! - `sender_lists(id TEXT PK, user TEXT, address_or_domain TEXT, kind TEXT, created_at BIGINT)`
+//! - `templates(id TEXT PK, user TEXT, name TEXT, body_html TEXT, body_text TEXT,
+//!    created_at BIGINT, updated_at BIGINT)`
 //! - `spam_annotations(message_id TEXT PK, mailbox TEXT, score BIGINT, reason TEXT)`
 //! - settings columns on `mailboxes` (signature, undo_send_window_secs, auto_reply_*), added
 //!   idempotently.
@@ -36,7 +38,7 @@ use thiserror::Error;
 use crate::model::{
     Alias, Contact, FilterRule, Label, Mailbox, MailboxSettings, Message, MessageSummary,
     OutboundItem, ScheduledOutbound, SearchPredicate, SearchPredicateKind, SearchQuery,
-    SearchState, SendIdentity, SenderListEntry, SpamAnnotation, ThreadSummary,
+    SearchState, SendIdentity, SenderListEntry, SpamAnnotation, Template, ThreadSummary,
     DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 
@@ -185,6 +187,18 @@ pub trait Store: Send + Sync {
         sender: &str,
         now: i64,
     ) -> Result<bool, StoreError>;
+
+    // --- Compose templates ----------------------------------------------------
+    /// Every compose template owned by a mailbox, ordered by name.
+    async fn list_templates(&self, mailbox: &str) -> Result<Vec<Template>, StoreError>;
+    /// A single compose template, scoped to `mailbox`.
+    async fn get_template(&self, mailbox: &str, id: &str) -> Result<Option<Template>, StoreError>;
+    /// Persist a new compose template.
+    async fn create_template(&self, template: &Template) -> Result<(), StoreError>;
+    /// Update an existing compose template, scoped by its `user` and `id`.
+    async fn update_template(&self, template: &Template) -> Result<(), StoreError>;
+    /// Delete one compose template, scoped to `mailbox`.
+    async fn delete_template(&self, mailbox: &str, id: &str) -> Result<(), StoreError>;
 
     /// Enqueue an outbound message for relay.
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError>;
@@ -377,6 +391,7 @@ pub struct InMemoryStore {
     settings: Mutex<Vec<MailboxSettings>>,
     /// Auto-reply dedupe log entries: `(mailbox, sender, sent_at)`.
     auto_replies: Mutex<Vec<(String, String, i64)>>,
+    templates: Mutex<Vec<Template>>,
     send_identities: Mutex<Vec<SendIdentity>>,
     /// Contacts qualified by their owning mailbox: `(mailbox, contact)`.
     contacts: Mutex<Vec<(String, Contact)>>,
@@ -1064,6 +1079,64 @@ impl Store for InMemoryStore {
             v.push((mailbox.to_string(), sender.to_string(), now));
         }
         Ok(true)
+    }
+
+    async fn list_templates(&self, mailbox: &str) -> Result<Vec<Template>, StoreError> {
+        let mut v: Vec<Template> = self
+            .templates
+            .lock()
+            .expect("templates lock poisoned")
+            .iter()
+            .filter(|t| t.user == mailbox)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(v)
+    }
+
+    async fn get_template(&self, mailbox: &str, id: &str) -> Result<Option<Template>, StoreError> {
+        Ok(self
+            .templates
+            .lock()
+            .expect("templates lock poisoned")
+            .iter()
+            .find(|t| t.user == mailbox && t.id == id)
+            .cloned())
+    }
+
+    async fn create_template(&self, template: &Template) -> Result<(), StoreError> {
+        self.templates
+            .lock()
+            .expect("templates lock poisoned")
+            .push(template.clone());
+        Ok(())
+    }
+
+    async fn update_template(&self, template: &Template) -> Result<(), StoreError> {
+        let mut v = self.templates.lock().expect("templates lock poisoned");
+        if let Some(existing) = v
+            .iter_mut()
+            .find(|t| t.user == template.user && t.id == template.id)
+        {
+            existing.name = template.name.clone();
+            existing.body_html = template.body_html.clone();
+            existing.body_text = template.body_text.clone();
+            existing.updated_at = template.updated_at;
+        }
+        Ok(())
+    }
+
+    async fn delete_template(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        self.templates
+            .lock()
+            .expect("templates lock poisoned")
+            .retain(|t| !(t.user == mailbox && t.id == id));
+        Ok(())
     }
 
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError> {
@@ -2013,6 +2086,25 @@ impl PgStore {
         .execute(&self.pool)
         .await?;
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS templates (\
+                 id TEXT PRIMARY KEY, \
+                 \"user\" TEXT NOT NULL, \
+                 name TEXT NOT NULL, \
+                 body_html TEXT NOT NULL DEFAULT '', \
+                 body_text TEXT NOT NULL DEFAULT '', \
+                 created_at BIGINT NOT NULL DEFAULT 0, \
+                 updated_at BIGINT NOT NULL DEFAULT 0\
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_templates_user \
+             ON templates (\"user\", name, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS spam_annotations (\
                  message_id TEXT PRIMARY KEY, \
                  mailbox TEXT NOT NULL, \
@@ -2206,6 +2298,18 @@ impl PgStore {
             address_or_domain: row.try_get("address_or_domain")?,
             kind: row.try_get("kind")?,
             created_at: row.try_get("created_at")?,
+        })
+    }
+
+    fn template_from_row(row: &sqlx::postgres::PgRow) -> Result<Template, sqlx::Error> {
+        Ok(Template {
+            id: row.try_get("id")?,
+            user: row.try_get("user")?,
+            name: row.try_get("name")?,
+            body_html: row.try_get("body_html")?,
+            body_text: row.try_get("body_text")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
         })
     }
 
@@ -2828,6 +2932,83 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_templates(&self, mailbox: &str) -> Result<Vec<Template>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, \"user\", name, body_html, body_text, created_at, updated_at \
+             FROM templates WHERE \"user\" = $1 ORDER BY name ASC, id ASC",
+        )
+        .bind(mailbox)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::template_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn get_template(&self, mailbox: &str, id: &str) -> Result<Option<Template>, StoreError> {
+        let row = sqlx::query(
+            "SELECT id, \"user\", name, body_html, body_text, created_at, updated_at \
+             FROM templates WHERE \"user\" = $1 AND id = $2",
+        )
+        .bind(mailbox)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.as_ref()
+            .map(Self::template_from_row)
+            .transpose()
+            .map_err(backend)
+    }
+
+    async fn create_template(&self, template: &Template) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO templates \
+                 (id, \"user\", name, body_html, body_text, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&template.id)
+        .bind(&template.user)
+        .bind(&template.name)
+        .bind(&template.body_html)
+        .bind(&template.body_text)
+        .bind(template.created_at)
+        .bind(template.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn update_template(&self, template: &Template) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE templates SET name = $1, body_html = $2, body_text = $3, updated_at = $4 \
+             WHERE \"user\" = $5 AND id = $6",
+        )
+        .bind(&template.name)
+        .bind(&template.body_html)
+        .bind(&template.body_text)
+        .bind(template.updated_at)
+        .bind(&template.user)
+        .bind(&template.id)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn delete_template(&self, mailbox: &str, id: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM templates WHERE \"user\" = $1 AND id = $2")
+            .bind(mailbox)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
     }
 
     async fn enqueue_outbound(&self, item: &OutboundItem) -> Result<(), StoreError> {
@@ -3813,5 +3994,72 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn templates_are_scoped_and_crud_roundtrips() {
+        let store = InMemoryStore::new();
+        let mut welcome = Template {
+            id: "tpl_welcome".to_string(),
+            user: "w33d@w33d.xyz".to_string(),
+            name: "Welcome".to_string(),
+            body_html: "<p>Hello <strong>there</strong></p>".to_string(),
+            body_text: "Hello there".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        };
+        let other = Template {
+            id: "tpl_other".to_string(),
+            user: "alice@w33d.xyz".to_string(),
+            name: "Alice private".to_string(),
+            body_html: String::new(),
+            body_text: "Private".to_string(),
+            created_at: 2,
+            updated_at: 2,
+        };
+
+        store.create_template(&welcome).await.unwrap();
+        store.create_template(&other).await.unwrap();
+
+        assert_eq!(
+            store.list_templates("w33d@w33d.xyz").await.unwrap(),
+            vec![welcome.clone()]
+        );
+        assert_eq!(
+            store
+                .get_template("alice@w33d.xyz", "tpl_welcome")
+                .await
+                .unwrap(),
+            None,
+            "templates are private to the owning mailbox"
+        );
+
+        welcome.name = "Welcome v2".to_string();
+        welcome.body_text = "Updated".to_string();
+        welcome.updated_at = 3;
+        store.update_template(&welcome).await.unwrap();
+        assert_eq!(
+            store
+                .get_template("w33d@w33d.xyz", "tpl_welcome")
+                .await
+                .unwrap()
+                .unwrap()
+                .body_text,
+            "Updated"
+        );
+
+        store
+            .delete_template("w33d@w33d.xyz", "tpl_welcome")
+            .await
+            .unwrap();
+        assert!(store
+            .list_templates("w33d@w33d.xyz")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.list_templates("alice@w33d.xyz").await.unwrap().len(),
+            1
+        );
     }
 }

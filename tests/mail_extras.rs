@@ -749,6 +749,86 @@ async fn settings_sender_lists_add_replace_and_delete() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn settings_templates_crud_and_compose_insert_hooks() {
+    let state = build_dev_state().await;
+    let (token, cookie) = mint_csrf(&state).await;
+    let body = "Hello <friend>\nThanks";
+
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/templates",
+            &cookie,
+            format!(
+                "csrf={token}&cmd=add&name={}&body_text={}",
+                urlencode("Follow-up"),
+                urlencode(body)
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let templates = state.store.list_templates(MAILBOX).await.unwrap();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].name, "Follow-up");
+    assert_eq!(templates[0].body_text, body);
+
+    let req = Request::builder()
+        .uri("/compose")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
+    assert!(html.contains(r#"class="template-menu""#));
+    assert!(html.contains(r#"btn-insert-template"#));
+    assert!(html.contains(r#"data-template-select"#));
+    assert!(html.contains("Follow-up"));
+    assert!(
+        html.contains("Hello &lt;friend&gt;"),
+        "template body is escaped in compose data"
+    );
+
+    let id = templates[0].id.clone();
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/templates",
+            &cookie,
+            format!(
+                "csrf={token}&cmd=update&id={}&name={}&body_text={}",
+                urlencode(&id),
+                urlencode("Updated"),
+                urlencode("Updated body")
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let updated = state
+        .store
+        .get_template(MAILBOX, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.name, "Updated");
+    assert_eq!(updated.body_text, "Updated body");
+
+    let resp = app(state.clone())
+        .oneshot(post(
+            "/settings/templates",
+            &cookie,
+            format!("csrf={token}&cmd=delete&id={}", urlencode(&id)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert!(state
+        .store
+        .list_templates(MAILBOX)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Minimal percent-encoding matching the webmail's own (unreserved chars pass through).
 fn urlencode(s: &str) -> String {
     let mut out = String::new();

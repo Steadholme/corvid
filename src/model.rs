@@ -102,6 +102,25 @@ pub struct SenderListEntry {
     pub created_at: i64,
 }
 
+/// A per-mailbox compose template, private to its owning user/mailbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Template {
+    /// Opaque id, primary key.
+    pub id: String,
+    /// The mailbox/user this template belongs to.
+    pub user: String,
+    /// User-facing template name.
+    pub name: String,
+    /// Sanitised rich HTML body. Empty means use `body_text`.
+    pub body_html: String,
+    /// Plain-text fallback/body.
+    pub body_text: String,
+    /// Creation time (epoch seconds).
+    pub created_at: i64,
+    /// Last update time (epoch seconds).
+    pub updated_at: i64,
+}
+
 /// Stored explanation for why a message was considered spam-like at delivery/action time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SpamAnnotation {

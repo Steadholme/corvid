@@ -10,7 +10,7 @@
 //! docker rm -f corvid-testpg
 //! ```
 
-use corvid::model::{parse_search_query, FilterRule, Mailbox, Message, OutboundItem};
+use corvid::model::{parse_search_query, FilterRule, Mailbox, Message, OutboundItem, Template};
 use corvid::store::{PgStore, Store, AUTO_REPLY_DEDUPE_SECS};
 use corvid::{new_id, now_secs};
 
@@ -36,6 +36,7 @@ async fn pg_store_full_integration() {
         "contacts",
         "labels",
         "message_labels",
+        "templates",
         "mailboxes",
     ] {
         sqlx_delete(&url, tbl).await;
@@ -676,6 +677,39 @@ async fn pg_store_full_integration() {
         .iter()
         .any(|r| r.action == "label" && r.target_label.as_deref() == Some("lblZ")));
 
+    // --- compose templates ----------------------------------------------------
+    let mut tpl = Template {
+        id: "tpl1".into(),
+        user: "w33d@w33d.xyz".into(),
+        name: "Welcome".into(),
+        body_html: "<p>Hello</p>".into(),
+        body_text: "Hello".into(),
+        created_at: now,
+        updated_at: now,
+    };
+    pg.create_template(&tpl).await.unwrap();
+    assert_eq!(
+        pg.get_template("w33d@w33d.xyz", "tpl1").await.unwrap(),
+        Some(tpl.clone())
+    );
+    assert!(
+        pg.get_template("alice@w33d.xyz", "tpl1")
+            .await
+            .unwrap()
+            .is_none(),
+        "templates are scoped to the owning user"
+    );
+    tpl.name = "Welcome v2".into();
+    tpl.body_text = "Hello again".into();
+    tpl.updated_at = now + 1;
+    pg.update_template(&tpl).await.unwrap();
+    assert_eq!(
+        pg.list_templates("w33d@w33d.xyz").await.unwrap()[0].body_text,
+        "Hello again"
+    );
+    pg.delete_template("w33d@w33d.xyz", "tpl1").await.unwrap();
+    assert!(pg.list_templates("w33d@w33d.xyz").await.unwrap().is_empty());
+
     for tbl in [
         "messages",
         "outbound_queue",
@@ -686,11 +720,12 @@ async fn pg_store_full_integration() {
         "contacts",
         "labels",
         "message_labels",
+        "templates",
         "mailboxes",
     ] {
         sqlx_delete(&url, tbl).await;
     }
-    println!("PG STORE INTEGRATION OK: mailboxes + messages + threading + identities + contacts + labels + rules/settings/auto-reply");
+    println!("PG STORE INTEGRATION OK: mailboxes + messages + threading + identities + contacts + labels + templates + rules/settings/auto-reply");
 }
 
 async fn sqlx_delete(url: &str, table: &str) {

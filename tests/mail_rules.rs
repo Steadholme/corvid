@@ -562,6 +562,8 @@ async fn settings_page_renders_core_sections() {
     assert!(html.contains("Filter rules"));
     assert!(html.contains("Undo send"));
     assert!(html.contains(r#"action="/settings/undo-send""#));
+    assert!(html.contains("Templates"));
+    assert!(html.contains(r#"action="/settings/templates""#));
     assert!(html.contains("Signature"));
     assert!(html.contains("Auto-reply (vacation)"));
     assert!(html.contains("No filter rules yet"), "empty state rendered");
