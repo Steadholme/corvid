@@ -6,7 +6,7 @@
 //! - header unfolding + case-insensitive lookup,
 //! - RFC 2047 `=?charset?B/Q?...?=` words (UTF-8 / ASCII) in display headers,
 //! - single-part bodies with `quoted-printable` / `base64` transfer encodings,
-//! - one level of `multipart/*` (picking the text/plain and text/html alternatives).
+//! - recursive `multipart/*` (picking the text/plain and text/html alternatives).
 //!
 //! Anything it cannot decode degrades to the raw text rather than failing.
 
@@ -102,7 +102,7 @@ fn extract_body(content_type: &str, cte: &str, body: &str) -> (String, String) {
 }
 
 /// Walk the parts of a multipart body, picking the text/plain + text/html alternatives.
-/// Handles one level of nesting (e.g. multipart/mixed wrapping multipart/alternative).
+/// Recurses through nested multipart trees (e.g. mixed -> related -> alternative).
 fn extract_multipart(boundary: &str, body: &str) -> (String, String) {
     let mut text = String::new();
     let mut html = String::new();
@@ -117,6 +117,7 @@ fn extract_multipart(boundary: &str, body: &str) -> (String, String) {
         let phdrs = parse_headers(phdr_block);
         let pct = header(&phdrs, "content-type").unwrap_or_default();
         let pcte = header(&phdrs, "content-transfer-encoding").unwrap_or_default();
+        let disposition = header(&phdrs, "content-disposition").unwrap_or_default();
         let pct_lower = pct.to_ascii_lowercase();
 
         if pct_lower.starts_with("multipart/") {
@@ -129,6 +130,10 @@ fn extract_multipart(boundary: &str, body: &str) -> (String, String) {
                     html = h;
                 }
             }
+            continue;
+        }
+
+        if !is_body_part(&pct, &disposition) {
             continue;
         }
 
@@ -285,11 +290,31 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentPart {
+    attachment: Attachment,
+    content_id: Option<String>,
+    inline: bool,
+}
+
 /// Lightweight metadata for one attachment, used to render the read-view download list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentMeta {
-    /// 0-based position among the attachments — the stable download key.
+    /// 0-based position among all extractable attachment parts — the stable download key.
     pub index: usize,
+    pub filename: String,
+    pub content_type: String,
+    /// Decoded size in bytes.
+    pub size: usize,
+}
+
+/// Metadata for an inline attachment addressable from `cid:` URLs in an HTML body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineAttachmentMeta {
+    /// 0-based position among all extractable attachment parts, matching [`extract_attachment`].
+    pub index: usize,
+    /// Normalised `Content-ID` without angle brackets.
+    pub content_id: String,
     pub filename: String,
     pub content_type: String,
     /// Decoded size in bytes.
@@ -299,27 +324,57 @@ pub struct AttachmentMeta {
 /// Enumerate the attachment parts of a raw message (Content-Disposition: attachment, or any part
 /// carrying a `filename`/`name`). Best effort: an empty list for a single-part / text-only body.
 pub fn list_attachments(raw: &str) -> Vec<AttachmentMeta> {
-    collect_attachments(raw)
+    collect_attachment_parts(raw)
         .into_iter()
         .enumerate()
-        .map(|(index, a)| AttachmentMeta {
+        .filter(|(_, part)| !part.inline)
+        .map(|(index, part)| AttachmentMeta {
             index,
-            filename: a.filename,
-            content_type: a.content_type,
-            size: a.data.len(),
+            filename: part.attachment.filename,
+            content_type: part.attachment.content_type,
+            size: part.attachment.data.len(),
         })
         .collect()
 }
 
-/// Extract the Nth attachment (0-based, matching [`list_attachments`] order) with decoded bytes.
-pub fn extract_attachment(raw: &str, index: usize) -> Option<Attachment> {
-    let mut all = collect_attachments(raw);
-    (index < all.len()).then(|| all.swap_remove(index))
+/// Enumerate inline parts with a `Content-ID`, used to rewrite `cid:` image references.
+pub fn list_inline_attachments(raw: &str) -> Vec<InlineAttachmentMeta> {
+    collect_attachment_parts(raw)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            if !part.inline {
+                return None;
+            }
+            let content_id = part.content_id?;
+            Some(InlineAttachmentMeta {
+                index,
+                content_id,
+                filename: part.attachment.filename,
+                content_type: part.attachment.content_type,
+                size: part.attachment.data.len(),
+            })
+        })
+        .collect()
 }
 
-/// Walk a message's MIME parts (one level of nesting, like [`extract_multipart`]) collecting the
-/// attachment parts with their bodies decoded per Content-Transfer-Encoding.
-fn collect_attachments(raw: &str) -> Vec<Attachment> {
+/// Extract the Nth attachment by the stable index exposed on [`AttachmentMeta`] and
+/// [`InlineAttachmentMeta`].
+pub fn extract_attachment(raw: &str, index: usize) -> Option<Attachment> {
+    extract_attachment_with_inline(raw, index).map(|(attachment, _)| attachment)
+}
+
+/// Extract the Nth attachment and whether it should be served inline.
+pub fn extract_attachment_with_inline(raw: &str, index: usize) -> Option<(Attachment, bool)> {
+    let mut all = collect_attachment_parts(raw);
+    (index < all.len()).then(|| {
+        let part = all.swap_remove(index);
+        (part.attachment, part.inline)
+    })
+}
+
+/// Walk a message's MIME parts collecting extractable file/inline parts with decoded bodies.
+fn collect_attachment_parts(raw: &str) -> Vec<AttachmentPart> {
     let (headers, body) = split_headers_body(raw);
     let hdrs = parse_headers(headers);
     let ct = header(&hdrs, "content-type").unwrap_or_default();
@@ -333,7 +388,7 @@ fn collect_attachments(raw: &str) -> Vec<Attachment> {
 }
 
 /// Recurse the parts of a multipart body, pushing every attachment part into `out`.
-fn walk_attachments(boundary: &str, body: &str, out: &mut Vec<Attachment>) {
+fn walk_attachments(boundary: &str, body: &str, out: &mut Vec<AttachmentPart>) {
     let delim = format!("--{boundary}");
     for part in body.split(&delim) {
         let part = part.trim_start_matches(['\r', '\n']);
@@ -353,28 +408,62 @@ fn walk_attachments(boundary: &str, body: &str, out: &mut Vec<Attachment>) {
         }
 
         let disposition = header(&phdrs, "content-disposition").unwrap_or_default();
-        let is_attach = disposition.trim_start().to_ascii_lowercase().starts_with("attachment");
+        let disposition_kind = disposition_kind(&disposition);
+        let is_attach = disposition_kind == "attachment";
+        let content_type = content_type_base(&pct);
+        let content_id = header(&phdrs, "content-id").and_then(|v| normalize_content_id(&v));
         let filename = param(&disposition, "filename").or_else(|| param(&pct, "name"));
+        let is_inline = !is_attach
+            && (disposition_kind == "inline"
+                || (content_id.is_some() && content_type.starts_with("image/")));
         // A part is an attachment when it is explicitly dispositioned so, or names a file.
-        let Some(name) = filename.filter(|n| !n.trim().is_empty()).or_else(|| {
-            is_attach.then(|| "attachment.bin".to_string())
-        }) else {
+        let Some(name) = filename
+            .filter(|n| !n.trim().is_empty())
+            .or_else(|| is_attach.then(|| "attachment.bin".to_string()))
+            .or_else(|| is_inline.then(|| "inline.bin".to_string()))
+        else {
             continue;
         };
 
         let pcte = header(&phdrs, "content-transfer-encoding").unwrap_or_default();
-        out.push(Attachment {
-            filename: sanitize_filename(&name),
-            content_type: content_type_base(&pct),
-            data: decode_cte_bytes(pbody, &pcte),
+        out.push(AttachmentPart {
+            attachment: Attachment {
+                filename: sanitize_filename(&name),
+                content_type,
+                data: decode_cte_bytes(pbody, &pcte),
+            },
+            content_id,
+            inline: is_inline,
         });
     }
+}
+
+fn is_body_part(content_type: &str, disposition: &str) -> bool {
+    let kind = disposition_kind(disposition);
+    if kind == "attachment" {
+        return false;
+    }
+    param(disposition, "filename").is_none() && param(content_type, "name").is_none()
+}
+
+fn disposition_kind(disposition: &str) -> String {
+    disposition
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
 }
 
 /// The base `type/subtype` of a Content-Type value (parameters stripped), lowercased; defaults to
 /// `application/octet-stream` for a blank/garbage value. Sanitised for safe header echoing.
 pub fn content_type_base(ct: &str) -> String {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let clean: String = base
         .chars()
         .filter(|c| !c.is_control() && *c != '"')
@@ -399,6 +488,22 @@ pub fn sanitize_filename(name: &str) -> String {
         "attachment.bin".to_string()
     } else {
         clean
+    }
+}
+
+/// Normalise a Content-ID for matching against `cid:` URLs: strip brackets and compare
+/// case-insensitively.
+pub fn normalize_content_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(trimmed)
+        .trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_ascii_lowercase())
     }
 }
 
@@ -506,6 +611,49 @@ mod tests {
         assert_eq!(att.data, b"hi\n");
         assert_eq!(att.filename, "note.txt");
         assert!(extract_attachment(raw, 1).is_none(), "no second attachment");
+    }
+
+    #[test]
+    fn recurses_related_alternative_and_tracks_inline_cid() {
+        let raw = "Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+                   --M\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
+                   --R\r\nContent-Type: multipart/alternative; boundary=\"A\"\r\n\r\n\
+                   --A\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain body\r\n\
+                   --A\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                   <p>rich <img src=\"cid:logo@example\"></p>\r\n--A--\r\n\
+                   --R\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+                   Content-Disposition: inline; filename=\"logo.png\"\r\n\
+                   Content-ID: <logo@example>\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\naW1n\r\n--R--\r\n\
+                   --M\r\nContent-Type: text/plain; name=\"note.txt\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   Content-Disposition: attachment; filename=\"note.txt\"\r\n\r\nZmlsZQ==\r\n--M--\r\n";
+
+        let parsed = parse(raw);
+        assert!(parsed.body_text.contains("plain body"));
+        assert!(
+            parsed
+                .body_html
+                .contains("<img src=\"cid:logo@example\" />")
+        );
+
+        let inline = list_inline_attachments(raw);
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].index, 0);
+        assert_eq!(inline[0].content_id, "logo@example");
+        assert_eq!(inline[0].filename, "logo.png");
+
+        let visible = list_attachments(raw);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].index, 1);
+        assert_eq!(visible[0].filename, "note.txt");
+
+        let (img, is_inline) = extract_attachment_with_inline(raw, inline[0].index).unwrap();
+        assert!(is_inline);
+        assert_eq!(img.data, b"img");
+        let (note, is_inline) = extract_attachment_with_inline(raw, visible[0].index).unwrap();
+        assert!(!is_inline);
+        assert_eq!(note.data, b"file");
     }
 
     #[test]

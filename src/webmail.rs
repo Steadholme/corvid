@@ -31,6 +31,7 @@ use crate::rfc822::Attachment;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::Deserialize;
+use std::collections::HashMap;
 use time::{Date, Month, OffsetDateTime};
 
 use crate::AppState;
@@ -1833,6 +1834,376 @@ fn canonical_folder(requested: Option<&str>) -> &'static str {
     }
 }
 
+fn render_message_body(msg: &Message) -> String {
+    if !msg.body_html.is_empty() {
+        let inline = crate::rfc822::list_inline_attachments(&msg.raw_rfc822);
+        let rewritten = rewrite_cid_image_sources(&msg.body_html, &msg.id, &inline);
+        let marked = mark_gmail_quote_blocks(&rewritten);
+        let clean = crate::sanitize::sanitize_html(&marked);
+        let folded = fold_quoted_html(&clean);
+        format!(r#"<div class="msg-body">{folded}</div>"#)
+    } else {
+        render_plain_message_body(&msg.body_text)
+    }
+}
+
+fn render_plain_message_body(text: &str) -> String {
+    let inner = if let Some((visible, quoted)) = split_quoted_text(text) {
+        let mut html = String::new();
+        let visible = visible.trim_end_matches(['\r', '\n']);
+        if !visible.trim().is_empty() {
+            html.push_str(&format!(r#"<pre>{}</pre>"#, esc(visible)));
+        }
+        let quoted = quoted.trim_start_matches(['\r', '\n']);
+        html.push_str(&quote_details(&format!(r#"<pre>{}</pre>"#, esc(quoted))));
+        html
+    } else {
+        format!(r#"<pre>{}</pre>"#, esc(text))
+    };
+    format!(r#"<div class="msg-body">{inner}</div>"#)
+}
+
+fn rewrite_cid_image_sources(
+    html: &str,
+    msg_id: &str,
+    inline: &[crate::rfc822::InlineAttachmentMeta],
+) -> String {
+    if inline.is_empty() || !html.to_ascii_lowercase().contains("cid:") {
+        return html.to_string();
+    }
+
+    let encoded_id = url_encode(msg_id);
+    let mut cid_urls = HashMap::new();
+    for part in inline {
+        cid_urls
+            .entry(part.content_id.clone())
+            .or_insert_with(|| format!("/m/{encoded_id}/attachments/{idx}", idx = part.index));
+    }
+
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while let Some(rel) = find_ascii_case_insensitive(&html[i..], "<img") {
+        let tag_start = i + rel;
+        if !is_img_tag_start(html, tag_start) {
+            out.push_str(&html[i..tag_start + 1]);
+            i = tag_start + 1;
+            continue;
+        }
+        out.push_str(&html[i..tag_start]);
+        let Some(tag_end) = find_html_tag_end(html.as_bytes(), tag_start) else {
+            out.push_str(&html[tag_start..]);
+            return out;
+        };
+        let tag = &html[tag_start..=tag_end];
+        out.push_str(&rewrite_img_src_attr(tag, &cid_urls));
+        i = tag_end + 1;
+    }
+    out.push_str(&html[i..]);
+    out
+}
+
+fn rewrite_img_src_attr(tag: &str, cid_urls: &HashMap<String, String>) -> String {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_attr_name_char(bytes[i]) {
+            i += 1;
+            continue;
+        }
+
+        let name_start = i;
+        while i < bytes.len() && is_attr_name_char(bytes[i]) {
+            i += 1;
+        }
+        let name = &tag[name_start..i];
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            i = j;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+
+        let quote = matches!(bytes[j], b'"' | b'\'').then_some(bytes[j]);
+        let value_start = if quote.is_some() { j + 1 } else { j };
+        let mut value_end = value_start;
+        if let Some(q) = quote {
+            while value_end < bytes.len() && bytes[value_end] != q {
+                value_end += 1;
+            }
+        } else {
+            while value_end < bytes.len()
+                && !bytes[value_end].is_ascii_whitespace()
+                && !matches!(bytes[value_end], b'>' | b'/')
+            {
+                value_end += 1;
+            }
+        }
+
+        if name.eq_ignore_ascii_case("src") {
+            let value = &tag[value_start..value_end];
+            if let Some(cid) = cid_src_value(value) {
+                if let Some(url) = cid_urls.get(&cid) {
+                    let mut rewritten = String::with_capacity(tag.len() + url.len());
+                    rewritten.push_str(&tag[..value_start]);
+                    rewritten.push_str(url);
+                    rewritten.push_str(&tag[value_end..]);
+                    return rewritten;
+                }
+            }
+        }
+
+        i = if quote.is_some() {
+            value_end.saturating_add(1)
+        } else {
+            value_end
+        };
+    }
+    tag.to_string()
+}
+
+fn cid_src_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.to_ascii_lowercase().starts_with("cid:") {
+        return None;
+    }
+    let decoded = percent_decode_lossy(&value[4..]);
+    crate::rfc822::normalize_content_id(&decoded)
+}
+
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn mark_gmail_quote_blocks(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(hit) = lower.find("gmail_quote") else {
+        return html.to_string();
+    };
+    let Some(tag_start) = html[..hit].rfind('<') else {
+        return html.to_string();
+    };
+    let Some(tag_end) = find_html_tag_end(html.as_bytes(), tag_start) else {
+        return html.to_string();
+    };
+    let tag = &html[tag_start..=tag_end];
+    if tag.starts_with("</") || !tag.to_ascii_lowercase().contains("gmail_quote") {
+        return html.to_string();
+    }
+    format!(
+        "{}<blockquote>{}</blockquote>",
+        &html[..tag_start],
+        &html[tag_start..]
+    )
+}
+
+fn fold_quoted_html(html: &str) -> String {
+    if let Some(block_start) = find_ascii_case_insensitive(html, "<blockquote") {
+        let start = attribution_start_before(html, block_start).unwrap_or(block_start);
+        let end = matching_blockquote_end(html, block_start).unwrap_or(html.len());
+        return fold_html_range(html, start, end);
+    }
+    if let Some(start) = wrote_quote_start(html) {
+        return fold_html_range(html, start, html.len());
+    }
+    html.to_string()
+}
+
+fn fold_html_range(html: &str, start: usize, end: usize) -> String {
+    let mut out = String::with_capacity(html.len() + 120);
+    out.push_str(&html[..start]);
+    out.push_str(&quote_details(&html[start..end]));
+    out.push_str(&html[end..]);
+    out
+}
+
+fn quote_details(inner: &str) -> String {
+    format!(
+        r#"<details class="quote-fold"><summary class="btn-expand-quote">&middot;&middot;&middot; Show quoted text</summary>{inner}</details>"#
+    )
+}
+
+fn split_quoted_text(text: &str) -> Option<(&str, &str)> {
+    let mut line_start = 0;
+    let mut previous_nonblank = None;
+    for line in text.split_inclusive('\n') {
+        let without_newline = line.trim_end_matches(['\r', '\n']);
+        let trimmed = without_newline.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        let starts_quote = trimmed.starts_with('>')
+            || looks_like_wrote_line(trimmed)
+            || lower.starts_with("-----original message-----");
+        if starts_quote {
+            let start = if trimmed.starts_with('>') {
+                previous_nonblank
+                    .filter(|prev| looks_like_wrote_line(text[*prev..line_start].trim()))
+                    .unwrap_or(line_start)
+            } else {
+                line_start
+            };
+            return (!text[start..].trim().is_empty()).then_some((&text[..start], &text[start..]));
+        }
+        if !trimmed.is_empty() {
+            previous_nonblank = Some(line_start);
+        }
+        line_start += line.len();
+    }
+    None
+}
+
+fn looks_like_wrote_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    lower.starts_with("on ") && lower.contains(" wrote:")
+}
+
+fn wrote_quote_start(html: &str) -> Option<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut search = 0;
+    while let Some(rel) = lower[search..].find(" wrote:") {
+        let wrote = search + rel;
+        if let Some(on) = lower[..wrote].rfind("on ") {
+            if wrote.saturating_sub(on) <= 300 {
+                return Some(html_block_start_before(html, on));
+            }
+        }
+        search = wrote + " wrote:".len();
+    }
+    None
+}
+
+fn attribution_start_before(html: &str, block_start: usize) -> Option<usize> {
+    let prefix = &html[..block_start];
+    let lower = prefix.to_ascii_lowercase();
+    let wrote = lower.rfind(" wrote:")?;
+    if block_start.saturating_sub(wrote) > 500 {
+        return None;
+    }
+    let on = lower[..wrote].rfind("on ")?;
+    if wrote.saturating_sub(on) > 300 {
+        return None;
+    }
+    Some(html_block_start_before(html, on))
+}
+
+fn html_block_start_before(html: &str, text_pos: usize) -> usize {
+    let before = &html[..text_pos];
+    ["<blockquote", "<div", "<p"]
+        .iter()
+        .filter_map(|needle| find_ascii_case_insensitive_reverse(before, needle))
+        .max()
+        .unwrap_or(text_pos)
+}
+
+fn matching_blockquote_end(html: &str, start: usize) -> Option<usize> {
+    let lower = html.to_ascii_lowercase();
+    let mut pos = start;
+    let mut depth = 0usize;
+    loop {
+        let next_open = lower[pos..].find("<blockquote").map(|p| pos + p);
+        let next_close = lower[pos..].find("</blockquote>").map(|p| pos + p);
+        match (next_open, next_close) {
+            (Some(open), Some(close)) if open < close => {
+                depth += 1;
+                pos = open + "<blockquote".len();
+            }
+            (Some(open), None) => {
+                depth += 1;
+                pos = open + "<blockquote".len();
+            }
+            (_, Some(close)) => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                let end = close + "</blockquote>".len();
+                if depth == 0 {
+                    return Some(end);
+                }
+                pos = end;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+fn find_ascii_case_insensitive_reverse(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .rfind(&needle.to_ascii_lowercase())
+}
+
+fn is_img_tag_start(html: &str, start: usize) -> bool {
+    let bytes = html.as_bytes();
+    let after = start + "<img".len();
+    after >= bytes.len()
+        || matches!(
+            bytes[after],
+            b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n' | 0x0c
+        )
+}
+
+fn find_html_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut j = start + 1;
+    let mut quote = None;
+    while j < bytes.len() {
+        match quote {
+            Some(q) => {
+                if bytes[j] == q {
+                    quote = None;
+                }
+            }
+            None => match bytes[j] {
+                b'"' | b'\'' => quote = Some(bytes[j]),
+                b'>' => return Some(j),
+                _ => {}
+            },
+        }
+        j += 1;
+    }
+    None
+}
+
+fn is_attr_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':')
+}
+
 /// Inputs for [`folder_tabs`]: which folder/label is active, the current search text + scope, the
 /// mailbox's labels, and whether the folder is showing the threaded (conversation) view.
 struct FolderTabs<'a> {
@@ -1984,18 +2355,7 @@ async fn read_message(
     // Mint/reuse a CSRF token for the read-view action buttons (star/archive/delete/move/unread).
     let (token, set_cookie) = ensure_csrf(&headers);
 
-    let body = if !msg.body_html.is_empty() {
-        // Already sanitised at store time; re-sanitise defensively on render.
-        format!(
-            r#"<div class="msg-body">{}</div>"#,
-            crate::sanitize::sanitize_html(&msg.body_html)
-        )
-    } else {
-        format!(
-            r#"<div class="msg-body"><pre>{}</pre></div>"#,
-            esc(&msg.body_text)
-        )
-    };
+    let body = render_message_body(&msg);
 
     // Enumerate the stored raw source's MIME parts and offer a download link per attachment.
     let attachments = render_attachment_list(&msg);
@@ -2198,17 +2558,7 @@ async fn conversation(
     let mut blocks = String::new();
     for m in &msgs {
         let _ = state.store.mark_seen(&m.id).await;
-        let body = if !m.body_html.is_empty() {
-            format!(
-                r#"<div class="msg-body">{}</div>"#,
-                crate::sanitize::sanitize_html(&m.body_html)
-            )
-        } else {
-            format!(
-                r#"<div class="msg-body"><pre>{}</pre></div>"#,
-                esc(&m.body_text)
-            )
-        };
+        let body = render_message_body(m);
         let attachments = render_attachment_list(m);
         blocks.push_str(&format!(
             r#"<section class="card pad convo-msg" data-convo-item>
@@ -3127,12 +3477,14 @@ async fn download_attachment(
     if msg.mailbox != mb.addr {
         return (StatusCode::NOT_FOUND, "no such message").into_response();
     }
-    let Some(att) = crate::rfc822::extract_attachment(&msg.raw_rfc822, idx) else {
+    let Some((att, inline)) = crate::rfc822::extract_attachment_with_inline(&msg.raw_rfc822, idx)
+    else {
         return (StatusCode::NOT_FOUND, "no such attachment").into_response();
     };
     // `filename` + `content_type` are already sanitised by rfc822 (no CRLF/quotes), so they are
     // safe to echo into response headers.
-    let disposition = format!("attachment; filename=\"{}\"", att.filename);
+    let disposition_kind = if inline { "inline" } else { "attachment" };
+    let disposition = format!("{disposition_kind}; filename=\"{}\"", att.filename);
     (
         [
             (header::CONTENT_TYPE, att.content_type),

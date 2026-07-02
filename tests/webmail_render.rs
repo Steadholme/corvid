@@ -2,11 +2,11 @@
 //! against the in-memory store (no sockets, no database).
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 
-use corvid::model::{parse_search_query, Label, Message};
-use corvid::{app, build_dev_state, new_id, now_secs, AppState};
+use corvid::model::{Label, Message, parse_search_query};
+use corvid::{AppState, app, build_dev_state, new_id, now_secs};
 
 fn seed_message(mailbox: &str, subject: &str, from: &str, body: &str) -> Message {
     Message {
@@ -93,6 +93,110 @@ async fn html_body_is_sanitised_on_render() {
     let html = body_string(resp).await;
     assert!(html.contains("<p>safe</p>"));
     assert!(!html.contains("<script>"));
+}
+
+#[tokio::test]
+async fn read_view_rewrites_inline_cid_images_and_hides_inline_attachment() {
+    let state = build_dev_state().await;
+    let raw = "From: Alice <alice@example.com>\r\nTo: w33d@w33d.xyz\r\nSubject: Inline\r\n\
+               MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
+               --R\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+               <p>Hello <img src=\"cid:Logo%40Example\" alt=\"logo\"></p>\r\n\
+               --R\r\nContent-Type: image/png; name=\"logo.png\"\r\n\
+               Content-Disposition: inline; filename=\"logo.png\"\r\n\
+               Content-ID: <logo@example>\r\nContent-Transfer-Encoding: base64\r\n\r\naW1n\r\n--R--\r\n";
+    let parsed = corvid::rfc822::parse(raw);
+    let mut msg = seed_message("w33d@w33d.xyz", "Inline", "Alice <alice@example.com>", "");
+    msg.raw_rfc822 = raw.to_string();
+    msg.body_text = parsed.body_text;
+    msg.body_html = parsed.body_html;
+    state.store.store_message(&msg).await.unwrap();
+
+    let req = Request::builder()
+        .uri(format!("/m/{}", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains(&format!(r#"<img src="/m/{}/attachments/0""#, msg.id)));
+    assert!(!html.contains("cid:Logo"));
+    assert!(
+        !html.contains(r#"<div class="attachments">"#),
+        "inline cid image is not repeated in the attachment strip"
+    );
+
+    let req = Request::builder()
+        .uri(format!("/m/{}/attachments/0", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let disp = resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(disp.contains(r#"inline; filename="logo.png""#));
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"img");
+}
+
+#[tokio::test]
+async fn read_view_folds_plain_text_quotes() {
+    let state = build_dev_state().await;
+    let msg = seed_message(
+        "w33d@w33d.xyz",
+        "Quoted",
+        "Alice <alice@example.com>",
+        "Fresh reply\n\nOn July 1, 2026, Alice <alice@example.com> wrote:\n> old line",
+    );
+    state.store.store_message(&msg).await.unwrap();
+
+    let req = Request::builder()
+        .uri(format!("/m/{}", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("Fresh reply"));
+    assert!(html.contains(r#"<details class="quote-fold">"#));
+    assert!(html.contains(r#"<summary class="btn-expand-quote">"#));
+    assert!(html.contains("Show quoted text"));
+    assert!(html.contains("Alice &lt;alice@example.com&gt; wrote:"));
+}
+
+#[tokio::test]
+async fn read_view_folds_gmail_quote_html() {
+    let state = build_dev_state().await;
+    let mut msg = seed_message(
+        "w33d@w33d.xyz",
+        "Gmail quote",
+        "Alice <alice@example.com>",
+        "",
+    );
+    msg.body_html =
+        r#"<p>Fresh reply</p><div class="gmail_quote"><p>old html</p></div>"#.to_string();
+    state.store.store_message(&msg).await.unwrap();
+
+    let req = Request::builder()
+        .uri(format!("/m/{}", msg.id))
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("<p>Fresh reply</p>"));
+    assert!(html.contains(r#"<details class="quote-fold">"#));
+    assert!(html.contains("old html"));
+    assert!(!html.contains("gmail_quote"));
 }
 
 #[tokio::test]
@@ -539,12 +643,14 @@ async fn store_mark_unseen_and_set_folder_roundtrip() {
         "Archive"
     );
     // list_folder now filters it out of INBOX and into the new folder.
-    assert!(state
-        .store
-        .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .store
+            .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         state
             .store
@@ -661,12 +767,14 @@ async fn admin_create_mailbox_requires_admin_and_csrf() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert!(state
-        .store
-        .get_mailbox("bob@w33d.xyz")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        state
+            .store
+            .get_mailbox("bob@w33d.xyz")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // Admin POST with a bad CSRF token is rejected (403) and creates nothing.
     let req = Request::builder()
@@ -680,12 +788,14 @@ async fn admin_create_mailbox_requires_admin_and_csrf() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    assert!(state
-        .store
-        .get_mailbox("bob@w33d.xyz")
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        state
+            .store
+            .get_mailbox("bob@w33d.xyz")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -955,12 +1065,14 @@ async fn store_starred_and_search_roundtrip() {
     assert_eq!(starred[0].id, m1.id);
     assert!(starred[0].starred);
     state.store.set_starred(&m1.id, false).await.unwrap();
-    assert!(state
-        .store
-        .list_starred("w33d@w33d.xyz", None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .store
+            .list_starred("w33d@w33d.xyz", None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // Search over subject / body / from, case-insensitive.
     let q_quarterly = parse_search_query("quarterly");
@@ -994,12 +1106,14 @@ async fn store_starred_and_search_roundtrip() {
             .len(),
         1
     );
-    assert!(state
-        .store
-        .search_messages("w33d@w33d.xyz", &q_nomatch, None, None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .store
+            .search_messages("w33d@w33d.xyz", &q_nomatch, None, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1135,12 +1249,14 @@ async fn search_matches_recipient_and_scopes_to_folder() {
         .unwrap();
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].id, sent.id);
-    assert!(state
-        .store
-        .search_messages("w33d@w33d.xyz", &q_hello, Some("Trash"), None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .store
+            .search_messages("w33d@w33d.xyz", &q_hello, Some("Trash"), None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1204,12 +1320,14 @@ async fn structured_search_operators_filter_in_memory_store() {
     assert!(ids.contains(&lunch.id.as_str()));
 
     let q_exclude = parse_search_query("Finance -from:alice");
-    assert!(state
-        .store
-        .search_messages("w33d@w33d.xyz", &q_exclude, None, None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        state
+            .store
+            .search_messages("w33d@w33d.xyz", &q_exclude, None, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let q_phrase = parse_search_query(r#""Quarterly Finance""#);
     let hits = state
