@@ -274,33 +274,108 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .pad { padding:22px; }
 .card.pad h2 { font-size:15px; margin:0 0 14px; }
 
-/* ---- Folder switcher + search ------------------------------------------- */
-.folder-tabs { display:flex; gap:8px; margin:0 0 18px; flex-wrap:wrap; align-items:center; }
-.folder-tabs .search-box { margin-left:auto; display:inline-flex; gap:8px; align-items:center; }
-.folder-tabs .search-box input[type=search] {
-  min-width:210px; width:auto; height:36px; padding:0 14px; font-size:13px; color:var(--ink);
+/* ---- Mail shell: full-width wrap + persistent folder sidebar ------------ */
+/* .wrap--mail widens the mail surfaces only; settings/docs keep plain .wrap. */
+.wrap--mail { max-width:none; padding:16px 20px 40px; }
+.mail-shell { display:grid; grid-template-columns:232px minmax(0,1fr); gap:20px; align-items:start; }
+.mail-main { min-width:0; }
+.mail-side { position:sticky; top:72px; max-height:calc(100vh - 88px); overflow:auto; padding-right:4px; }
+.mail-side__compose { width:100%; height:40px; margin:0 0 14px; display:inline-flex; align-items:center; justify-content:center; gap:8px; }
+.mail-side__list { list-style:none; margin:0 0 4px; padding:0; }
+.mail-side__item {
+  display:flex; align-items:center; gap:10px; height:32px; padding:0 10px 0 12px;
+  border-radius:var(--r-pill); color:var(--ink-2); font-size:13.5px; font-weight:550;
+}
+.mail-side__item:hover { background:var(--surface-3); text-decoration:none; }
+.mail-side__item.is-active { background:var(--accent-soft); color:var(--accent-ink); font-weight:650; }
+.mail-side__item svg { width:16px; height:16px; flex:none; }
+.mail-side__name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mail-side__count { margin-left:auto; font-size:11.5px; font-variant-numeric:tabular-nums; color:var(--ink-3); }
+.mail-side__count--unread { color:var(--accent-ink); font-weight:650; }
+.mail-side__sep { border-top:1px solid var(--hairline); margin:8px 10px; }
+.mail-side__heading {
+  font-size:11px; font-weight:650; letter-spacing:.05em; text-transform:uppercase;
+  color:var(--ink-3); padding:8px 12px 4px; cursor:pointer; list-style:none;
+}
+.mail-side__heading::-webkit-details-marker { display:none; }
+.mail-side__heading::after {
+  content:""; display:inline-block; margin-left:7px; vertical-align:1px;
+  border-left:4px solid transparent; border-right:4px solid transparent; border-top:5px solid currentColor;
+  transition:transform var(--dur) var(--ease);
+}
+.mail-side__labels[open] .mail-side__heading::after { transform:rotate(180deg); }
+/* SSR emits only the --default colour modifier today; it rides --accent. */
+.mail-side__dot { width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none; margin:0 4px 0 2px; }
+.mail-side__dot--default { background:var(--accent); }
+/* SSR marks unread rows with an inline "unread" span for AT; keep it off-screen. */
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+/* breadcrumb reads as a quiet button inside the mail shell */
+.wrap--mail .crumbs a { display:inline-flex; align-items:center; height:32px; padding:0 10px; border-radius:var(--r-sm); }
+.wrap--mail .crumbs a:hover { background:var(--surface-3); color:var(--accent-ink); text-decoration:none; }
+
+/* ---- List toolbar: scoped search + operator-hint popover ---------------- */
+.list-toolbar { display:flex; align-items:center; gap:8px; margin:0 0 14px; }
+.list-toolbar__spacer { flex:1; }
+.list-toolbar .search-box { display:inline-flex; gap:8px; align-items:center; position:relative; flex:0 1 460px; }
+.list-toolbar .search-box input[type=search] {
+  flex:1; min-width:160px; width:auto; height:36px; padding:0 14px; font-size:13px; color:var(--ink);
   background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-pill);
   transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-.folder-tabs .search-box input[type=search]:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none; }
+.list-toolbar .search-box input[type=search]:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none; }
+/* Operator cheat-sheet: hidden at rest, opens as a popover while the field
+   has focus. :hover doubles as the Safari fallback — clicking the Advanced
+   link blurs the input before mouseup there, so focus-within alone would
+   close the layer under the pointer. */
+.search-hint {
+  display:none; position:absolute; top:calc(100% + 6px); left:0; z-index:25;
+  width:min(520px,90vw); padding:10px 12px;
+  font:11.5px/1.85 var(--mono); color:var(--ink-2); word-spacing:3px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm);
+  box-shadow:var(--sh-pop);
+}
+.list-toolbar .search-box:focus-within .search-hint,
+.list-toolbar .search-box:hover .search-hint { display:block; }
+.search-hint .adv-search-link { display:inline-block; margin-top:4px; font-family:var(--font); }
+
+/* shell responsive: narrower rail first, then the sidebar folds to pills */
+@media (max-width:1100px) {
+  .mail-shell { grid-template-columns:200px minmax(0,1fr); }
+  .mail-side__item { font-size:13px; }
+}
+@media (max-width:960px) {
+  .mail-shell { display:block; }
+  .mail-side { position:static; max-height:none; margin-bottom:14px; }
+  .mail-side__list { display:flex; flex-wrap:wrap; gap:4px; }
+  .mail-side__sep { display:none; }
+  .mail-side__compose { width:auto; }
+}
 
 /* ---- Inbox mail list ---------------------------------------------------- */
 .maillist { list-style:none; margin:0; padding:8px; }
 .maillist > li + li { border-top:1px solid var(--hairline); }
-.mailrow-wrap { display:flex; align-items:center; gap:6px; }
+.mailrow-wrap { display:flex; align-items:center; gap:6px; position:relative; }
 .mailrow-wrap .mailrow { flex:1; min-width:0; }
 .mailrow {
-  display:flex; align-items:center; gap:14px; padding:9px 14px; border-radius:var(--r-sm);
+  display:flex; align-items:center; gap:12px; padding:8px 12px; border-radius:var(--r-sm);
   color:var(--ink-2); transition:background var(--dur) var(--ease);
 }
 .mailrow:hover { background:var(--surface-2); text-decoration:none; }
 .mailrow .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none; }
 .mailrow .dot.seen { background:transparent; border:1px solid var(--border-2); }
-.mailrow .from { width:200px; flex:none; font-weight:600; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.mailrow .subject { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); }
-.mailrow.unseen .subject { font-weight:650; color:var(--ink); }
-.mailrow .subject.muted { color:var(--ink-3); font-weight:500; }
-.mailrow .date { flex:none; color:var(--ink-3); font-size:12.5px; font-variant-numeric:tabular-nums; }
+.star-slot { flex:none; width:18px; text-align:center; color:var(--warn); font-size:13px; }
+.mailrow .from { width:200px; flex:none; font-weight:500; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+/* subject line = subject text (shrinks) + snippet (takes the leftovers) */
+.mailrow .subject { flex:1; min-width:0; display:flex; gap:6px; overflow:hidden; }
+.subj-text { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); }
+.snip { flex:1 1 0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-3); font-weight:400; }
+.snip::before { content:"— "; }
+/* unread weight lives on sender + subject text; the snippet never bolds */
+.mailrow.unseen .from, .mailrow.unseen .subj-text { font-weight:650; color:var(--ink); }
+.att { flex:none; color:var(--ink-3); display:inline-flex; }
+.att svg { width:14px; height:14px; }
+.mailrow .date { flex:none; width:76px; text-align:right; color:var(--ink-3); font-size:12.5px; font-variant-numeric:tabular-nums; }
+.count-slot { flex:none; }
 .star.on { color:var(--warn); }
 
 /* per-message actions (inbox rows + read view) */
@@ -311,8 +386,30 @@ table.data td .strong { color:var(--ink); font-weight:600; }
   transition:border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
 .row-actions .move-select:focus { border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none; }
-.maillist .row-actions { opacity:0; transition:opacity var(--dur) var(--ease); }
-.mailrow-wrap:hover .row-actions, .mailrow-wrap:focus-within .row-actions { opacity:1; }
+/* List rows: actions float over the date zone on hover/focus. The date hides
+   via visibility (zero reflow); the gradient end shares the row-hover token so
+   dark mode adapts for free. Scheduled rows keep their inline strip. */
+.maillist .row-actions:not(.scheduled-actions) {
+  position:absolute; right:6px; top:50%; transform:translateY(-50%);
+  opacity:0; pointer-events:none; flex-wrap:nowrap; padding:2px 4px 2px 36px;
+  background:linear-gradient(90deg,transparent,var(--surface-2) 32px);
+  border-radius:var(--r-sm); transition:opacity var(--dur) var(--ease);
+}
+.maillist .scheduled-actions { opacity:0; transition:opacity var(--dur) var(--ease); }
+.mailrow-wrap:hover .row-actions, .mailrow-wrap:focus-within .row-actions { opacity:1; pointer-events:auto; }
+.mailrow-wrap:hover .mailrow .date, .mailrow-wrap:focus-within .mailrow .date { visibility:hidden; }
+.mailrow-wrap.is-scheduled:hover .mailrow .date,
+.mailrow-wrap.is-scheduled:focus-within .mailrow .date { visibility:visible; }
+/* Slim the in-list strip to the six core actions (star/read/archive/delete
+   pairs). Snooze/spam/move/mute stay full-strength in the read view and the
+   bulkbar; hidden csrf/return inputs are display:none either way. */
+.maillist .row-actions:not(.scheduled-actions) > * { display:none; }
+.maillist .row-actions:not(.scheduled-actions) > button[value="star"],
+.maillist .row-actions:not(.scheduled-actions) > button[value="unstar"],
+.maillist .row-actions:not(.scheduled-actions) > button[value="read"],
+.maillist .row-actions:not(.scheduled-actions) > button[value="unread"],
+.maillist .row-actions:not(.scheduled-actions) > button[value="archive"],
+.maillist .row-actions:not(.scheduled-actions) > button[value="delete"] { display:inline-flex; }
 .msg-actions { margin-top:14px; }
 .msg-actions + .row-actions { margin-top:10px; }
 
@@ -321,6 +418,37 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 .msg-subject { font-size:20px; font-weight:650; margin:0 0 14px; letter-spacing:-.02em; }
 .msg-meta { font-size:13px; color:var(--ink-2); display:grid; grid-template-columns:auto 1fr; gap:5px 14px; }
 .msg-meta b { color:var(--ink-3); font-weight:650; font-size:11px; letter-spacing:.05em; text-transform:uppercase; align-self:center; }
+
+/* sender block (read-view header): avatar + name/address + right-pinned date */
+.msg-from { display:flex; gap:12px; align-items:flex-start; margin:2px 0 12px; }
+.msg-avatar {
+  width:36px; height:36px; border-radius:50%; display:grid; place-items:center;
+  font-size:15px; font-weight:650; flex:none; background:var(--accent-soft); color:var(--accent-ink);
+}
+/* hue classes from avatar_hue() (addr checksum % 6) — all soft-token pairs */
+.avatar--h0 { background:var(--accent-soft); color:var(--accent-ink); }
+.avatar--h1 { background:var(--ok-soft); color:var(--ok-ink); }
+.avatar--h2 { background:var(--warn-soft); color:var(--warn-ink); }
+.avatar--h3 { background:var(--info-soft); color:var(--info-ink); }
+.avatar--h4 { background:var(--down-soft); color:var(--down-ink); }
+.avatar--h5 { background:var(--surface-3); color:var(--ink-2); }
+/* min-width:0 + single-line ellipsis keep long display names from squeezing
+   the nowrap date out of the 375px viewport */
+.msg-from__who { flex:1; min-width:0; }
+.msg-from__line { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.msg-from__name { font-weight:650; color:var(--ink); font-size:14px; }
+.msg-from__addr { color:var(--ink-3); font-size:12.5px; }
+.msg-from__date { margin-left:auto; color:var(--ink-3); font-size:12.5px; white-space:nowrap; flex:none; }
+.msg-recips__summary { cursor:pointer; color:var(--ink-3); font-size:12.5px; list-style:none; }
+.msg-recips__summary::-webkit-details-marker { display:none; }
+.msg-recips__summary::after {
+  content:""; display:inline-block; margin-left:6px; vertical-align:1px;
+  border-left:4px solid transparent; border-right:4px solid transparent; border-top:5px solid currentColor;
+  transition:transform var(--dur) var(--ease);
+}
+.msg-recips[open] .msg-recips__summary::after { transform:rotate(180deg); }
+.msg-recips[open] .msg-meta { margin-top:8px; }
+
 .msg-body { margin-top:18px; padding-top:18px; border-top:1px solid var(--hairline); color:var(--ink); word-wrap:break-word; overflow-wrap:anywhere; line-height:1.6; }
 .msg-body pre { white-space:pre-wrap; font:13px/1.6 var(--mono); margin:0; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--r-sm); padding:14px 16px; color:var(--ink-2); }
 .msg-body img { max-width:100%; }
@@ -328,9 +456,23 @@ table.data td .strong { color:var(--ink); font-weight:600; }
 /* attachments strip */
 .attachments { margin-top:18px; padding-top:16px; border-top:1px solid var(--hairline); }
 .attach-head { display:block; color:var(--ink-3); font-weight:650; font-size:11px; letter-spacing:.05em; text-transform:uppercase; margin:0 0 10px; }
-.attach-list { list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-.attach-list > li { display:inline-flex; align-items:center; gap:6px; }
-.attach-size { font-size:12px; font-variant-numeric:tabular-nums; }
+.attach-list { list-style:none; margin:0; padding:0; display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:8px; }
+.attach-list > li {
+  display:flex; align-items:center; gap:10px; min-width:0; padding:8px 10px;
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--r-sm);
+  transition:box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.attach-list > li:hover { box-shadow:var(--sh-sm); border-color:var(--border-2); }
+/* leading paperclip glyph — token-tinted mask (same idiom as the muted-row
+   bell). Spec called for --accent-soft here, but that wash is ~1.1:1 against
+   the card surface, so the glyph rides --accent-ink instead (dark-safe). */
+.attach-list > li::before {
+  content:""; flex:none; width:28px; height:28px; background:var(--accent-ink);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48'/></svg>") center/16px no-repeat;
+  mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48'/></svg>") center/16px no-repeat;
+}
+.attach-list > li .btn { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; justify-content:flex-start; }
+.attach-size { font-size:12px; font-variant-numeric:tabular-nums; flex:none; }
 
 /* ---- Forms (compose/admin use bare <input>/<textarea>/<select>/<label>) - */
 .field { margin-bottom:16px; }
@@ -360,14 +502,23 @@ input::placeholder, textarea::placeholder { color:var(--ink-4); }
 @media (max-width:720px) {
   .wrap { padding:20px 14px 48px; }
   .site-foot { padding:18px 14px 0; }
-  .folder-tabs .search-box { margin-left:0; width:100%; }
-  .folder-tabs .search-box input[type=search] { flex:1; min-width:0; }
+  .list-toolbar { flex-wrap:wrap; }
+  .list-toolbar .search-box { flex:1 1 100%; }
   .mailrow-wrap { flex-wrap:wrap; }
   .mailrow { flex-wrap:wrap; row-gap:4px; }
   .mailrow .from { width:auto; max-width:60%; }
-  .mailrow .date { margin-left:auto; }
-  .mailrow .subject { flex:1 1 100%; order:3; padding-left:22px; }
-  .maillist .row-actions { opacity:1; padding:0 14px 10px; }
+  .mailrow .date { margin-left:auto; width:auto; }
+  .mailrow .subject { flex:1 1 100%; order:3; padding-left:22px; flex-wrap:wrap; }
+  /* hover overlay reverts to the inline strip; the date stays visible.
+     :not() kept so this outweighs the desktop overlay rule's specificity */
+  .maillist .row-actions:not(.scheduled-actions) {
+    position:static; transform:none; opacity:1; pointer-events:auto;
+    background:none; padding:0 14px 10px;
+  }
+  .maillist .scheduled-actions { opacity:1; padding:0 14px 10px; }
+  .mailrow-wrap:hover .mailrow .date,
+  .mailrow-wrap:focus-within .mailrow .date { visibility:visible; }
+  .attach-list { grid-template-columns:1fr; }
   .msg-meta { grid-template-columns:1fr; gap:2px; }
   .msg-meta b { margin-top:6px; }
 }
@@ -375,8 +526,15 @@ input::placeholder, textarea::placeholder { color:var(--ink-4); }
 /* ---- Conversation threading -------------------------------------------- */
 /* Reuses .pill; a compact count badge on collapsed conversation rows + the convo header. */
 .thread-count { background:var(--accent-soft); color:var(--accent-ink); margin-right:2px; }
-.convo-msg { margin-bottom:14px; }
+.convo-msg { margin-bottom:12px; }
 .convo-msg + .convo-msg { margin-top:0; }
+/* collapsed conversation card: one compact sender line, small avatar; the
+   body/attachments hiding lives in the enhancement layer's is-collapsed rule */
+.convo-msg.is-collapsed { padding:10px 16px; }
+.convo-msg.is-collapsed .msg-from { margin:0; align-items:center; }
+.convo-msg.is-collapsed .msg-avatar { width:24px; height:24px; font-size:11px; }
+.convo-msg.is-collapsed .msg-recips,
+.convo-msg.is-collapsed .msg-subject { display:none; }
 
 /* ---- Labels ------------------------------------------------------------- */
 /* Label pills in the tab strip + on messages; reuses .pill sizing. */
@@ -416,7 +574,7 @@ a.label-pill:hover { color:var(--accent-ink); }
 /* ---- Row selection checkbox -------------------------------------------- */
 .mailcheck { flex:none; display:inline-flex; align-items:center; padding-left:6px; }
 .mailcheck .rowcheck { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
-.maillist .mailcheck { opacity:0; transition:opacity var(--dur) var(--ease); }
+.maillist .mailcheck { opacity:.45; transition:opacity var(--dur) var(--ease); }
 .mailrow-wrap:hover .mailcheck,
 .mailrow-wrap:focus-within .mailcheck,
 .mailrow-wrap.is-selected .mailcheck { opacity:1; }
@@ -494,17 +652,6 @@ mark.search-hit {
   background:var(--accent-soft-2); color:inherit;
   border-radius:var(--r-xs); padding:0 2px;
   -webkit-box-decoration-break:clone; box-decoration-break:clone;
-}
-
-/* Operator cheat-sheet under the search field. Drops onto its own full-width
-   row beneath the input/button and reads as a restrained code hint. */
-.folder-tabs .search-box { flex-wrap:wrap; }
-.folder-tabs .search-hint {
-  flex-basis:100%; max-width:320px; margin-top:8px;
-  padding:7px 11px; word-spacing:3px;
-  font:11.5px/1.85 var(--mono); color:var(--ink-2);
-  background:var(--surface-2); border:1px solid var(--border);
-  border-radius:var(--r-sm);
 }
 
 /* ---- Rich compose editor -------------------------------------------------
@@ -610,16 +757,8 @@ mark.search-hit {
    prefers-reduced-motion rule above; colour adapts via tokens.
    ============================================================ */
 
-/* Spam folder pill in the tab strip. It is already a .btn pill so
-   it stays unified with the other folders; a restrained --warn dot
-   marks it as the junk folder. Scoped to .folder-tabs so the same
-   .folder-spam hook on spam mail rows (.mailrow-wrap) is untouched. */
-.folder-tabs .folder-spam::before {
-  content:""; flex:none; width:6px; height:6px;
-  border-radius:50%; background:var(--warn);
-}
-/* On the active (indigo) pill the dot flips to white so it stays visible. */
-.folder-tabs .btn-primary.folder-spam::before { background:#fff; opacity:.85; }
+/* (The old folder pill strip is gone — folder navigation lives in the
+   persistent .mail-side sidebar now.) */
 
 /* Report spam — weak warning: keeps the ghost body, tints only the
    label (--warn-ink, 5.0:1 on --surface) and reveals a --warn border
@@ -669,17 +808,6 @@ mark.search-hit {
    prefers-reduced-motion rule above); colour is token-driven so it
    tracks any theme the same way the spam zone does. */
 
-/* Snoozed folder pill in the tab strip. Already a .btn pill, so it
-   stays unified with the other folders; an --info dot (the "time"
-   status hue, distinct from spam's --warn) gives the clock cue.
-   Scoped to .folder-tabs so any .folder-snoozed row hook is untouched. */
-.folder-tabs .folder-snoozed::before {
-  content:""; flex:none; width:6px; height:6px;
-  border-radius:50%; background:var(--info);
-}
-/* On the active (indigo) pill the dot flips to white so it stays visible. */
-.folder-tabs .btn-primary.folder-snoozed::before { background:#fff; opacity:.85; }
-
 /* Snooze time picker + custom epoch. The generic `select`/`input`
    rules would stretch these to width:100% and blow out the action
    row; compact them to the sibling .move-select footprint instead.
@@ -723,7 +851,7 @@ mark.search-hit {
    The glyph is a token-tinted inline SVG mask, so it adapts with theme
    and degrades to nothing under reduced-motion (it has no motion). */
 .mailrow-wrap.is-muted .mailrow .from,
-.mailrow-wrap.is-muted .mailrow .subject { color:var(--ink-3); font-weight:500; }
+.mailrow-wrap.is-muted .mailrow .subj-text { color:var(--ink-3); font-weight:500; }
 .mailrow-wrap.is-muted .mailrow .subject::before,
 .mailrow-wrap.is-snoozed .mailrow .subject::before {
   content:""; display:inline-block; flex:none; width:12px; height:12px;
@@ -809,17 +937,6 @@ mark.search-hit {
 .schedule-menu:focus, .schedule-custom:focus {
   border-color:var(--accent); box-shadow:0 0 0 4px var(--ring); outline:none;
 }
-
-/* Scheduled folder pill in the tab strip. Already a .btn pill so it
-   stays unified with the other folders; an --accent dot marks it as
-   the outbound queue (distinct from snooze's --info dot). Scoped to
-   .folder-tabs so the .folder-scheduled hook on scheduled rows is
-   untouched. */
-.folder-tabs .folder-scheduled::before {
-  content:""; flex:none; width:6px; height:6px; border-radius:50%; background:var(--accent);
-}
-/* On the active (indigo) pill the dot flips to white so it stays visible. */
-.folder-tabs .btn-primary.folder-scheduled::before { background:#fff; opacity:.85; }
 
 /* Scheduled row — same faint-icon idiom as the snoozed/muted rows, a
    small calendar glyph in --accent leading the subject (calendar =
@@ -1470,6 +1587,40 @@ mark.search-hit {
 .contact-import .field { margin-bottom:12px; }
 .contact-import textarea { min-height:96px; font:12.5px/1.55 var(--mono); }
 
+/* ============================================================
+   Compose card — underlined header rows (Gmail-style)
+   Scoped entirely to .compose-card so settings/admin/advanced-search
+   forms keep the boxed inputs from the global rules. SSR ships no
+   field--block hook, so the attachments row is excluded via
+   :not(:has(input[type=file])); on engines without :has() the grid
+   rules drop and compose gracefully keeps the boxed fallback.
+   .compose-field (Message) keeps its own block layout — only its
+   editing surface goes borderless below. Tokens only.
+   ============================================================ */
+.compose-card { max-width:860px; margin:0 auto; }
+.compose-card .field:not(.compose-field):not(:has(input[type=file])) {
+  display:grid; grid-template-columns:64px 1fr; align-items:center; gap:10px;
+  margin:0; border-bottom:1px solid var(--hairline); padding:2px 0;
+}
+.compose-card .field:not(.compose-field):not(:has(input[type=file])) > label {
+  margin:0; font-size:12px; color:var(--ink-3); font-weight:600;
+}
+/* header inputs shed the box; focus feedback moves to the row underline */
+.compose-card .field:not(.compose-field) input[type=text],
+.compose-card .field:not(.compose-field) input:not([type]),
+.compose-card .field:not(.compose-field) select {
+  border:0; border-radius:0; box-shadow:none; padding:10px 2px; background:transparent;
+}
+.compose-card .field:not(.compose-field) input[type=text]:focus,
+.compose-card .field:not(.compose-field) input:not([type]):focus,
+.compose-card .field:not(.compose-field) select:focus { box-shadow:none; outline:none; }
+.compose-card .field:focus-within { border-bottom-color:var(--accent); }
+.compose-card #subject { font-size:15px; font-weight:600; }
+.compose-card textarea#body,
+.compose-card .compose-rich { border:0; box-shadow:none; min-height:320px; padding:14px 2px; }
+.compose-card textarea#body:focus,
+.compose-card .compose-rich:focus { border:0; box-shadow:none; }
+
 /* ============================================================================
    DISPLAY DENSITY · READING PANE · DARK MODE  (pure CSS visual layer)
    Server (webmail.rs → shell.html) emits three hooks on the root <html>:
@@ -1491,18 +1642,20 @@ mark.search-hit {
    Scoped to the root [data-density] hook so the split reading-pane list is
    tightened too. `normal` is deliberately absent → inherits the base .mailrow. */
 
-/* compact — denser scan, more rows per screen */
+/* compact — denser scan, more rows per screen; the snippet drops so every
+   row is a pure single scan line (~32px) */
 [data-density="compact"] .maillist        { padding:5px; }
 [data-density="compact"] .mailrow-wrap     { gap:4px; }
-[data-density="compact"] .mailrow          { padding:5px 12px; gap:10px; font-size:13px; }
+[data-density="compact"] .mailrow          { padding:4px 10px; gap:10px; font-size:13px; }
 [data-density="compact"] .mailrow .from    { width:172px; }
 [data-density="compact"] .mailrow .subject { font-size:13px; }
+[data-density="compact"] .mailrow .snip    { display:none; }
 [data-density="compact"] .mailrow .date    { font-size:11.5px; }
 
 /* comfortable — airier, calmer rhythm */
 [data-density="comfortable"] .maillist     { padding:12px; }
 [data-density="comfortable"] .mailrow-wrap { gap:8px; }
-[data-density="comfortable"] .mailrow      { padding:13px 16px; gap:16px; }
+[data-density="comfortable"] .mailrow      { padding:12px 14px; gap:16px; }
 [data-density="comfortable"] .mailrow .from{ width:220px; }
 
 /* ---- 2. Reading pane -----------------------------------------------------
@@ -1518,7 +1671,7 @@ mark.search-hit {
    (sticky, own scroll) while the reader below it changes. */
 .mailbox-layout--right {
   display:grid;
-  grid-template-columns:minmax(300px,360px) minmax(0,1fr);
+  grid-template-columns:minmax(320px,30%) minmax(0,1fr);
   gap:16px; align-items:start;
 }
 .mailbox-layout--right > .mail-list-pane {
@@ -1527,11 +1680,15 @@ mark.search-hit {
   max-height:calc(100vh - 96px); overflow:auto;
 }
 .mailbox-layout--right > .read-pane { grid-column:2; }
-/* narrow rows reflow: sender + date on line 1, subject wraps to line 2 */
-.mailbox-layout--right .mailrow          { flex-wrap:wrap; row-gap:3px; }
-.mailbox-layout--right .mailrow .from    { width:auto; flex:1; order:1; }
-.mailbox-layout--right .mailrow .date    { margin-left:auto; order:2; }
-.mailbox-layout--right .mailrow .subject { flex-basis:100%; order:3; }
+/* narrow rows reflow: star + sender + clip + date on line 1, subject/snippet
+   take line 2 (the stretched .from right-aligns the meta cluster) */
+.mailbox-layout--right .mailrow            { flex-wrap:wrap; row-gap:3px; }
+.mailbox-layout--right .mailrow .star-slot { order:1; }
+.mailbox-layout--right .mailrow .from      { width:auto; flex:1; order:1; }
+.mailbox-layout--right .mailrow .att       { order:2; margin-left:auto; }
+.mailbox-layout--right .mailrow .date      { margin-left:0; width:auto; order:2; }
+.mailbox-layout--right .mailrow .subject   { flex-basis:100%; order:3; }
+.mailbox-layout--right .mailrow .snip      { flex:1; }
 
 /* bottom: list on top (capped, own scroll), reading area below it */
 .mailbox-layout--bottom {

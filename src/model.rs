@@ -213,6 +213,8 @@ pub struct MessageSummary {
     pub id: String,
     pub msg_from: String,
     pub subject: String,
+    pub snippet: String,
+    pub has_attachment: bool,
     pub received_at: i64,
     pub seen: bool,
     pub starred: bool,

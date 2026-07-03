@@ -43,6 +43,7 @@ use crate::model::{
     DEFAULT_UNDO_SEND_WINDOW_SECS,
 };
 use crate::sanitize::esc_text;
+use crate::store::FolderCounts;
 use crate::util::{domain_of, email_date, message_id, new_id, now_secs};
 use crate::AppState;
 
@@ -250,14 +251,13 @@ const WEBMAIL_JS: &str = r#"
       if (btn) { btn.value = on ? 'unstar' : 'star'; btn.title = on ? 'Unstar' : 'Star'; btn.textContent = on ? '★' : '☆'; }
       if (row) {
         row.setAttribute('data-starred', on ? 'true' : 'false');
-        var subj = row.querySelector('.mailrow .subject');
-        if (subj) {
-          var st = subj.querySelector('.star');
+        var slot = row.querySelector('.mailrow .star-slot');
+        if (slot) {
+          var st = slot.querySelector('.star');
           if (on && !st) {
             var sp = document.createElement('span'); sp.className = 'star on';
             sp.setAttribute('aria-label', 'starred'); sp.textContent = '★';
-            subj.insertBefore(document.createTextNode(' '), subj.firstChild);
-            subj.insertBefore(sp, subj.firstChild);
+            slot.appendChild(sp);
           } else if (!on && st) { st.remove(); }
         }
       }
@@ -734,6 +734,16 @@ const ICO_CARET: &str = r#"<svg class="usermenu__caret" viewBox="0 0 24 24" fill
 const ICO_USER: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>"#;
 const ICO_LOGOUT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/></svg>"#;
 const ICO_SETTINGS: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const ICO_PENCIL: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>"#;
+const ICO_SEND: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>"#;
+const ICO_DRAFT: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 12h4"/><path d="M10 16h4"/></svg>"#;
+const ICO_ARCHIVE: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="4" rx="1"/><path d="M5 7v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7"/><path d="M10 12h4"/></svg>"#;
+const ICO_SPAM: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/></svg>"#;
+const ICO_TRASH: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6 18 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>"#;
+const ICO_CLOCK: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>"#;
+const ICO_CAL: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v4"/><path d="M16 2v4"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M3 10h18"/></svg>"#;
+const ICO_STAR: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01Z"/></svg>"#;
+const ICO_CLIP: &str = r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 1 1-2.83-2.83l8.49-8.48"/></svg>"#;
 
 /// Build the webmail router.
 pub fn app(state: AppState) -> Router {
@@ -993,6 +1003,11 @@ async fn inbox(
     let cursor = parse_cursor(q.before.as_deref());
     // The mailbox's labels drive both the tab strip and the label-filter view.
     let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let counts = state
+        .store
+        .folder_counts(&mb.addr)
+        .await
+        .unwrap_or_default();
     let settings = settings_for_page(&state, &mb.addr).await;
     let prefs = page_prefs(&settings);
 
@@ -1030,17 +1045,16 @@ async fn inbox(
         }
         let list = render_list_with_optional_read_pane(&rows, prefs);
         let heading = format!(r#"Label: <span class="pill">{}</span>"#, esc(&label.name));
-        let content = format!(
-            r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
-{tabs}
+        let main = format!(
+            r#"<div class="page-head"><h1>{heading}</h1></div>
+{toolbar}
 {list}{bulk}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
-            tabs = folder_tabs(&FolderTabs {
+            toolbar = list_toolbar(&FolderTabs {
                 active: "",
                 search_q: "",
                 scope: None,
-                labels: &labels,
                 active_label: label_id,
                 threads_on: false
             }),
@@ -1048,7 +1062,8 @@ async fn inbox(
             bulk = bulk_toolbar(&token),
             undo_bar = undo_bar,
         );
-        let html = render_page_with_prefs(&label.name, &email, &content, "inbox", prefs);
+        let content = mail_shell(mail_sidebar("", label_id, &labels, &counts), main);
+        let html = render_mail_page(&label.name, &email, &content, prefs);
         return match set_cookie {
             Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
             None => Html(html).into_response(),
@@ -1092,24 +1107,24 @@ async fn inbox(
                 esc(folder)
             };
             let list = render_list_with_optional_read_pane(&rows, prefs);
-            let content = format!(
-                r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
-{tabs}
+            let main = format!(
+                r#"<div class="page-head"><h1>{heading}</h1></div>
+{toolbar}
 {list}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
-                tabs = folder_tabs(&FolderTabs {
+                toolbar = list_toolbar(&FolderTabs {
                     active: folder,
                     search_q: "",
                     scope: real_folder(folder).filter(|f| *f != "INBOX"),
-                    labels: &labels,
                     active_label: "",
                     threads_on: true
                 }),
                 list = list,
                 undo_bar = undo_bar,
             );
-            let html = render_page_with_prefs(folder, &email, &content, "inbox", prefs);
+            let content = mail_shell(mail_sidebar(folder, "", &labels, &counts), main);
+            let html = render_mail_page(folder, &email, &content, prefs);
             return match set_cookie {
                 Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
                 None => Html(html).into_response(),
@@ -1150,24 +1165,24 @@ async fn inbox(
         let base = format!("/?folder=Scheduled&limit={limit}");
         let next_link = next_scheduled_link(&scheduled, limit, &base);
         let list = render_list_with_optional_read_pane(&rows, prefs);
-        let content = format!(
-            r#"<div class="page-head"><h1>Scheduled</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
-{tabs}
+        let main = format!(
+            r#"<div class="page-head"><h1>Scheduled</h1></div>
+{toolbar}
 {list}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
-            tabs = folder_tabs(&FolderTabs {
+            toolbar = list_toolbar(&FolderTabs {
                 active: SCHEDULED_VIEW,
                 search_q: "",
                 scope: None,
-                labels: &labels,
                 active_label: "",
                 threads_on: false,
             }),
             list = list,
             undo_bar = undo_bar,
         );
-        let html = render_page_with_prefs(SCHEDULED_VIEW, &email, &content, "inbox", prefs);
+        let content = mail_shell(mail_sidebar(SCHEDULED_VIEW, "", &labels, &counts), main);
+        let html = render_mail_page(SCHEDULED_VIEW, &email, &content, prefs);
         return match set_cookie {
             Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
             None => Html(html).into_response(),
@@ -1275,18 +1290,17 @@ async fn inbox(
 
     let search_actions = search.map(render_search_actions).unwrap_or_default();
     let list = render_list_with_optional_read_pane(&rows, prefs);
-    let content = format!(
-        r#"<div class="page-head"><h1>{heading}</h1><a class="btn btn-primary btn-sm" href="/compose">Compose</a></div>
-{tabs}
+    let main = format!(
+        r#"<div class="page-head"><h1>{heading}</h1></div>
+{toolbar}
 {search_actions}
 {list}{bulk}{next_link}
 {undo_bar}
 <script src="/assets/webmail.js"></script>"#,
-        tabs = folder_tabs(&FolderTabs {
+        toolbar = list_toolbar(&FolderTabs {
             active: folder,
             search_q: search.unwrap_or(""),
             scope,
-            labels: &labels,
             active_label: "",
             threads_on: false,
         }),
@@ -1295,7 +1309,8 @@ async fn inbox(
         undo_bar = undo_bar,
     );
     let title = if folder.is_empty() { "Search" } else { folder };
-    let html = render_page_with_prefs(title, &email, &content, "inbox", prefs);
+    let content = mail_shell(mail_sidebar(folder, "", &labels, &counts), main);
+    let html = render_mail_page(title, &email, &content, prefs);
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -1570,6 +1585,22 @@ fn render_row_inner(
         .map(|q| highlight_search_hits(&from_display, q))
         .unwrap_or_else(|| esc(&from_display));
     let star = star_mark(m.starred);
+    let unread = if m.seen {
+        String::new()
+    } else {
+        r#"<span class="sr-only">unread</span>"#.to_string()
+    };
+    let snip = clean_snippet(&m.snippet);
+    let snip_html = if snip.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<span class="snip">{}</span>"#, esc(&snip))
+    };
+    let att = if m.has_attachment {
+        format!(r#"<span class="att" aria-label="Has attachment">{ICO_CLIP}</span>"#)
+    } else {
+        String::new()
+    };
     let state_cls = format!(
         "mailrow-wrap--{}{}{}{}",
         prefs.density,
@@ -1587,7 +1618,7 @@ fn render_row_inner(
         format!("/m/{}", url_encode(&m.id))
     };
     format!(
-        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls} mailrow--{density}" href="{href}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{star}{subject}</span><span class="date">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls} mailrow--{density}" href="{href}"><span class="{dot}"></span>{unread}<span class="star-slot">{star}</span><span class="from">{from}</span><span class="subject"><span class="subj-text">{subject}</span>{snip}</span>{att}<span class="date" title="{date_full}">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         href = esc(&href),
         density = esc(prefs.density),
@@ -1597,7 +1628,10 @@ fn render_row_inner(
         muted = m.muted,
         state_cls = state_cls,
         from = from,
-        date = fmt_date(m.received_at),
+        snip = snip_html,
+        att = att,
+        date_full = fmt_date(m.received_at),
+        date = fmt_date_list(m.received_at),
         actions = row_actions(
             &m.id,
             m.starred,
@@ -1630,7 +1664,7 @@ fn render_scheduled_row(item: &ScheduledOutbound, token: &str, prefs: PagePrefs)
     };
     let controls = schedule_controls_for(now_secs(), item.send_at);
     format!(
-        r#"<li class="mailrow-wrap mailrow-wrap--{density} folder-scheduled is-scheduled" data-id="{id}" data-send-at="{send_at}"><a class="mailrow mailrow--{density}" href="/compose?scheduled={scheduled}"><span class="dot seen"></span><span class="from">{to}</span><span class="subject">{subject}</span><span class="date">{date}</span></a><form class="row-actions scheduled-actions" method="post" action="/scheduled/{scheduled}/action">
+        r#"<li class="mailrow-wrap mailrow-wrap--{density} folder-scheduled is-scheduled" data-id="{id}" data-send-at="{send_at}"><a class="mailrow mailrow--{density}" href="/compose?scheduled={scheduled}"><span class="dot seen"></span><span class="star-slot"></span><span class="from">{to}</span><span class="subject"><span class="subj-text">{subject}</span></span><span class="date" title="{date_full}">{date}</span></a><form class="row-actions scheduled-actions" method="post" action="/scheduled/{scheduled}/action">
   <input type="hidden" name="csrf" value="{token}">
   <input type="hidden" name="return" value="/?folder=Scheduled">
   {controls}
@@ -1648,7 +1682,8 @@ fn render_scheduled_row(item: &ScheduledOutbound, token: &str, prefs: PagePrefs)
         to = esc(&to_display),
         from = esc(&from_display),
         subject = esc(&subject_text),
-        date = fmt_date(item.send_at),
+        date_full = fmt_date(item.send_at),
+        date = fmt_date_list(item.send_at),
     )
 }
 
@@ -2432,41 +2467,201 @@ fn is_attr_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':')
 }
 
-/// Inputs for [`folder_tabs`]: which folder/label is active, the current search text + scope, the
-/// mailbox's labels, and whether the folder is showing the threaded (conversation) view.
+/// Inputs for [`list_toolbar`]: which folder/label is active, the current search text + scope,
+/// and whether the folder is showing the threaded (conversation) view.
 struct FolderTabs<'a> {
     active: &'a str,
     search_q: &'a str,
     scope: Option<&'a str>,
-    labels: &'a [Label],
     active_label: &'a str,
     threads_on: bool,
 }
 
-/// Render the folder switcher as a row of pill links (INBOX/Sent/Drafts/Archive/Trash/Starred),
-/// highlighting the active folder, then a Threads/Messages toggle for the active folder, then a
-/// pill per label, then the `?q=` search box. `scope` is the folder the search box narrows to
-/// (carried as a hidden `folder` field); `None` searches the whole mailbox.
-fn folder_tabs(t: &FolderTabs) -> String {
-    let mut out = String::from(r#"<nav class="folder-tabs">"#);
-    for f in FOLDERS
-        .iter()
-        .copied()
-        .chain([SNOOZED_VIEW, SCHEDULED_VIEW, STARRED_VIEW])
-    {
-        // A folder pill is only "active" when no label filter is in effect.
-        let cls = if f == t.active && t.active_label.is_empty() {
-            "btn btn-primary btn-sm"
-        } else {
-            "btn btn-ghost btn-sm"
-        };
-        let label = if f == "INBOX" { "Inbox" } else { f };
-        out.push_str(&format!(
-            r#"<a class="{cls} {folder_cls}" href="/?folder={f}">{label}</a>"#,
-            folder_cls = folder_class(f),
-        ));
+fn sidebar_count(n: i64, unread: bool) -> String {
+    if n <= 0 {
+        return String::new();
     }
-    // Threads/Messages toggle — meaningful for a real folder view (never the Starred/search view).
+    let cls = if unread {
+        "mail-side__count mail-side__count--unread"
+    } else {
+        "mail-side__count"
+    };
+    format!(r#"<span class="{cls}">{n}</span>"#)
+}
+
+fn sidebar_item(
+    active: &str,
+    active_label: &str,
+    key: &str,
+    href: &str,
+    icon: &str,
+    name: &str,
+    count: String,
+) -> String {
+    let is_active = active_label.is_empty() && active == key;
+    let active_cls = if is_active { " is-active" } else { "" };
+    let current = if is_active {
+        r#" aria-current="page""#
+    } else {
+        ""
+    };
+    let aria = if key == "INBOX" && !count.is_empty() {
+        format!(r#" aria-label="Inbox, {} unread""#, count_text(&count))
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<li><a class="mail-side__item{active_cls}" href="{href}"{current}{aria}>{icon}<span class="mail-side__name">{name}</span>{count}</a></li>"#,
+        href = esc(href),
+        name = esc(name),
+    )
+}
+
+fn count_text(html: &str) -> String {
+    html.chars().filter(|ch| ch.is_ascii_digit()).collect()
+}
+
+fn mail_sidebar(
+    active: &str,
+    active_label: &str,
+    labels: &[Label],
+    counts: &FolderCounts,
+) -> String {
+    let mut primary = String::new();
+    // The sidebar Inbox count is intentionally INBOX-scoped; the page-head "N unread" pill keeps
+    // the existing mailbox-wide unseen_count semantics.
+    primary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "INBOX",
+        "/?folder=INBOX",
+        ICO_INBOX,
+        "Inbox",
+        sidebar_count(counts.inbox_unseen, true),
+    ));
+    primary.push_str(&sidebar_item(
+        active,
+        active_label,
+        STARRED_VIEW,
+        "/?folder=Starred",
+        ICO_STAR,
+        "Starred",
+        String::new(),
+    ));
+    primary.push_str(&sidebar_item(
+        active,
+        active_label,
+        SNOOZED_VIEW,
+        "/?folder=Snoozed",
+        ICO_CLOCK,
+        "Snoozed",
+        sidebar_count(counts.snoozed_total, false),
+    ));
+    primary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "Sent",
+        "/?folder=Sent",
+        ICO_SEND,
+        "Sent",
+        String::new(),
+    ));
+    primary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "Drafts",
+        "/?folder=Drafts",
+        ICO_DRAFT,
+        "Drafts",
+        sidebar_count(counts.drafts_total, false),
+    ));
+
+    let mut secondary = String::new();
+    secondary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "Archive",
+        "/?folder=Archive",
+        ICO_ARCHIVE,
+        "Archive",
+        String::new(),
+    ));
+    secondary.push_str(&sidebar_item(
+        active,
+        active_label,
+        crate::delivery::SPAM_FOLDER,
+        "/?folder=Spam",
+        ICO_SPAM,
+        "Spam",
+        sidebar_count(counts.spam_unseen, false),
+    ));
+    secondary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "Trash",
+        "/?folder=Trash",
+        ICO_TRASH,
+        "Trash",
+        String::new(),
+    ));
+    secondary.push_str(&sidebar_item(
+        active,
+        active_label,
+        SCHEDULED_VIEW,
+        "/?folder=Scheduled",
+        ICO_CAL,
+        "Scheduled",
+        sidebar_count(counts.scheduled_total, false),
+    ));
+
+    let labels_html = if labels.is_empty() {
+        String::new()
+    } else {
+        let mut items = String::new();
+        for label in labels {
+            let is_active = label.id == active_label;
+            let active_cls = if is_active { " is-active" } else { "" };
+            let current = if is_active {
+                r#" aria-current="page""#
+            } else {
+                ""
+            };
+            items.push_str(&format!(
+                r#"<li><a class="mail-side__item{active_cls}" href="/?label={id}"{current}><span class="mail-side__dot mail-side__dot--default" aria-hidden="true"></span><span class="mail-side__name">{name}</span></a></li>"#,
+                id = url_encode(&label.id),
+                name = esc(&label.name),
+            ));
+        }
+        format!(
+            r#"<details class="mail-side__labels" open><summary class="mail-side__heading">Labels</summary><ul class="mail-side__list">{items}</ul></details>"#
+        )
+    };
+
+    format!(
+        r#"<nav class="mail-side" aria-label="Mail folders">
+  <a class="btn btn-primary mail-side__compose" href="/compose">{compose}<span>Compose</span></a>
+  <ul class="mail-side__list">{primary}</ul>
+  <div class="mail-side__sep" role="presentation"></div>
+  <ul class="mail-side__list">{secondary}</ul>
+  {labels}
+</nav>"#,
+        compose = ICO_PENCIL,
+        labels = labels_html,
+    )
+}
+
+fn mail_shell(sidebar: String, main: String) -> String {
+    format!(r#"<div class="mail-shell">{sidebar}<div class="mail-main">{main}</div></div>"#)
+}
+
+/// Render the list toolbar: scoped search box, operator hint, and the Threads/Messages view
+/// toggle. Folder and label navigation live in the persistent sidebar.
+fn list_toolbar(t: &FolderTabs) -> String {
+    let scope_input = t
+        .scope
+        .map(|f| format!(r#"<input type="hidden" name="folder" value="{}">"#, esc(f)))
+        .unwrap_or_default();
+    let mut toggle = String::new();
     if t.active_label.is_empty()
         && !t.active.is_empty()
         && t.active != STARRED_VIEW
@@ -2474,43 +2669,27 @@ fn folder_tabs(t: &FolderTabs) -> String {
         && t.active != SCHEDULED_VIEW
     {
         if t.threads_on {
-            out.push_str(&format!(
-                r#"<a class="btn btn-ghost btn-sm" href="/?folder={f}" title="Show individual messages">Messages</a>"#,
+            toggle.push_str(&format!(
+                r#"<a class="btn btn-subtle btn-sm threads-toggle" href="/?folder={f}" title="Show individual messages">Messages</a>"#,
                 f = t.active,
             ));
         } else {
-            out.push_str(&format!(
-                r#"<a class="btn btn-ghost btn-sm" href="/?folder={f}&view=threads" title="Group into conversations">Threads</a>"#,
+            toggle.push_str(&format!(
+                r#"<a class="btn btn-subtle btn-sm threads-toggle" href="/?folder={f}&view=threads" title="Group into conversations">Threads</a>"#,
                 f = t.active,
             ));
         }
     }
-    // Label pills.
-    for l in t.labels {
-        let cls = if l.id == t.active_label {
-            "btn btn-primary btn-sm label-pill"
-        } else {
-            "btn btn-ghost btn-sm label-pill"
-        };
-        out.push_str(&format!(
-            r#"<a class="{cls}" href="/?label={id}">{name}</a>"#,
-            id = url_encode(&l.id),
-            name = esc(&l.name),
-        ));
-    }
-    let scope_input = t
-        .scope
-        .map(|f| format!(r#"<input type="hidden" name="folder" value="{}">"#, esc(f)))
-        .unwrap_or_default();
-    out.push_str(&format!(
-        r#"<form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button><div class="search-hint">from: to: cc: subject: label: is:unread is:read is:starred has:attachment in: before: after: larger: smaller: "exact phrase" -exclude OR</div></form>"#,
+    format!(
+        r#"<div class="list-toolbar">
+  <form class="search-box" method="get" action="/">{scope_input}<input type="search" name="q" value="{q}" placeholder="Search mail"><button class="btn btn-ghost btn-sm" type="submit">Search</button>
+    <div class="search-hint">from: to: cc: subject: label: is:unread is:read is:starred has:attachment in: before: after: larger: smaller: "exact phrase" -exclude OR <a class="adv-search-link" href="/search/advanced">Advanced search →</a></div>
+  </form>
+  <span class="list-toolbar__spacer"></span>
+  {toggle}
+</div>"#,
         q = esc(t.search_q),
-    ));
-    out.push_str(
-        r#"<a class="btn btn-ghost btn-sm adv-search-link" href="/search/advanced">Advanced</a>"#,
-    );
-    out.push_str("</nav>");
-    out
+    )
 }
 
 /// Render one collapsed conversation row for the threaded folder view: the latest message's
@@ -2529,17 +2708,30 @@ fn render_thread_row(t: &crate::model::ThreadSummary, prefs: PagePrefs) -> Strin
         esc(&m.subject)
     };
     let count_badge = if t.count > 1 {
-        format!(r#"<span class="pill thread-count">{}</span> "#, t.count)
+        format!(r#"<span class="pill thread-count">{}</span>"#, t.count)
     } else {
         String::new()
     };
+    let unread = if t.unseen > 0 {
+        r#"<span class="sr-only">unread</span>"#
+    } else {
+        ""
+    };
+    let snip = clean_snippet(&m.snippet);
+    let snip_html = if snip.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<span class="snip">{}</span>"#, esc(&snip))
+    };
     format!(
-        r#"<li class="mailrow-wrap mailrow-wrap--{density}"><a class="{cls} mailrow--{density}" href="/t?id={id}"><span class="{dot}"></span><span class="from">{from}</span><span class="subject">{count}{subject}</span><span class="date">{date}</span></a></li>"#,
+        r#"<li class="mailrow-wrap mailrow-wrap--{density}"><a class="{cls} mailrow--{density}" href="/t?id={id}"><span class="{dot}"></span>{unread}<span class="from">{from}</span><span class="count-slot">{count}</span><span class="subject"><span class="subj-text">{subject}</span>{snip}</span><span class="date" title="{date_full}">{date}</span></a></li>"#,
         id = url_encode(&t.thread_id),
         density = esc(prefs.density),
         from = esc(&display_from(&m.msg_from)),
         count = count_badge,
-        date = fmt_date(m.received_at),
+        snip = snip_html,
+        date_full = fmt_date(m.received_at),
+        date = fmt_date_list(m.received_at),
     )
 }
 
@@ -2593,6 +2785,11 @@ async fn read_message(
 
     // Label strip + assign/remove control (scoped to this mailbox's labels).
     let all_labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let counts = state
+        .store
+        .folder_counts(&mb.addr)
+        .await
+        .unwrap_or_default();
     let msg_labels = state
         .store
         .labels_for_message(&mb.addr, &id)
@@ -2635,6 +2832,7 @@ async fn read_message(
     } else {
         esc(&msg.subject)
     };
+    let sender = msg_from_block(&msg.msg_from, &msg.msg_to, msg.received_at);
     let mut pane_rows = String::new();
     if prefs.reading_pane != "off" {
         let return_to = format!("/m/{}", url_encode(&msg.id));
@@ -2662,11 +2860,7 @@ async fn read_message(
         r#"<section class="card pad read-pane read-pane--message" data-read-pane>
   <header class="msg-head">
     <h1 class="msg-subject">{subject}</h1>
-    <div class="msg-meta">
-      <b>From</b><span>{from}</span>
-      <b>To</b><span>{to}</span>
-      <b>Date</b><span>{date}</span>
-    </div>
+    {sender}
     <div class="form-actions msg-actions">
       <a class="btn btn-primary btn-sm" href="/compose?reply={id}">Reply</a>
       <a class="btn btn-ghost btn-sm" href="/compose?replyall={id}">Reply all</a>
@@ -2680,9 +2874,7 @@ async fn read_message(
   {attachments}
   {body}
 </section>"#,
-        from = esc(&msg.msg_from),
-        to = esc(&msg.msg_to),
-        date = fmt_date(msg.received_at),
+        sender = sender,
         id = esc(&msg.id),
         convo = convo_html,
         labels = labels_html,
@@ -2711,7 +2903,8 @@ async fn read_message(
         },
     );
     let content = format!("{content}\n<script src=\"/assets/webmail.js\"></script>");
-    let html = render_page_with_prefs(&msg.subject, &email, &content, "inbox", prefs);
+    let content = mail_shell(mail_sidebar(&msg.folder, "", &all_labels, &counts), content);
+    let html = render_mail_page(&msg.subject, &email, &content, prefs);
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -2788,6 +2981,12 @@ async fn conversation(
     };
     let settings = settings_for_page(&state, &mb.addr).await;
     let prefs = page_prefs(&settings);
+    let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
+    let counts = state
+        .store
+        .folder_counts(&mb.addr)
+        .await
+        .unwrap_or_default();
     let msgs = match state.store.list_thread(&mb.addr, &q.id, PAGE_MAX).await {
         Ok(m) => m,
         Err(e) => {
@@ -2820,14 +3019,11 @@ async fn conversation(
         let _ = state.store.mark_seen(&m.id).await;
         let body = render_message_body(m);
         let attachments = render_attachment_list(m);
+        let sender = msg_from_block(&m.msg_from, &m.msg_to, m.received_at);
         blocks.push_str(&format!(
             r#"<section class="card pad read-pane read-pane--conversation convo-msg" data-read-pane data-convo-item>
   <header class="msg-head">
-    <div class="msg-meta">
-      <b>From</b><span>{from}</span>
-      <b>To</b><span>{to}</span>
-      <b>Date</b><span>{date}</span>
-    </div>
+    {sender}
     <div class="form-actions msg-actions">
       <button class="btn btn-ghost btn-sm convo-toggle" type="button" data-convo-toggle aria-expanded="true">Collapse</button>
       <a class="btn btn-ghost btn-sm" href="/m/{id}">Open</a>
@@ -2838,14 +3034,12 @@ async fn conversation(
   {attachments}
   {body}
 </section>"#,
-            from = esc(&m.msg_from),
-            to = esc(&m.msg_to),
-            date = fmt_date(m.received_at),
+            sender = sender,
             id = esc(&m.id),
         ));
     }
 
-    let content = format!(
+    let main = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
 <div class="page-head"><h1>{subject} <span class="pill thread-count">{count}</span></h1><a class="btn btn-primary btn-sm" href="/compose?replyall={latest}">Reply all</a></div>
 {blocks}
@@ -2853,14 +3047,8 @@ async fn conversation(
         count = msgs.len(),
         latest = esc(&latest_id),
     );
-    Html(render_page_with_prefs(
-        "Conversation",
-        &email,
-        &content,
-        "inbox",
-        prefs,
-    ))
-    .into_response()
+    let content = mail_shell(mail_sidebar("INBOX", "", &labels, &counts), main);
+    Html(render_mail_page("Conversation", &email, &content, prefs)).into_response()
 }
 
 /// Form body for `POST /m/{id}/labels`: CSRF, `op` (`add`|`remove`), and the `label` id.
@@ -4000,7 +4188,7 @@ async fn compose_form(
 
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
-<section class="card pad">
+<section class="card pad compose-card">
   <div class="page-head"><h1>New message</h1></div>
   <form method="post" action="/send" enctype="multipart/form-data" data-current-signature-text="{current_signature_text}" data-current-signature-html="{current_signature_html}">
     <input type="hidden" name="csrf" value="{token}">
@@ -8425,8 +8613,24 @@ fn render_page_with_prefs(
     nav_active: &str,
     prefs: PagePrefs,
 ) -> String {
+    render_shell(title, email_display, content, nav_active, prefs, "")
+}
+
+fn render_mail_page(title: &str, email_display: &str, content: &str, prefs: PagePrefs) -> String {
+    render_shell(title, email_display, content, "inbox", prefs, " wrap--mail")
+}
+
+fn render_shell(
+    title: &str,
+    email_display: &str,
+    content: &str,
+    nav_active: &str,
+    prefs: PagePrefs,
+    wrap_mod: &str,
+) -> String {
     SHELL
         .replace("{{STYLE}}", APP_CSS)
+        .replace("{{WRAP}}", wrap_mod)
         .replace("{{TITLE}}", &esc(title))
         .replace("{{THEME}}", &esc(prefs.theme))
         .replace("{{DENSITY}}", &esc(prefs.density))
@@ -8539,6 +8743,105 @@ fn display_from(from: &str) -> String {
     from.to_string()
 }
 
+fn from_display_parts(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    if let Some(lt) = raw.find('<') {
+        let name = raw[..lt].trim().trim_matches('"').trim();
+        if let Some(gt) = raw[lt..].find('>') {
+            let addr = raw[lt + 1..lt + gt].trim();
+            if name.is_empty() {
+                return (addr.to_string(), String::new());
+            }
+            return (name.to_string(), addr.to_string());
+        }
+    }
+    (raw.to_string(), String::new())
+}
+
+fn recips_short(to: &str) -> String {
+    let recipients: Vec<&str> = to
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(first) = recipients.first() else {
+        return "to undisclosed recipients".to_string();
+    };
+    let first = display_from(first);
+    if recipients.len() > 1 {
+        format!("to {first}, +{}", recipients.len() - 1)
+    } else {
+        format!("to {first}")
+    }
+}
+
+fn avatar_hue(addr: &str) -> u8 {
+    (addr.bytes().fold(0_u32, |sum, b| sum + b as u32) % 6) as u8
+}
+
+fn avatar_initial(name: &str, addr: &str) -> String {
+    name.chars()
+        .chain(addr.chars())
+        .find(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn clean_snippet(snippet: &str) -> String {
+    let without_quotes = snippet
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.starts_with('>')
+                && !(line.starts_with("On ") && line.contains("wrote:"))
+                && !line.is_empty()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let collapsed = without_quotes
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    collapsed.chars().take(120).collect()
+}
+
+fn msg_from_block(from_raw: &str, to_raw: &str, received_at: i64) -> String {
+    let (name, addr) = from_display_parts(from_raw);
+    let hue_key = if addr.is_empty() {
+        name.as_str()
+    } else {
+        addr.as_str()
+    };
+    let addr_html = if addr.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#" <span class="msg-from__addr">&lt;{}&gt;</span>"#,
+            esc(&addr)
+        )
+    };
+    let date = fmt_date(received_at);
+    format!(
+        r#"<div class="msg-from">
+    <span class="msg-avatar avatar--h{hue}" aria-hidden="true">{initial}</span>
+    <div class="msg-from__who">
+      <div class="msg-from__line"><span class="msg-from__name">{name}</span>{addr_html}</div>
+      <details class="msg-recips"><summary class="msg-recips__summary">{recips}</summary>
+        <div class="msg-meta"><b>From</b><span>{from}</span><b>To</b><span>{to}</span><b>Date</b><span>{date}</span></div>
+      </details>
+    </div>
+    <span class="msg-from__date" title="{date}">{date}</span>
+  </div>"#,
+        hue = avatar_hue(hue_key),
+        initial = esc(&avatar_initial(&name, &addr)),
+        name = esc(&name),
+        addr_html = addr_html,
+        recips = esc(&recips_short(to_raw)),
+        from = esc(from_raw),
+        to = esc(to_raw),
+    )
+}
+
 /// Format an epoch-seconds timestamp as `YYYY-MM-DD HH:MM` (UTC).
 fn fmt_date(ts: i64) -> String {
     match OffsetDateTime::from_unix_timestamp(ts) {
@@ -8552,6 +8855,23 @@ fn fmt_date(ts: i64) -> String {
         ),
         Err(_) => "—".to_string(),
     }
+}
+
+fn fmt_date_list(ts: i64) -> String {
+    let Ok(dt) = OffsetDateTime::from_unix_timestamp(ts) else {
+        return "—".to_string();
+    };
+    let now = OffsetDateTime::now_utc();
+    if dt.date() == now.date() {
+        return format!("{:02}:{:02}", dt.hour(), dt.minute());
+    }
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    if dt.year() == now.year() {
+        return format!("{} {}", MONTHS[dt.month() as usize - 1], dt.day());
+    }
+    format!("{:04}-{:02}-{:02}", dt.year(), dt.month() as u8, dt.day())
 }
 
 #[cfg(test)]
@@ -9176,6 +9496,8 @@ mod tests {
             id: id.to_string(),
             msg_from: String::new(),
             subject: String::new(),
+            snippet: String::new(),
+            has_attachment: false,
             received_at: ts,
             seen: false,
             starred: false,

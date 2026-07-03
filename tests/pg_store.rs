@@ -91,6 +91,8 @@ async fn pg_store_full_integration() {
     let list = pg.list_messages("w33d@w33d.xyz", 10).await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].subject, "PG subject");
+    assert_eq!(list[0].snippet, "body");
+    assert!(!list[0].has_attachment);
     assert_eq!(pg.unseen_count("w33d@w33d.xyz").await.unwrap(), 1);
 
     pg.mark_seen(&msg.id).await.unwrap();

@@ -16,7 +16,8 @@
 //! - `messages(id TEXT PK, mailbox TEXT, msg_from TEXT, msg_to TEXT, subject TEXT,
 //!    raw_rfc822 TEXT, body_text TEXT, body_html TEXT, received_at BIGINT,
 //!    seen BOOLEAN DEFAULT FALSE, folder TEXT DEFAULT 'INBOX',
-//!    snooze_until BIGINT DEFAULT 0, muted BOOLEAN DEFAULT FALSE)`
+//!    snooze_until BIGINT DEFAULT 0, muted BOOLEAN DEFAULT FALSE,
+//!    has_attachment INTEGER DEFAULT 0)`
 //! - `outbound_queue(id TEXT PK, mailbox TEXT, batch_id TEXT, raw TEXT, env_from TEXT,
 //!    rcpts TEXT, to_domain TEXT, attempts BIGINT, next_at BIGINT, send_at BIGINT,
 //!    sent_copy_filed BOOLEAN, status TEXT)`
@@ -57,6 +58,17 @@ pub const AUTO_REPLY_DEDUPE_SECS: i64 = 86_400;
 pub enum StoreError {
     #[error("store error: {0}")]
     Backend(String),
+}
+
+/// Counts for the mail sidebar. These deliberately mix unread and total semantics to match the UI:
+/// Inbox/Spam show unread pressure, while Drafts/Snoozed/Scheduled show total work queues.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FolderCounts {
+    pub inbox_unseen: i64,
+    pub drafts_total: i64,
+    pub spam_unseen: i64,
+    pub snoozed_total: i64,
+    pub scheduled_total: i64,
 }
 
 /// Pluggable mail store. All methods are `async` and `.await`ed on the serving runtime.
@@ -152,6 +164,8 @@ pub trait Store: Send + Sync {
     async fn is_thread_muted(&self, mailbox: &str, thread_id: &str) -> Result<bool, StoreError>;
     /// Unread count for the app-bar badge.
     async fn unseen_count(&self, mailbox: &str) -> Result<i64, StoreError>;
+    /// Sidebar counts for primary folders and virtual queues.
+    async fn folder_counts(&self, mailbox: &str) -> Result<FolderCounts, StoreError>;
 
     /// Every filter rule of a mailbox (enabled AND disabled), ordered by position ascending.
     /// Delivery filters on `enabled`; the settings UI lists them all.
@@ -502,12 +516,22 @@ fn summary(m: &Message) -> MessageSummary {
         id: m.id.clone(),
         msg_from: m.msg_from.clone(),
         subject: m.subject.clone(),
+        snippet: m.body_text.chars().take(240).collect(),
+        has_attachment: !crate::rfc822::list_attachments(&m.raw_rfc822).is_empty(),
         received_at: m.received_at,
         seen: m.seen,
         starred: m.starred,
         snooze_until: m.snooze_until,
         muted: m.muted,
         folder: m.folder.clone(),
+    }
+}
+
+fn has_attachment_flag(raw: &str) -> i64 {
+    if crate::rfc822::list_attachments(raw).is_empty() {
+        0
+    } else {
+        1
     }
 }
 
@@ -1124,6 +1148,49 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| m.mailbox == mailbox && !m.seen && !is_snoozed_at(m, now))
             .count() as i64)
+    }
+
+    async fn folder_counts(&self, mailbox: &str) -> Result<FolderCounts, StoreError> {
+        let now = crate::util::now_secs();
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let inbox_unseen = messages
+            .iter()
+            .filter(|m| {
+                m.mailbox == mailbox && m.folder == "INBOX" && !m.seen && !is_snoozed_at(m, now)
+            })
+            .count() as i64;
+        let drafts_total = messages
+            .iter()
+            .filter(|m| m.mailbox == mailbox && m.folder == "Drafts")
+            .count() as i64;
+        let spam_unseen = messages
+            .iter()
+            .filter(|m| {
+                m.mailbox == mailbox
+                    && m.folder == crate::delivery::SPAM_FOLDER
+                    && !m.seen
+                    && !is_snoozed_at(m, now)
+            })
+            .count() as i64;
+        let snoozed_total = messages
+            .iter()
+            .filter(|m| m.mailbox == mailbox && is_snoozed_at(m, now))
+            .count() as i64;
+        drop(messages);
+        let scheduled_total = self
+            .outbound
+            .lock()
+            .expect("outbound lock poisoned")
+            .iter()
+            .filter(|o| o.mailbox == mailbox && o.status == "scheduled" && o.send_at > now)
+            .count() as i64;
+        Ok(FolderCounts {
+            inbox_unseen,
+            drafts_total,
+            spam_unseen,
+            snoozed_total,
+            scheduled_total,
+        })
     }
 
     async fn list_rules(&self, mailbox: &str) -> Result<Vec<FilterRule>, StoreError> {
@@ -2510,7 +2577,8 @@ impl PgStore {
                  seen BOOLEAN NOT NULL DEFAULT FALSE, \
                  folder TEXT NOT NULL DEFAULT 'INBOX', \
                  snooze_until BIGINT NOT NULL DEFAULT 0, \
-                 muted BOOLEAN NOT NULL DEFAULT FALSE\
+                 muted BOOLEAN NOT NULL DEFAULT FALSE, \
+                 has_attachment INTEGER NOT NULL DEFAULT 0\
              )",
         )
         .execute(&self.pool)
@@ -2527,6 +2595,11 @@ impl PgStore {
         .await?;
         sqlx::query(
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS has_attachment INTEGER NOT NULL DEFAULT 0",
         )
         .execute(&self.pool)
         .await?;
@@ -3182,8 +3255,8 @@ impl Store for PgStore {
         sqlx::query(
             "INSERT INTO messages \
                  (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id, has_attachment) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         )
         .bind(&msg.id)
         .bind(&msg.mailbox)
@@ -3201,6 +3274,7 @@ impl Store for PgStore {
         .bind(msg.muted)
         .bind(&msg.thread_id)
         .bind(&msg.message_id)
+        .bind(has_attachment_flag(&msg.raw_rfc822))
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -3216,8 +3290,8 @@ impl Store for PgStore {
         let result = sqlx::query(
             "INSERT INTO messages \
                  (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
-                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'Drafts', $11, $12, $13, $14, $15) \
+                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id, has_attachment) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'Drafts', $11, $12, $13, $14, $15, $16) \
              ON CONFLICT (id) DO UPDATE SET \
                  msg_from = EXCLUDED.msg_from, \
                  msg_to = EXCLUDED.msg_to, \
@@ -3232,7 +3306,8 @@ impl Store for PgStore {
                  snooze_until = EXCLUDED.snooze_until, \
                  muted = EXCLUDED.muted, \
                  thread_id = EXCLUDED.thread_id, \
-                 message_id = EXCLUDED.message_id \
+                 message_id = EXCLUDED.message_id, \
+                 has_attachment = EXCLUDED.has_attachment \
              WHERE messages.mailbox = EXCLUDED.mailbox AND messages.folder = 'Drafts'",
         )
         .bind(&msg.id)
@@ -3250,6 +3325,7 @@ impl Store for PgStore {
         .bind(msg.muted)
         .bind(&msg.thread_id)
         .bind(&msg.message_id)
+        .bind(has_attachment_flag(&msg.raw_rfc822))
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -3279,7 +3355,8 @@ impl Store for PgStore {
         limit: i64,
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
+            "SELECT id, msg_from, subject, substr(COALESCE(body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(has_attachment, 0) AS has_attachment, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 ORDER BY received_at DESC, id DESC LIMIT $2",
         )
         .bind(mailbox)
@@ -3302,7 +3379,8 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
+            "SELECT id, msg_from, subject, substr(COALESCE(body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(has_attachment, 0) AS has_attachment, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 AND folder = $2 \
                AND ($2 <> 'INBOX' OR COALESCE(snooze_until, 0) <= $3) \
                AND (received_at < $4 OR (received_at = $4 AND id < $5)) \
@@ -3331,7 +3409,8 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
+            "SELECT id, msg_from, subject, substr(COALESCE(body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(has_attachment, 0) AS has_attachment, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 AND starred = TRUE \
                AND (received_at < $2 OR (received_at = $2 AND id < $3)) \
              ORDER BY received_at DESC, id DESC LIMIT $4",
@@ -3358,7 +3437,8 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT id, msg_from, subject, received_at, seen, starred, snooze_until, muted, folder FROM messages \
+            "SELECT id, msg_from, subject, substr(COALESCE(body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(has_attachment, 0) AS has_attachment, received_at, seen, starred, snooze_until, muted, folder FROM messages \
              WHERE mailbox = $1 AND COALESCE(snooze_until, 0) > $2 \
                AND (received_at < $3 OR (received_at = $3 AND id < $4)) \
              ORDER BY received_at DESC, id DESC LIMIT $5",
@@ -3387,7 +3467,8 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let mut sql = String::from(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder FROM messages m WHERE m.mailbox = $1",
+            "SELECT m.id, m.msg_from, m.subject, substr(COALESCE(m.body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(m.has_attachment, 0) AS has_attachment, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder FROM messages m WHERE m.mailbox = $1",
         );
         let mut binds = Vec::new();
         let mut next_param = 2_usize;
@@ -3601,6 +3682,39 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         row.try_get("n").map_err(backend)
+    }
+
+    async fn folder_counts(&self, mailbox: &str) -> Result<FolderCounts, StoreError> {
+        let now = crate::util::now_secs();
+        let row = sqlx::query(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN folder = 'INBOX' AND seen = FALSE AND COALESCE(snooze_until, 0) <= $2 THEN 1 ELSE 0 END), 0) AS inbox_unseen, \
+               COALESCE(SUM(CASE WHEN folder = 'Drafts' THEN 1 ELSE 0 END), 0) AS drafts_total, \
+               COALESCE(SUM(CASE WHEN folder = 'Spam' AND seen = FALSE THEN 1 ELSE 0 END), 0) AS spam_unseen, \
+               COALESCE(SUM(CASE WHEN COALESCE(snooze_until, 0) > $2 THEN 1 ELSE 0 END), 0) AS snoozed_total \
+             FROM messages WHERE mailbox = $1",
+        )
+        .bind(mailbox)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        let scheduled = sqlx::query(
+            "SELECT COUNT(*) AS n FROM outbound_queue \
+             WHERE mailbox = $1 AND status = 'scheduled' AND send_at > $2",
+        )
+        .bind(mailbox)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(FolderCounts {
+            inbox_unseen: row.try_get("inbox_unseen").map_err(backend)?,
+            drafts_total: row.try_get("drafts_total").map_err(backend)?,
+            spam_unseen: row.try_get("spam_unseen").map_err(backend)?,
+            snoozed_total: row.try_get("snoozed_total").map_err(backend)?,
+            scheduled_total: scheduled.try_get("n").map_err(backend)?,
+        })
     }
 
     async fn list_rules(&self, mailbox: &str) -> Result<Vec<FilterRule>, StoreError> {
@@ -4299,7 +4413,8 @@ impl Store for PgStore {
         // keyset-paginated on that representative's (received_at, id). Correlated COUNTs give the
         // thread size + unread tally. All standard SQL (|| concat, NULLIF/COALESCE, subqueries).
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder, \
+            "SELECT m.id, m.msg_from, m.subject, substr(COALESCE(m.body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(m.has_attachment, 0) AS has_attachment, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder, \
                     COALESCE(NULLIF(m.thread_id, ''), 'm:' || m.id) AS gk, \
                     (SELECT COUNT(*) FROM messages c WHERE c.mailbox = m.mailbox AND c.folder = m.folder \
                        AND (m.folder <> 'INBOX' OR COALESCE(c.snooze_until, 0) <= $3) \
@@ -4930,7 +5045,8 @@ impl Store for PgStore {
     ) -> Result<Vec<MessageSummary>, StoreError> {
         let (cur_ts, cur_id) = Self::cursor(before);
         let rows = sqlx::query(
-            "SELECT m.id, m.msg_from, m.subject, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder \
+            "SELECT m.id, m.msg_from, m.subject, substr(COALESCE(m.body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(m.has_attachment, 0) AS has_attachment, m.received_at, m.seen, m.starred, m.snooze_until, m.muted, m.folder \
              FROM messages m JOIN message_labels ml ON ml.message_id = m.id \
              WHERE m.mailbox = $1 AND ml.mailbox = $1 AND ml.label_id = $2 \
                AND (m.received_at < $3 OR (m.received_at = $3 AND m.id < $4)) \
@@ -5062,6 +5178,8 @@ fn summary_from_row(r: &sqlx::postgres::PgRow) -> Result<MessageSummary, sqlx::E
         id: r.try_get("id")?,
         msg_from: r.try_get("msg_from")?,
         subject: r.try_get("subject")?,
+        snippet: r.try_get("snippet")?,
+        has_attachment: r.try_get::<i32, _>("has_attachment")? != 0,
         received_at: r.try_get("received_at")?,
         seen: r.try_get("seen")?,
         starred: r.try_get::<Option<bool>, _>("starred")?.unwrap_or(false),
@@ -5281,6 +5399,68 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn summaries_and_folder_counts_include_sidebar_fields() {
+        let store = InMemoryStore::new();
+        let now = crate::util::now_secs();
+        let raw_with_attachment = "From: a@example.com\r\nTo: w33d@w33d.xyz\r\nSubject: Attach\r\n\
+            MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n\
+            --b\r\nContent-Type: text/plain\r\n\r\nVisible body\r\n\
+            --b\r\nContent-Type: text/plain; name=\"a.txt\"\r\nContent-Disposition: attachment; filename=\"a.txt\"\r\n\r\nfile\r\n--b--\r\n";
+        let mut inbox = msg("m_inbox", now);
+        inbox.subject = "Attach".to_string();
+        inbox.raw_rfc822 = raw_with_attachment.to_string();
+        inbox.body_text = "Intro line\n> quoted line\nOn Tue, Alice wrote:\nbody tail".to_string();
+        store.store_message(&inbox).await.unwrap();
+
+        let mut draft = msg("m_draft", now - 1);
+        draft.folder = "Drafts".to_string();
+        store.store_message(&draft).await.unwrap();
+
+        let mut spam = msg("m_spam", now - 2);
+        spam.folder = crate::delivery::SPAM_FOLDER.to_string();
+        store.store_message(&spam).await.unwrap();
+
+        let mut snoozed = msg("m_snoozed", now - 3);
+        snoozed.snooze_until = now + 300;
+        store.store_message(&snoozed).await.unwrap();
+
+        store
+            .enqueue_outbound(&OutboundItem {
+                id: "o_sched".to_string(),
+                mailbox: "w33d@w33d.xyz".to_string(),
+                batch_id: "batch_sched".to_string(),
+                raw: "Subject: Later\r\n\r\nbody".to_string(),
+                env_from: "w33d@w33d.xyz".to_string(),
+                rcpts: vec!["friend@example.com".to_string()],
+                to_domain: "example.com".to_string(),
+                attempts: 0,
+                next_at: now + 600,
+                send_at: now + 600,
+                sent_copy_filed: false,
+                status: "scheduled".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let listed = store
+            .list_folder("w33d@w33d.xyz", "INBOX", None, 10)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|m| m.has_attachment));
+        assert_eq!(
+            listed[0].snippet.chars().take(10).collect::<String>(),
+            "Intro line"
+        );
+
+        let counts = store.folder_counts("w33d@w33d.xyz").await.unwrap();
+        assert_eq!(counts.inbox_unseen, 1);
+        assert_eq!(counts.drafts_total, 1);
+        assert_eq!(counts.spam_unseen, 1);
+        assert_eq!(counts.snoozed_total, 1);
+        assert_eq!(counts.scheduled_total, 1);
     }
 
     #[tokio::test]
