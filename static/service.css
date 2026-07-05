@@ -1554,3 +1554,59 @@ mark.search-hit {
   [data-theme="system"] .undo-bar .btn-undo-send:hover { color:var(--ink); }
   [data-theme="system"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
 }
+
+/* ============================================================================
+   HOLDFAST · Corvid webmail — narrow-viewport hardening (ADDITIVE)
+   Tablet (<=900px) + phone (<=640px) rules for the Corvid-specific fixed /
+   multi-column surfaces the desktop sheet above lays out at ~1440px. These are
+   NEW @media blocks only — every desktop (non-@media) rule stays byte-for-byte.
+   What is already covered above, and NOT re-done here:
+     · .mail-shell (folder rail + main)     — folds to a pill row at <=960px
+     · .mailrow / .list-toolbar / .attach-list / .msg-meta — reflow at <=720px
+     · .mailbox-layout--{right,bottom}       — stacks at <=720px
+     · .adv-search__form / .filter-rule-form — collapse to 1 col at <=640px
+     · .bulkbar / .undo-bar                  — repin at <=720px / <=520px
+   This block picks up the surfaces that stayed desktop-shaped between those
+   points: the reading-pane split through tablet portrait, the contacts grid on
+   phones, and the folded folder-rail touch targets. Tokens/units match the
+   existing sheet (Odyssey v2 tokens for colour/radii, concrete px for spacing,
+   as every other @media block above does — no --sp-*/--tap token is in use here).
+   ============================================================================ */
+
+/* ---- Tablet (<=900px): stack the reading-pane split earlier -------------- */
+/* With pane=right/bottom the message list + reader sit side-by-side down to
+   720px; on tablet portrait (768px) that pins the reader into a ~390px column
+   where rich HTML mail (wide tables, fixed-width layouts, images) overflows.
+   Extend the existing <=720px collapse up to the full tablet band so the reader
+   always spans the full width, and unpin/uncap the list so it never traps
+   scroll. Desktop (>900px) keeps the split completely untouched. The mailrow
+   reflow rules that shape the *narrow* list column are intentionally left as-is
+   here — identical to the proven <=720px handling. */
+@media (max-width:900px) {
+  .mailbox-layout--right,
+  .mailbox-layout--bottom { display:block; }
+  .mailbox-layout--right > * + *,
+  .mailbox-layout--bottom > * + * { margin-top:16px; }
+  .mailbox-layout--right > .mail-list-pane,
+  .mailbox-layout--bottom > .mail-list-pane {
+    position:static; max-height:none; overflow:visible;
+  }
+}
+
+/* ---- Phone (<=640px): Corvid-specific grids + touch targets ------------- */
+@media (max-width:640px) {
+  /* Contacts grid — the auto-fill 258px track floor forces a 258px column even
+     when the viewport can't afford it (horizontal overflow below ~300px) and
+     packs cramped cards on a phone. Drop to a single full-width column. */
+  .contact-grid { grid-template-columns:1fr; }
+
+  /* Folded folder rail (the pill row from the <=960px shell fold) — grow the
+     folder pills and the collapsible section headings to a comfortable touch
+     size; the rest inherits the desktop pill styling. */
+  .mail-side__item { height:auto; min-height:40px; }
+  .mail-side__heading { padding-top:12px; padding-bottom:8px; }
+
+  /* Duplicate-contact merge rows — let a long address + Merge button wrap onto
+     two lines instead of squeezing side-by-side. */
+  .contact-duplicate { flex-wrap:wrap; }
+}
