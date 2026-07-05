@@ -98,8 +98,26 @@ const PAGE_DEFAULT: i64 = 50;
 /// reachable through the keyset `?before=` cursor instead of a bigger page.
 const PAGE_MAX: i64 = 200;
 
-const APP_CSS: &str = include_str!("../static/app.css");
+/// Corvid-only webmail CSS (mail shell / folder list / mail rows / read view / compose /
+/// contacts / threading / density / reading-pane / dark mode) layered AFTER Odyssey's canonical
+/// font, tokens, and shared components.
+const SERVICE_CSS: &str = include_str!("../static/service.css");
 const SHELL: &str = include_str!("../templates/shell.html");
+
+/// Embedded design system for every rendered page's `<style>`: Odyssey canonical CSS followed by
+/// the Corvid service layer. Concatenated once on first use.
+static APP_CSS: OnceLock<String> = OnceLock::new();
+
+fn app_css() -> &'static str {
+    APP_CSS
+        .get_or_init(|| {
+            let mut css = String::with_capacity(odyssey::APP_CSS.len() + SERVICE_CSS.len());
+            css.push_str(odyssey::APP_CSS);
+            css.push_str(SERVICE_CSS);
+            css
+        })
+        .as_str()
+}
 
 /// Vanilla, dependency-free To/Cc autocomplete. Progressive enhancement: the inputs are plain
 /// text fields that submit fine with JS off; this only layers a debounced suggestion listbox on
@@ -8629,7 +8647,7 @@ fn render_shell(
     wrap_mod: &str,
 ) -> String {
     SHELL
-        .replace("{{STYLE}}", APP_CSS)
+        .replace("{{STYLE}}", app_css())
         .replace("{{WRAP}}", wrap_mod)
         .replace("{{TITLE}}", &esc(title))
         .replace("{{THEME}}", &esc(prefs.theme))

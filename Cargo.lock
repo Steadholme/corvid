@@ -172,6 +172,7 @@ dependencies = [
  "base64",
  "hex",
  "hmac",
+ "odyssey",
  "rand",
  "rsa",
  "rustls",
@@ -866,6 +867,10 @@ dependencies = [
  "autocfg",
  "libm",
 ]
+
+[[package]]
+name = "odyssey"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

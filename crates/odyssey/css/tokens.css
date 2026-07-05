@@ -1,0 +1,66 @@
+/* GENERATED FROM odyssey — DO NOT EDIT */
+/* ============================================================================
+   Odyssey · tokens.css — HOLDFAST 设计语言的 token 层(L0 + L1)
+   ----------------------------------------------------------------------------
+   L0 primitive  : 纯原始色阶/尺度值,全 estate 唯一允许出现 raw hex 的位置。
+   L1 semantic   : 语义名 → L0 的映射。组件 CSS(components.css)只准引这一层。
+   per-service 换肤 = 各仓 static/theme.css 覆盖 L1 的 --accent/--r/--cat-*。
+   GENERATED SOURCE OF TRUTH — 改 token 只在 canonical odyssey 仓改,勿手改副本。
+   ============================================================================ */
+
+/* ============ L0 primitives(唯一 raw hex 处)============ */
+:root{
+  /* 中性 / 表面 ramp */
+  --c-white:#ffffff; --c-slate-25:#f7f8fa; --c-slate-50:#f6f7f9; --c-slate-75:#f0f2f6;
+  --c-slate-100:#eef0f4; --c-slate-200:#e5e7ec; --c-slate-300:#d3d7e0;
+  --c-ink-900:#1a1d24; --c-ink-700:#4a5160; --c-ink-500:#727a8a; --c-ink-400:#9aa2b1;
+  /* 品牌靛蓝 */
+  --c-indigo-600:#4f46e5; --c-indigo-500:#6366f1; --c-indigo-700:#4338ca;
+  --c-indigo-50:#eef0fe; --c-indigo-100:#e4e7fd;
+  /* 语义 4 色(success / warn / danger / info) */
+  --c-green-600:#16a34a; --c-green-50:#e6f6ec; --c-green-700:#15803d;
+  --c-amber-600:#d97706; --c-amber-50:#fdf1de; --c-amber-700:#b45309;
+  --c-rose-600:#e11d48;  --c-rose-50:#fde7ec;  --c-rose-700:#be123c;
+  --c-cyan-600:#0891b2;  --c-cyan-50:#e0f5f9;  --c-cyan-700:#0e7490;
+  --c-gray-400:#9aa3b5;
+  /* 几何 / 阴影 */
+  --r-xs:6px; --r-sm:8px; --r:11px; --r-lg:16px; --r-pill:999px;
+  --sh-xs:0 1px 1px rgba(20,23,33,.04);
+  --sh-sm:0 1px 2px rgba(20,23,33,.06),0 1px 3px rgba(20,23,33,.05);
+  --sh-md:0 4px 12px rgba(20,23,33,.07),0 2px 4px rgba(20,23,33,.05);
+  --sh-lg:0 12px 32px rgba(20,23,33,.12),0 4px 8px rgba(20,23,33,.06);
+  --sh-pop:0 8px 28px rgba(20,23,33,.16);
+  /* 运动 / 控件尺寸 */
+  --ease:cubic-bezier(.2,.6,.25,1); --dur:140ms; --tap:40px;
+  /* 间距 scale(4 基数梯)*/
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:24px; --sp-8:32px;
+  /* type scale */
+  --fs-body:14px; --lh-body:1.5; --fs-h1:22px; --lh-h1:1.25; --fs-h2:17px; --lh-h2:1.3;
+  --fs-h3:14.5px; --fs-eyebrow:11.5px; --track-eyebrow:.08em; --fs-stat:26px;
+  --fs-sm:12px; --fs-micro:11px;
+  --fw-medium:550; --fw-semibold:650;
+  --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"JetBrains Mono","SFMono-Regular",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+
+/* ============ L1 semantic(组件只引这层)============ */
+:root{
+  --bg:var(--c-slate-50); --bg-2:var(--c-slate-100);
+  --surface:var(--c-white); --surface-2:var(--c-slate-25); --surface-3:var(--c-slate-75);
+  --border:var(--c-slate-200); --border-2:var(--c-slate-300); --hairline:var(--c-slate-100);
+  --ink:var(--c-ink-900); --ink-2:var(--c-ink-700); --ink-3:var(--c-ink-500); --ink-4:var(--c-ink-400);
+  --accent:var(--c-indigo-600); --accent-2:var(--c-indigo-500); --accent-ink:var(--c-indigo-700);
+  --accent-soft:var(--c-indigo-50); --accent-soft-2:var(--c-indigo-100); --ring:rgba(79,70,229,.30);
+  --ok:var(--c-green-600); --ok-soft:var(--c-green-50); --ok-ink:var(--c-green-700);
+  --warn:var(--c-amber-600); --warn-soft:var(--c-amber-50); --warn-ink:var(--c-amber-700);
+  --down:var(--c-rose-600); --down-soft:var(--c-rose-50); --down-ink:var(--c-rose-700);
+  --info:var(--c-cyan-600); --info-soft:var(--c-cyan-50); --info-ink:var(--c-cyan-700);
+  --unknown:var(--c-gray-400);
+  /* 淡描边变体(给 pill/tag 边框) */
+  --ok-border:color-mix(in srgb,var(--ok) 24%,#fff); --warn-border:color-mix(in srgb,var(--warn) 24%,#fff);
+  --down-border:color-mix(in srgb,var(--down) 24%,#fff); --info-border:color-mix(in srgb,var(--info) 24%,#fff);
+  /* per-service 换肤覆盖点(库给默认,服务在 theme.css 重定向) */
+  --app:var(--accent); --app-soft:var(--accent-soft);
+  /* v1→v2 别名桥:让 baseline 服务不改 markup 即可迁移 */
+  --radius:var(--r); --radius-md:var(--r-sm); --radius-sm:var(--r-xs);
+}

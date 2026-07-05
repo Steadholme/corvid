@@ -1,0 +1,12 @@
+# GENERATED FROM odyssey — DO NOT EDIT
+[package]
+name = "odyssey"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "odyssey-vendor"
+path = "src/bin/vendor.rs"

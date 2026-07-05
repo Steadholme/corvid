@@ -14,6 +14,9 @@ name = "corvid"
 path = "src/main.rs"
 
 [dependencies]
+# Vendored Odyssey canonical CSS (font + tokens + shared components) for the server-rendered
+# webmail pages. The service-specific mail/compose/contact/thread CSS layers on top.
+odyssey = { path = "crates/odyssey" }
 # HTTP framework for the webmail surface (shared with agora/keystone/…): State/Path/Form
 # extractors, typed responses.
 axum = { version = "0.8", features = ["multipart"] }

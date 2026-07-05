@@ -15,6 +15,7 @@ WORKDIR /build
 # Cache the dependency graph first: build a throwaway lib/bin against the real manifest so
 # `cargo build` only recompiles our crate when src/ changes, not the whole tree.
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '' > src/lib.rs \
