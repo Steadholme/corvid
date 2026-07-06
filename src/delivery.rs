@@ -357,6 +357,14 @@ fn split_name_addr(s: &str) -> (String, String) {
     (String::new(), s.to_string())
 }
 
+/// Summary returned after retroactively applying one filter rule to stored messages.
+#[derive(Debug, Default, Clone)]
+pub struct RuleRunReport {
+    pub scanned: i64,
+    pub matched: i64,
+    pub changed: i64,
+}
+
 /// The first ENABLED rule (position order) matching `msg`, if any — first match wins.
 pub fn first_match<'a>(rules: &'a [FilterRule], msg: &Message) -> Option<&'a FilterRule> {
     let mut ordered: Vec<&FilterRule> = rules.iter().filter(|r| r.enabled).collect();
@@ -380,6 +388,62 @@ pub fn rule_matches(rule: &FilterRule, msg: &Message) -> bool {
         "equals" => hay.trim() == needle.trim(),
         _ => false,
     }
+}
+
+/// Apply one existing rule to already-stored messages in `mailbox`, bounded by `limit`.
+pub async fn apply_rule_to_existing(
+    store: &dyn Store,
+    mailbox: &str,
+    rule: &FilterRule,
+    limit: i64,
+) -> Result<RuleRunReport, StoreError> {
+    let cands = store.list_messages(mailbox, limit).await?;
+    let mut report = RuleRunReport {
+        scanned: cands.len() as i64,
+        ..RuleRunReport::default()
+    };
+
+    for s in &cands {
+        let Some(msg) = store.get_message(&s.id).await? else {
+            continue;
+        };
+        if msg.mailbox != mailbox {
+            continue;
+        }
+        if !rule_matches(rule, &msg) {
+            continue;
+        }
+        report.matched += 1;
+        match rule.action.as_str() {
+            "move" => {
+                if let Some(f) = rule.target_folder.as_deref().filter(|f| !f.is_empty()) {
+                    store.set_folder(&msg.id, f).await?;
+                    report.changed += 1;
+                }
+            }
+            "star" => {
+                store.set_starred(&msg.id, true).await?;
+                report.changed += 1;
+            }
+            "markread" => {
+                store.mark_seen(&msg.id).await?;
+                report.changed += 1;
+            }
+            "label" => {
+                if let Some(l) = rule.target_label.as_deref().filter(|l| !l.is_empty()) {
+                    store.assign_label(mailbox, &msg.id, l).await?;
+                    report.changed += 1;
+                }
+            }
+            "discard" => {
+                store.set_folder(&msg.id, "Trash").await?;
+                report.changed += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(report)
 }
 
 /// Whether the auto-reply is switched on and unexpired (`until` of 0 = no expiry).
@@ -555,6 +619,63 @@ mod tests {
         }
     }
 
+    fn stored_msg(
+        id: &str,
+        mailbox: &str,
+        from: &str,
+        to: &str,
+        subject: &str,
+        received_at: i64,
+    ) -> Message {
+        let mut m = msg(from, to, subject);
+        m.id = id.to_string();
+        m.mailbox = mailbox.to_string();
+        m.received_at = received_at;
+        m
+    }
+
+    fn action_rule(id: &str, mailbox: &str, field: &str, needle: &str, action: &str) -> FilterRule {
+        let mut r = rule(id, 1, field, "contains", needle);
+        r.mailbox = mailbox.to_string();
+        r.action = action.to_string();
+        r
+    }
+
+    async fn assert_move_rule_moves_only_match(
+        field: &str,
+        needle: &str,
+        matching: Message,
+        miss: Message,
+    ) {
+        let store = InMemoryStore::new();
+        let mailbox = matching.mailbox.clone();
+        let matching_id = matching.id.clone();
+        let miss_id = miss.id.clone();
+        store.store_message(&matching).await.unwrap();
+        store.store_message(&miss).await.unwrap();
+
+        let mut r = action_rule("r_move", &mailbox, field, needle, "move");
+        r.target_folder = Some("Archive".to_string());
+        let rep = apply_rule_to_existing(&store, &mailbox, &r, 10)
+            .await
+            .unwrap();
+
+        assert_eq!((rep.scanned, rep.matched, rep.changed), (2, 1, 1));
+        assert_eq!(
+            store
+                .get_message(&matching_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .folder,
+            "Archive"
+        );
+        assert_eq!(
+            store.get_message(&miss_id).await.unwrap().unwrap().folder,
+            "INBOX"
+        );
+    }
+
     #[test]
     fn rule_matches_fields_and_ops_case_insensitively() {
         let m = msg(
@@ -615,6 +736,231 @@ mod tests {
 
         // Nothing enabled matches -> None.
         assert!(first_match(&rules, &msg("bob@x.com", "", "nope2")).is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_rule_to_existing_moves_only_matching_messages() {
+        assert_move_rule_moves_only_match(
+            "from",
+            "alice@example.com",
+            stored_msg(
+                "m_from_hit",
+                "w33d@w33d.xyz",
+                "Alice <alice@example.com>",
+                "w33d@w33d.xyz",
+                "Hello",
+                10,
+            ),
+            stored_msg(
+                "m_from_miss",
+                "w33d@w33d.xyz",
+                "Bob <bob@example.com>",
+                "w33d@w33d.xyz",
+                "Hello",
+                9,
+            ),
+        )
+        .await;
+        assert_move_rule_moves_only_match(
+            "subject",
+            "quarterly",
+            stored_msg(
+                "m_subject_hit",
+                "w33d@w33d.xyz",
+                "reporter@example.com",
+                "w33d@w33d.xyz",
+                "Quarterly report",
+                10,
+            ),
+            stored_msg(
+                "m_subject_miss",
+                "w33d@w33d.xyz",
+                "reporter@example.com",
+                "w33d@w33d.xyz",
+                "Weekly report",
+                9,
+            ),
+        )
+        .await;
+        assert_move_rule_moves_only_match(
+            "to",
+            "team@example.com",
+            stored_msg(
+                "m_to_hit",
+                "w33d@w33d.xyz",
+                "sender@example.com",
+                "Team <team@example.com>",
+                "Alias mail",
+                10,
+            ),
+            stored_msg(
+                "m_to_miss",
+                "w33d@w33d.xyz",
+                "sender@example.com",
+                "w33d@w33d.xyz",
+                "Alias mail",
+                9,
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn apply_rule_to_existing_star_markread_and_label_are_idempotent() {
+        let store = InMemoryStore::new();
+        let mailbox = "w33d@w33d.xyz";
+        let star = stored_msg(
+            "m_star",
+            mailbox,
+            "news@example.com",
+            mailbox,
+            "Star this",
+            30,
+        );
+        let read = stored_msg(
+            "m_read",
+            mailbox,
+            "news@example.com",
+            mailbox,
+            "Read this",
+            20,
+        );
+        let labelled = stored_msg(
+            "m_label",
+            mailbox,
+            "news@example.com",
+            mailbox,
+            "Label this",
+            10,
+        );
+        store.store_message(&star).await.unwrap();
+        store.store_message(&read).await.unwrap();
+        store.store_message(&labelled).await.unwrap();
+        let label = crate::model::Label {
+            id: "lbl_finance".to_string(),
+            mailbox: mailbox.to_string(),
+            name: "Finance".to_string(),
+            color: String::new(),
+        };
+        store.add_label(&label).await.unwrap();
+
+        let star_rule = action_rule("r_star", mailbox, "subject", "Star this", "star");
+        let read_rule = action_rule("r_read", mailbox, "subject", "Read this", "markread");
+        let mut label_rule = action_rule("r_label", mailbox, "subject", "Label this", "label");
+        label_rule.target_label = Some(label.id.clone());
+
+        for r in [&star_rule, &read_rule, &label_rule] {
+            let rep = apply_rule_to_existing(&store, mailbox, r, 10)
+                .await
+                .unwrap();
+            assert_eq!((rep.scanned, rep.matched, rep.changed), (3, 1, 1));
+            let rep = apply_rule_to_existing(&store, mailbox, r, 10)
+                .await
+                .unwrap();
+            assert_eq!((rep.scanned, rep.matched, rep.changed), (3, 1, 1));
+        }
+
+        assert!(store.get_message("m_star").await.unwrap().unwrap().starred);
+        assert!(store.get_message("m_read").await.unwrap().unwrap().seen);
+        let labels = store.labels_for_message(mailbox, "m_label").await.unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].id, label.id);
+    }
+
+    #[tokio::test]
+    async fn apply_rule_to_existing_discard_moves_to_trash_without_deleting() {
+        let store = InMemoryStore::new();
+        let mailbox = "w33d@w33d.xyz";
+        let m = stored_msg(
+            "m_discard",
+            mailbox,
+            "alerts@example.com",
+            mailbox,
+            "Discard this",
+            1,
+        );
+        store.store_message(&m).await.unwrap();
+
+        let r = action_rule("r_discard", mailbox, "subject", "Discard this", "discard");
+        let rep = apply_rule_to_existing(&store, mailbox, &r, 10)
+            .await
+            .unwrap();
+
+        assert_eq!((rep.scanned, rep.matched, rep.changed), (1, 1, 1));
+        let stored = store.get_message("m_discard").await.unwrap().unwrap();
+        assert_eq!(stored.folder, "Trash");
+    }
+
+    #[tokio::test]
+    async fn apply_rule_to_existing_isolates_mailboxes() {
+        let store = InMemoryStore::new();
+        let a = stored_msg(
+            "m_a",
+            "a@w33d.xyz",
+            "shared@example.com",
+            "a@w33d.xyz",
+            "Shared needle",
+            2,
+        );
+        let b = stored_msg(
+            "m_b",
+            "b@w33d.xyz",
+            "shared@example.com",
+            "b@w33d.xyz",
+            "Shared needle",
+            1,
+        );
+        store.store_message(&a).await.unwrap();
+        store.store_message(&b).await.unwrap();
+
+        let mut r = action_rule(
+            "r_isolate",
+            "a@w33d.xyz",
+            "subject",
+            "Shared needle",
+            "move",
+        );
+        r.target_folder = Some("Archive".to_string());
+        let rep = apply_rule_to_existing(&store, "a@w33d.xyz", &r, 10)
+            .await
+            .unwrap();
+
+        assert_eq!((rep.scanned, rep.matched, rep.changed), (1, 1, 1));
+        assert_eq!(
+            store.get_message("m_a").await.unwrap().unwrap().folder,
+            "Archive"
+        );
+        assert_eq!(
+            store.get_message("m_b").await.unwrap().unwrap().folder,
+            "INBOX"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_rule_to_existing_honors_scan_limit() {
+        let store = InMemoryStore::new();
+        let mailbox = "w33d@w33d.xyz";
+        let cap = 1000;
+        for i in 0..(cap + 1) {
+            let m = stored_msg(
+                &format!("m_cap_{i}"),
+                mailbox,
+                "sender@example.com",
+                mailbox,
+                "Cap match",
+                i,
+            );
+            store.store_message(&m).await.unwrap();
+        }
+
+        let r = action_rule("r_cap", mailbox, "subject", "Cap match", "star");
+        let rep = apply_rule_to_existing(&store, mailbox, &r, cap)
+            .await
+            .unwrap();
+
+        assert_eq!(rep.scanned, cap);
+        assert_eq!(rep.matched, cap);
+        assert_eq!(rep.changed, cap);
     }
 
     #[tokio::test]

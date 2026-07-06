@@ -5793,6 +5793,7 @@ async fn admin_add_alias(
 const RULE_FIELDS: [&str; 3] = ["from", "to", "subject"];
 const RULE_OPS: [&str; 2] = ["contains", "equals"];
 const RULE_ACTIONS: [&str; 5] = ["move", "star", "markread", "discard", "label"];
+const RULE_RUN_SCAN_CAP: i64 = 1000;
 
 /// `GET /settings` — the mailbox settings page: filter rules (list + add form), signature, display,
 /// and auto-reply (vacation), all POSTing back with the same double-submit CSRF token.
@@ -5918,6 +5919,15 @@ async fn settings_page(
     for (i, r) in rules.iter().enumerate() {
         rule_rows.push_str(&render_rule_row(i, rules.len(), r, &labels, &token));
     }
+    let rule_run_banner = if q.ran.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="spam-banner" role="note"><b>Filter applied</b><span>{m} matched, {c} updated.</span></div>"#,
+            m = q.matched,
+            c = q.changed,
+        )
+    };
 
     let rule_prefill = rule_prefill_from_search(&q.filter_q);
     let rule_field = rule_prefill
@@ -5963,6 +5973,7 @@ async fn settings_page(
 <section id="filter-rules" class="card pad filter-rules">
   <h2>Filter rules</h2>
   <p class="muted">Applied to incoming mail at delivery, top to bottom — the first matching rule wins.</p>
+  {rule_run_banner}
   <table class="data admin-table">
     <thead><tr><th>#</th><th>Match</th><th>Action</th><th>Status</th><th></th></tr></thead>
     <tbody>{rule_rows}</tbody>
@@ -6014,6 +6025,7 @@ async fn settings_page(
   </form>
 </section>"#,
         token = esc(&token),
+        rule_run_banner = rule_run_banner,
         rule_needle = esc(rule_needle),
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
@@ -6053,6 +6065,12 @@ async fn settings_page(
 struct SettingsQuery {
     #[serde(default)]
     filter_q: String,
+    #[serde(default)]
+    ran: String,
+    #[serde(default)]
+    matched: i64,
+    #[serde(default)]
+    changed: i64,
 }
 
 /// One filter-rule table row: the match/action summary plus its inline control form
@@ -6098,13 +6116,19 @@ fn render_rule_row(
     } else {
         ""
     };
+    let discard_confirm = if r.action == "discard" {
+        r#" onsubmit="return !event.submitter || event.submitter.value !== 'run' || confirm('Move all matching mail to Trash?')"#
+    } else {
+        ""
+    };
     format!(
         r#"<tr><td class="mono">{n}</td><td>{field} {op} &ldquo;{needle}&rdquo;</td><td>{action}</td><td>{status}</td><td>
-<form class="row-actions" method="post" action="/settings/rules">
+<form class="row-actions" method="post" action="/settings/rules"{discard_confirm}>
   <input type="hidden" name="csrf" value="{token}">
   <input type="hidden" name="id" value="{id}">
   {up}{down}
   <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="{toggle_cmd}">{toggle_label}</button>
+  <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="run" title="Apply this filter to existing mail (Discard moves matches to Trash)">Run now</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="cmd" value="delete">Delete</button>
 </form></td></tr>"#,
         n = index + 1,
@@ -6113,6 +6137,7 @@ fn render_rule_row(
         needle = esc(&r.needle),
         id = esc(&r.id),
         token = esc(token),
+        discard_confirm = discard_confirm,
         toggle_cmd = toggle.0,
         toggle_label = toggle.1,
     )
@@ -6203,6 +6228,7 @@ async fn settings_rules_redirect() -> Response {
 /// field/op/needle/action(/folder) selects; `up|down|enable|disable|delete` operate on `id`.
 #[derive(Deserialize, Default)]
 struct RuleForm {
+    #[serde(default)]
     csrf: String,
     #[serde(default)]
     cmd: String,
@@ -6242,6 +6268,7 @@ async fn settings_rules_post(
         return no_mailbox_page(&email_display(&headers));
     };
 
+    let mut run_report: Option<crate::delivery::RuleRunReport> = None;
     let result = match form.cmd.as_str() {
         "" | "add" => add_rule_from_form(&state, &mb.addr, &form).await,
         "up" | "down" => reorder_rule(&state, &mb.addr, &form.id, form.cmd == "up").await,
@@ -6260,6 +6287,13 @@ async fn settings_rules_post(
             .delete_rule(&mb.addr, &form.id)
             .await
             .map_err(|e| e.to_string()),
+        "run" => match run_rule_now(&state, &mb.addr, &form.id).await {
+            Ok(rep) => {
+                run_report = Some(rep);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         _ => {
             return error_page(
                 StatusCode::BAD_REQUEST,
@@ -6271,6 +6305,25 @@ async fn settings_rules_post(
     if let Err(e) = result {
         return error_page(StatusCode::BAD_REQUEST, "Invalid request", &e);
     }
+    if let Some(rep) = run_report {
+        tracing::info!(
+            target: "corvid::audit",
+            actor = %identity_subject(&headers).unwrap_or_default(),
+            mailbox = %mb.addr,
+            cmd = %"run",
+            rule = %form.id,
+            matched = rep.matched,
+            changed = rep.changed,
+            "filter rule change",
+        );
+        return Redirect::to(&format!(
+            "/settings?ran={}&matched={}&changed={}",
+            url_encode(&form.id),
+            rep.matched,
+            rep.changed
+        ))
+        .into_response();
+    }
     tracing::info!(
         target: "corvid::audit",
         actor = %identity_subject(&headers).unwrap_or_default(),
@@ -6280,6 +6333,24 @@ async fn settings_rules_post(
         "filter rule change",
     );
     Redirect::to("/settings").into_response()
+}
+
+async fn run_rule_now(
+    state: &AppState,
+    mailbox: &str,
+    id: &str,
+) -> Result<crate::delivery::RuleRunReport, String> {
+    let rules = state
+        .store
+        .list_rules(mailbox)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(rule) = rules.iter().find(|r| r.id == id) else {
+        return Err("Unknown rule.".to_string());
+    };
+    crate::delivery::apply_rule_to_existing(state.store.as_ref(), mailbox, rule, RULE_RUN_SCAN_CAP)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Validate + persist a new rule from the add form (appended at the end of the order).

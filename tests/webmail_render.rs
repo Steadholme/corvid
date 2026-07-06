@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
-use corvid::model::{parse_search_query, Label, Message};
+use corvid::model::{parse_search_query, FilterRule, Label, Mailbox, Message};
 use corvid::{app, build_dev_state, new_id, now_secs, AppState};
 
 fn seed_message(mailbox: &str, subject: &str, from: &str, body: &str) -> Message {
@@ -26,6 +26,22 @@ fn seed_message(mailbox: &str, subject: &str, from: &str, body: &str) -> Message
         muted: false,
         thread_id: String::new(),
         message_id: String::new(),
+    }
+}
+
+fn filter_rule(id: &str, mailbox: &str, action: &str, needle: &str) -> FilterRule {
+    FilterRule {
+        id: id.to_string(),
+        mailbox: mailbox.to_string(),
+        position: 1,
+        field: "subject".to_string(),
+        op: "contains".to_string(),
+        needle: needle.to_string(),
+        action: action.to_string(),
+        target_folder: None,
+        target_label: None,
+        enabled: true,
+        created_at: now_secs(),
     }
 }
 
@@ -1598,6 +1614,107 @@ async fn message_actions_star_archive_move_delete_unread() {
             .folder,
         "Trash"
     );
+}
+
+#[tokio::test]
+async fn settings_rule_run_applies_owned_rule_and_renders_banner() {
+    let state = build_dev_state().await;
+    let msg = seed_message(
+        "w33d@w33d.xyz",
+        "Retroactive receipt",
+        "alice@example.com",
+        "body",
+    );
+    state.store.store_message(&msg).await.unwrap();
+    let rule = filter_rule("fr_run", "w33d@w33d.xyz", "star", "Retroactive");
+    state.store.add_rule(&rule).await.unwrap();
+    let (token, cookie) = mint_csrf(&state).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/settings/rules")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(format!("csrf={token}&id=fr_run&cmd=run")))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("/settings?ran=fr_run&matched=1&changed=1")
+    );
+    assert!(
+        state
+            .store
+            .get_message(&msg.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .starred
+    );
+
+    let req = Request::builder()
+        .uri("/settings?ran=fr_run&matched=1&changed=1")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains(r#"<div class="spam-banner" role="note"><b>Filter applied</b><span>1 matched, 1 updated.</span></div>"#));
+    assert!(html.contains("Run now"));
+}
+
+#[tokio::test]
+async fn settings_rule_run_rejects_missing_csrf() {
+    let state = build_dev_state().await;
+    let rule = filter_rule("fr_run", "w33d@w33d.xyz", "star", "Retroactive");
+    state.store.add_rule(&rule).await.unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/settings/rules")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from("id=fr_run&cmd=run"))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn settings_rule_run_denies_other_mailbox_rule_id() {
+    let state = build_dev_state().await;
+    state
+        .store
+        .upsert_mailbox(&Mailbox {
+            addr: "alice@w33d.xyz".to_string(),
+            owner_sub: "alice".to_string(),
+        })
+        .await
+        .unwrap();
+    let rule = filter_rule("fr_alice", "alice@w33d.xyz", "star", "Secret");
+    state.store.add_rule(&rule).await.unwrap();
+    let (token, cookie) = mint_csrf(&state).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/settings/rules")
+        .header("x-auth-subject", "w33d")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie)
+        .body(Body::from(format!("csrf={token}&id=fr_alice&cmd=run")))
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let html = body_string(resp).await;
+    assert!(html.contains("Unknown rule."));
 }
 
 #[tokio::test]
