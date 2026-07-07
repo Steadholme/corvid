@@ -39,9 +39,27 @@
   --fs-h3:14.5px; --fs-eyebrow:11.5px; --track-eyebrow:.08em; --fs-stat:26px;
   --fs-sm:12px; --fs-micro:11px;
   --fw-medium:550; --fw-semibold:650;
-  --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  /* Latin (embedded Inter) first, then a cross-OS CJK fallback chain so zh/ja render with system
+     fonts (zero download bytes, fully sovereign). Regional Han forms are corrected per <html lang>
+     below. */
+  --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"PingFang SC","Hiragino Sans","Microsoft YaHei","Yu Gothic","Meiryo","Noto Sans CJK SC","Noto Sans CJK JP","Source Han Sans SC","WenQuanYi Micro Hei",sans-serif;
+  --serif:Georgia,Cambria,"Times New Roman",Times,"Songti SC","Noto Serif CJK SC","Yu Mincho","Hiragino Mincho ProN",SimSun,serif;
   --mono:"JetBrains Mono","SFMono-Regular",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
 }
+
+/* ============ i18n · CJK Han-unification (driven by the dynamic <html lang>) ============
+   Without both these :lang-scoped reorderings AND a correct <html lang>, Japanese kanji render in
+   Chinese glyph forms (a Chinese font precedes any Japanese one in the flat list above). */
+html[lang^="ja"]{
+  --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"Hiragino Sans","Yu Gothic","Meiryo","Noto Sans CJK JP","Source Han Sans JP","Noto Sans CJK SC","PingFang SC",sans-serif;
+  --serif:Georgia,Cambria,"Times New Roman",Times,"Yu Mincho","Hiragino Mincho ProN","Noto Serif CJK JP","Songti SC",serif;
+}
+html[lang^="zh"]{
+  --font:"Inter","Inter Variable",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC","WenQuanYi Micro Hei",sans-serif;
+  --serif:Georgia,Cambria,"Times New Roman",Times,"Songti SC","Noto Serif CJK SC",SimSun,serif;
+}
+/* Inter's tight negative tracking reads poorly for CJK; relax it under CJK locales. */
+html[lang^="ja"] body,html[lang^="zh"] body{ letter-spacing:normal; }
 
 /* ============ L1 semantic(组件只引这层)============ */
 :root{
@@ -51,6 +69,7 @@
   --ink:var(--c-ink-900); --ink-2:var(--c-ink-700); --ink-3:var(--c-ink-500); --ink-4:var(--c-ink-400);
   --accent:var(--c-indigo-600); --accent-2:var(--c-indigo-500); --accent-ink:var(--c-indigo-700);
   --accent-soft:var(--c-indigo-50); --accent-soft-2:var(--c-indigo-100); --ring:rgba(79,70,229,.30);
+  --brand:var(--accent); --brand-soft:var(--accent-soft); --brand-ink:color-mix(in srgb, var(--brand) 82%, var(--ink));
   --ok:var(--c-green-600); --ok-soft:var(--c-green-50); --ok-ink:var(--c-green-700);
   --warn:var(--c-amber-600); --warn-soft:var(--c-amber-50); --warn-ink:var(--c-amber-700);
   --down:var(--c-rose-600); --down-soft:var(--c-rose-50); --down-ink:var(--c-rose-700);
@@ -59,8 +78,23 @@
   /* 淡描边变体(给 pill/tag 边框) */
   --ok-border:color-mix(in srgb,var(--ok) 24%,#fff); --warn-border:color-mix(in srgb,var(--warn) 24%,#fff);
   --down-border:color-mix(in srgb,var(--down) 24%,#fff); --info-border:color-mix(in srgb,var(--info) 24%,#fff);
+  --accent-border:var(--accent-soft-2); --brand-border:color-mix(in srgb,var(--brand) 24%,#fff);
+  --scrim:color-mix(in srgb,var(--ink) 44%,transparent); --appbar-h:56px;
+  --tone-2:var(--c-indigo-600); --tone-2-soft:var(--c-indigo-50); --tone-2-ink:var(--c-indigo-700);
+  --tone-3:var(--c-green-600); --tone-3-soft:var(--c-green-50); --tone-3-ink:var(--c-green-700);
+  --tone-4:var(--c-amber-600); --tone-4-soft:var(--c-amber-50); --tone-4-ink:var(--c-amber-700);
+  --tone-5:var(--c-cyan-600); --tone-5-soft:var(--c-cyan-50); --tone-5-ink:var(--c-cyan-700);
   /* per-service 换肤覆盖点(库给默认,服务在 theme.css 重定向) */
   --app:var(--accent); --app-soft:var(--accent-soft);
   /* v1→v2 别名桥:让 baseline 服务不改 markup 即可迁移 */
   --radius:var(--r); --radius-md:var(--r-sm); --radius-sm:var(--r-xs);
+}
+
+/* ============ L1.5 · density([data-density=compact] console opt-in;默认视觉零变化)============ */
+/* 只准出现几何/字号 token;颜色、圆角、阴影、动效严禁进此块。 */
+[data-density="compact"]{
+  --tap:32px;
+  --sp-3:10px; --sp-4:12px; --sp-5:16px; --sp-6:20px; --sp-8:24px;
+  --fs-body:13.5px; --lh-body:1.45;
+  --fs-h1:20px; --fs-h2:16px; --fs-h3:13.5px; --fs-stat:22px;
 }
