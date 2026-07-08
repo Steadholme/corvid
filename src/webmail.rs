@@ -79,6 +79,7 @@ struct PagePrefs {
     density: &'static str,
     reading_pane: &'static str,
     theme: &'static str,
+    doc_theme: &'static str,
 }
 
 impl Default for PagePrefs {
@@ -87,6 +88,7 @@ impl Default for PagePrefs {
             density: DEFAULT_DENSITY,
             reading_pane: DEFAULT_READING_PANE,
             theme: DEFAULT_THEME,
+            doc_theme: DEFAULT_THEME,
         }
     }
 }
@@ -1014,7 +1016,7 @@ async fn advanced_search(
         return no_mailbox_page(&email);
     };
     let settings = settings_for_page(&state, &mb.addr).await;
-    let prefs = page_prefs(&settings);
+    let prefs = page_prefs(&settings, estate_theme(&headers));
 
     if q.has_input() {
         if let Some(search) = build_advanced_search_query(&q) {
@@ -1063,7 +1065,7 @@ async fn inbox(
         .await
         .unwrap_or_default();
     let settings = settings_for_page(&state, &mb.addr).await;
-    let prefs = page_prefs(&settings);
+    let prefs = page_prefs(&settings, estate_theme(&headers));
 
     // Label-filter view: a flat, cross-folder listing of one label's messages.
     if let Some(label_id) = q.label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1895,11 +1897,13 @@ fn undo_send_window_options(selected: i64) -> String {
     opts
 }
 
-fn page_prefs(settings: &MailboxSettings) -> PagePrefs {
+fn page_prefs(settings: &MailboxSettings, estate: &str) -> PagePrefs {
+    let theme = effective_theme(&settings.theme);
     PagePrefs {
         density: effective_density(&settings.density),
         reading_pane: effective_reading_pane(&settings.reading_pane),
-        theme: effective_theme(&settings.theme),
+        theme,
+        doc_theme: document_theme(theme, estate),
     }
 }
 
@@ -1914,7 +1918,7 @@ async fn settings_for_page(state: &AppState, mailbox: &str) -> MailboxSettings {
 }
 
 fn display_preference_options(settings: &MailboxSettings) -> (String, String, String) {
-    let prefs = page_prefs(settings);
+    let prefs = page_prefs(settings, "");
     (
         select_options_selected(&DENSITY_CHOICES, prefs.density, density_label),
         select_options_selected(
@@ -2842,7 +2846,7 @@ async fn read_message(
     // Mint/reuse a CSRF token for the read-view action buttons (star/archive/delete/move/unread).
     let (token, set_cookie) = ensure_csrf(&headers);
     let settings = settings_for_page(&state, &mb.addr).await;
-    let prefs = page_prefs(&settings);
+    let prefs = page_prefs(&settings, estate_theme(&headers));
 
     let body = render_message_body(&msg);
 
@@ -3046,7 +3050,7 @@ async fn conversation(
         return no_mailbox_page(&email);
     };
     let settings = settings_for_page(&state, &mb.addr).await;
-    let prefs = page_prefs(&settings);
+    let prefs = page_prefs(&settings, estate_theme(&headers));
     let labels = state.store.list_labels(&mb.addr).await.unwrap_or_default();
     let counts = state
         .store
@@ -3445,6 +3449,26 @@ fn effective_reading_pane(raw: &str) -> &'static str {
 
 fn effective_theme(raw: &str) -> &'static str {
     choice_or_default(raw, &THEME_CHOICES, DEFAULT_THEME)
+}
+
+fn estate_theme(headers: &HeaderMap) -> &'static str {
+    match get_cookie(headers, "__Secure-theme").as_deref() {
+        Some("dark") => "dark",
+        Some("light") => "light",
+        _ => "",
+    }
+}
+
+fn document_theme(pref: &'static str, estate: &str) -> &'static str {
+    match pref {
+        "light" | "dark" => pref,
+        "system" => match estate {
+            "dark" => "dark",
+            "light" => "light",
+            _ => "system",
+        },
+        _ => pref,
+    }
 }
 
 fn choice_or_default(raw: &str, choices: &[&'static str], default: &'static str) -> &'static str {
@@ -4181,7 +4205,7 @@ async fn compose_form(
     };
     let (token, set_cookie) = ensure_csrf(&headers);
     let settings = settings_for_page(&state, &mb.addr).await;
-    let prefs = page_prefs(&settings);
+    let prefs = page_prefs(&settings, estate_theme(&headers));
 
     // Seed the draft from the original when a reply/forward id is present (and it belongs to us).
     let mut pre = build_prefill(&state, &mb, &q).await;
@@ -6098,7 +6122,7 @@ async fn settings_page(
         &email,
         &content,
         "settings",
-        page_prefs(&settings),
+        page_prefs(&settings, estate_theme(&headers)),
     );
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
@@ -8768,7 +8792,7 @@ fn render_shell(
         .replace("{{STYLE}}", app_css())
         .replace("{{WRAP}}", wrap_mod)
         .replace("{{TITLE}}", &esc(title))
-        .replace("{{THEME}}", &esc(prefs.theme))
+        .replace("{{THEME}}", &esc(prefs.doc_theme))
         .replace("{{DENSITY}}", &esc(prefs.density))
         .replace("{{PANE}}", &esc(prefs.reading_pane))
         .replace("{{NAV}}", &nav_bar(nav_active))
@@ -9082,6 +9106,56 @@ mod tests {
         assert_eq!(effective_theme("sepia"), DEFAULT_THEME);
         assert!(parse_display_choice("right", &READING_PANE_CHOICES, "reading pane").is_ok());
         assert!(parse_display_choice("invalid", &THEME_CHOICES, "theme").is_err());
+    }
+
+    #[test]
+    fn estate_theme_folds_only_system_document_theme() {
+        let no_cookie = HeaderMap::new();
+        assert_eq!(estate_theme(&no_cookie), "");
+        for pref in ["system", "light", "dark"] {
+            assert_eq!(document_theme(pref, estate_theme(&no_cookie)), pref);
+        }
+
+        let mut dark_cookie = HeaderMap::new();
+        dark_cookie.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-csrf=abc; __Secure-theme=dark"),
+        );
+        assert_eq!(estate_theme(&dark_cookie), "dark");
+
+        let mut auto_cookie = HeaderMap::new();
+        auto_cookie.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Secure-theme=auto"),
+        );
+        assert_eq!(estate_theme(&auto_cookie), "");
+
+        assert_eq!(document_theme("system", "dark"), "dark");
+        assert_eq!(document_theme("system", "light"), "light");
+        assert_eq!(document_theme("light", "dark"), "light");
+        assert_eq!(document_theme("dark", "light"), "dark");
+
+        let mut settings = MailboxSettings::default_for("w33d@w33d.xyz");
+        settings.theme = "system".to_string();
+        let prefs = page_prefs(&settings, estate_theme(&dark_cookie));
+        assert_eq!(prefs.theme, "system");
+        assert_eq!(prefs.doc_theme, "dark");
+        let html = render_page_with_prefs("Theme", "w33d@w33d.xyz", "", "settings", prefs);
+        assert!(html.contains(r#"<html lang="en" data-theme="dark""#));
+        let (_, _, theme_opts) = display_preference_options(&settings);
+        assert!(theme_opts.contains(r#"<option value="system" selected>System</option>"#));
+
+        let prefs = page_prefs(&settings, estate_theme(&no_cookie));
+        assert_eq!(prefs.doc_theme, "system");
+        let html = render_page_with_prefs("Theme", "w33d@w33d.xyz", "", "settings", prefs);
+        assert!(html.contains(r#"<html lang="en" data-theme="system""#));
+
+        settings.theme = "light".to_string();
+        let prefs = page_prefs(&settings, estate_theme(&dark_cookie));
+        assert_eq!(prefs.theme, "light");
+        assert_eq!(prefs.doc_theme, "light");
+        let html = render_page_with_prefs("Theme", "w33d@w33d.xyz", "", "settings", prefs);
+        assert!(html.contains(r#"<html lang="en" data-theme="light""#));
     }
 
     #[tokio::test]
