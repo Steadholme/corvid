@@ -521,6 +521,13 @@ input[type="range"]:focus-visible { box-shadow:0 0 0 4px var(--ring); border-rad
 .langswitch__opt:hover{color:var(--ink);background:var(--bg-2);}
 .langswitch__opt.is-active{color:var(--accent-ink);background:var(--accent-soft);}
 
+/* 主题切换器(Light/Dark/System 三档,镜像 langswitch;appbar 内可见) */
+.themeswitch{display:inline-flex;align-items:center;gap:2px;margin-right:var(--sp-2);padding:2px;border:1px solid var(--border);border-radius:var(--r-pill);background:var(--surface);}
+.themeswitch__opt{display:grid;place-items:center;width:28px;height:24px;border-radius:var(--r-pill);color:var(--ink-3);text-decoration:none;transition:background var(--dur) var(--ease),color var(--dur) var(--ease);}
+.themeswitch__opt:hover{color:var(--ink);background:var(--bg-2);}
+.themeswitch__opt.is-active{color:var(--accent-ink);background:var(--accent-soft);}
+.themeswitch__opt svg{width:15px;height:15px;}
+
 /* ============ 16 · Micro utilities ============ */
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;}
 .clamp-2,.clamp-3{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden;}
@@ -779,3 +786,24 @@ details[open]>.accordion__head .accordion__caret{transform:rotate(180deg);}
   box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
   border-color:var(--border);
 }
+
+/* ============ §W9 · 组件暗色修补(全 [data-theme=dark] 作用域 → light 字节不变)============
+   关键裁决:不给填充控件盖 color:#fff——accent-lift(#7c86fc)已让 color:var(--surface)
+   白标签惯用法在亮 accent 上 AA 清晰(白于 #7c86fc 反而 3.15:1 退化)。这里只补真正坏的:
+   材质抬升面、select 箭头、autofill、激活段、switch 旋钮、toast、selection。 */
+/* 面内抬升面:镜像 .card(阶梯+顶部高光+hairline,无投影) */
+:root[data-theme="dark"] :is(.stat,.table-wrap,.accordion){ background:var(--surface-2); box-shadow:inset 0 1px 0 rgba(255,255,255,.05); border-color:var(--border); }
+/* 浮层:材质 + 深投影把抬起面与画布分开 */
+:root[data-theme="dark"] :is(.usermenu__pop,.pop__card,.modal__card,.drawer__panel){ background:var(--surface-2); box-shadow:inset 0 1px 0 rgba(255,255,255,.05),var(--sh-pop); border-color:var(--border); }
+/* select 箭头是 stroke='slategray' 定值 data-URI,暗底发暗 → 换抬升 ink-3 */
+:root[data-theme="dark"] .select,:root[data-theme="dark"] select{ background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>"); }
+/* -webkit-autofill 会画亮框 → 强制暗 */
+:root[data-theme="dark"] input:-webkit-autofill,:root[data-theme="dark"] textarea:-webkit-autofill{ -webkit-text-fill-color:var(--ink); caret-color:var(--ink); -webkit-box-shadow:0 0 0 1000px var(--surface) inset; }
+/* 激活段/窗口 tab 画 var(--surface) 比其 track 更暗 → 下陷;抬到 ramp 之上 + 高光 */
+:root[data-theme="dark"] :is(.segment__item.is-active,.tabs--window .tab.is-active){ background:color-mix(in srgb,var(--surface-3) 78%,#fff); box-shadow:inset 0 1px 0 rgba(255,255,255,.06),var(--sh-xs); }
+/* switch 旋钮是 var(--surface) 暗底消失 → 白旋钮(状态另由 track 色+滑动承载) */
+:root[data-theme="dark"] .switch i::before{ background:#fff; }
+/* .toast 是 bg:var(--ink) 暗色下翻成近白刺眼 → 保持暗表面 */
+:root[data-theme="dark"] .toast{ background:var(--surface-3); color:var(--ink); }
+:root[data-theme="dark"] .toast--err{ background:var(--down-soft); color:var(--down-ink); }
+:root[data-theme="dark"] ::selection{ background:color-mix(in srgb,var(--accent) 42%,transparent); color:var(--ink); }

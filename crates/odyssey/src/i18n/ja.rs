@@ -26,4 +26,8 @@ pub static TABLE: &[(&str, &str)] = &[
     ("pager.label", "ページネーション"),
     ("pager.next", "次へ"),
     ("pager.prev", "前へ"),
+    ("theme.auto", "システム"),
+    ("theme.dark", "ダーク"),
+    ("theme.label", "テーマ"),
+    ("theme.light", "ライト"),
 ];

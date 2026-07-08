@@ -113,7 +113,7 @@ pub fn resolve_locale(cookie: Option<&str>, accept_language: Option<&str>) -> Lo
 }
 
 /// Extract a cookie value by exact name from a raw `Cookie:` header (`a=1; __Secure-lang=ja`).
-fn cookie_val<'a>(cookie: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_val<'a>(cookie: &'a str, name: &str) -> Option<&'a str> {
     for part in cookie.split(';') {
         let p = part.trim();
         if let Some(rest) = p.strip_prefix(name) {

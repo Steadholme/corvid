@@ -19,6 +19,7 @@ pub mod i18n;
 pub mod icons;
 pub mod identity;
 pub mod shell;
+pub mod theme;
 
 pub use controls::{
     button, checkbox_field, field, field_err, field_hint, form, link_button, number_input,
@@ -33,6 +34,7 @@ pub use shell::{
     breadcrumb, console_head, layout_split, page_shell, pagehead, tabs, Brand, NavItem, PageChrome,
     PageHead, ShellOpts, Tab, TabsOpts, UserBox,
 };
+pub use theme::{color_scheme_meta, html_theme_attr, resolve_theme};
 
 /// Both dynamic modules in one inline script block.
 ///

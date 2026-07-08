@@ -1469,8 +1469,8 @@ mark.search-hit {
 /* 3a. Dark token VALUES — the single source of truth, shared by explicit
        `dark` and OS-followed `system`. Harmless on a light `system` root:
        these --dk-* customs simply stay unreferenced until dark applies. */
-[data-theme="dark"],
-[data-theme="system"] {
+:root[data-theme="dark"],
+:root[data-theme="system"] {
   --dk-bg:#0e1116; --dk-bg-2:#12161d;
   --dk-surface:#171b23; --dk-surface-2:#1e232c; --dk-surface-3:#262c37;
   --dk-border:#2a303b; --dk-border-2:#3a414e; --dk-hairline:#21262f;
@@ -1492,7 +1492,7 @@ mark.search-hit {
 }
 
 /* 3b. Apply for explicit dark — map each :root token onto its dark value. */
-[data-theme="dark"] {
+:root[data-theme="dark"] {
   color-scheme:dark;
   --bg:var(--dk-bg); --bg-2:var(--dk-bg-2);
   --surface:var(--dk-surface); --surface-2:var(--dk-surface-2); --surface-3:var(--dk-surface-3);
@@ -1513,21 +1513,21 @@ mark.search-hit {
 /* 3c. Hard-coded-colour fixups for explicit dark — three spots bypass tokens
        (translucent light chrome + light-background toast/undo chips) and must
        be repainted by hand. Inline body images are NOT filtered/inverted. */
-[data-theme="dark"] .appbar               { background:rgba(20,24,31,.86); }
-[data-theme="dark"] .toast                { background:var(--surface-3); color:var(--ink); }
-[data-theme="dark"] .toast--err           { background:var(--down-soft); color:var(--down-ink); }
-[data-theme="dark"] .undo-bar             { background:var(--surface-3); color:var(--ink); }
-[data-theme="dark"] .undo-bar__message    { color:var(--ink); }
-[data-theme="dark"] .undo-bar__countdown  { color:var(--ink-3); }
-[data-theme="dark"] .undo-bar .btn-undo-send        { color:var(--accent-ink); }
-[data-theme="dark"] .undo-bar .btn-undo-send:hover  { color:var(--ink); }
-[data-theme="dark"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
+:root[data-theme="dark"] .appbar               { background:rgba(20,24,31,.86); }
+:root[data-theme="dark"] .toast                { background:var(--surface-3); color:var(--ink); }
+:root[data-theme="dark"] .toast--err           { background:var(--down-soft); color:var(--down-ink); }
+:root[data-theme="dark"] .undo-bar             { background:var(--surface-3); color:var(--ink); }
+:root[data-theme="dark"] .undo-bar__message    { color:var(--ink); }
+:root[data-theme="dark"] .undo-bar__countdown  { color:var(--ink-3); }
+:root[data-theme="dark"] .undo-bar .btn-undo-send        { color:var(--accent-ink); }
+:root[data-theme="dark"] .undo-bar .btn-undo-send:hover  { color:var(--ink); }
+:root[data-theme="dark"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
 
 /* 3d. System-followed dark — identical mapping + fixups, gated by the OS
        preference. Only var() references repeat here; the hex values live once
        in 3a, so there is no second copy of the palette to keep in sync. */
 @media (prefers-color-scheme:dark) {
-  [data-theme="system"] {
+  :root[data-theme="system"] {
     color-scheme:dark;
     --bg:var(--dk-bg); --bg-2:var(--dk-bg-2);
     --surface:var(--dk-surface); --surface-2:var(--dk-surface-2); --surface-3:var(--dk-surface-3);
@@ -1544,15 +1544,15 @@ mark.search-hit {
     --sh-xs:var(--dk-sh-xs); --sh-sm:var(--dk-sh-sm); --sh-md:var(--dk-sh-md);
     --sh-lg:var(--dk-sh-lg); --sh-pop:var(--dk-sh-pop);
   }
-  [data-theme="system"] .appbar              { background:rgba(20,24,31,.86); }
-  [data-theme="system"] .toast               { background:var(--surface-3); color:var(--ink); }
-  [data-theme="system"] .toast--err          { background:var(--down-soft); color:var(--down-ink); }
-  [data-theme="system"] .undo-bar            { background:var(--surface-3); color:var(--ink); }
-  [data-theme="system"] .undo-bar__message   { color:var(--ink); }
-  [data-theme="system"] .undo-bar__countdown { color:var(--ink-3); }
-  [data-theme="system"] .undo-bar .btn-undo-send       { color:var(--accent-ink); }
-  [data-theme="system"] .undo-bar .btn-undo-send:hover { color:var(--ink); }
-  [data-theme="system"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
+  :root[data-theme="system"] .appbar              { background:rgba(20,24,31,.86); }
+  :root[data-theme="system"] .toast               { background:var(--surface-3); color:var(--ink); }
+  :root[data-theme="system"] .toast--err          { background:var(--down-soft); color:var(--down-ink); }
+  :root[data-theme="system"] .undo-bar            { background:var(--surface-3); color:var(--ink); }
+  :root[data-theme="system"] .undo-bar__message   { color:var(--ink); }
+  :root[data-theme="system"] .undo-bar__countdown { color:var(--ink-3); }
+  :root[data-theme="system"] .undo-bar .btn-undo-send       { color:var(--accent-ink); }
+  :root[data-theme="system"] .undo-bar .btn-undo-send:hover { color:var(--ink); }
+  :root[data-theme="system"] .undo-bar.is-expired .undo-bar__countdown { color:var(--ink-4); }
 }
 
 /* ============================================================================

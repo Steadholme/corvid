@@ -30,4 +30,8 @@ pub static TABLE: &[(&str, &str)] = &[
     ("pager.label", "Pagination"),
     ("pager.next", "Next"),
     ("pager.prev", "Previous"),
+    ("theme.auto", "System"),
+    ("theme.dark", "Dark"),
+    ("theme.label", "Theme"),
+    ("theme.light", "Light"),
 ];

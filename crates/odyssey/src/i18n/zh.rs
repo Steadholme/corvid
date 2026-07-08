@@ -27,4 +27,8 @@ pub static TABLE: &[(&str, &str)] = &[
     ("pager.label", "分页"),
     ("pager.next", "下一页"),
     ("pager.prev", "上一页"),
+    ("theme.auto", "跟随系统"),
+    ("theme.dark", "深色"),
+    ("theme.label", "主题"),
+    ("theme.light", "浅色"),
 ];

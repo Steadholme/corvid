@@ -44,6 +44,11 @@ pub struct ShellOpts {
     /// `ShellOpts { locale: odyssey::resolve_locale(cookie, accept_language), ..Default::default() }`.
     pub locale: Locale,
     pub compact: bool,
+    /// The resolved colour theme — `"light"` (default), `"dark"`, or `"auto"`. Drives the
+    /// `<html data-theme>` attribute and the `color-scheme` meta. `"light"` stamps NOTHING (the
+    /// output stays byte-identical to the pre-theme era); a service opts in with
+    /// `ShellOpts { theme: odyssey::resolve_theme(cookie), ..Default::default() }`.
+    pub theme: &'static str,
 }
 
 impl Default for ShellOpts {
@@ -54,6 +59,7 @@ impl Default for ShellOpts {
             body_class: "",
             locale: Locale::En,
             compact: false,
+            theme: "light",
         }
     }
 }
@@ -93,14 +99,26 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
     } else {
         format!(" style=\"--app:{}\"", esc(chrome.brand.accent))
     };
+    // Theme stamping is LIGHT-first: light emits neither the `data-theme` attr nor the
+    // `color-scheme` meta, keeping the output byte-identical to the pre-theme era.
+    let theme_attr = crate::theme::html_theme_attr(opts.theme);
+    let color_scheme_meta = if theme_attr.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<meta name=\"color-scheme\" content=\"{}\">\n",
+            crate::theme::color_scheme_meta(opts.theme)
+        )
+    };
 
     format!(
         concat!(
             "<!doctype html>\n",
-            "<html lang=\"{lang}\">\n",
+            "<html lang=\"{lang}\"{theme_attr}>\n",
             "<head>\n",
             "<meta charset=\"utf-8\">\n",
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n",
+            "{color_scheme_meta}",
             "<title>{title}</title>\n",
             "<style>{css}{extra_css}</style>\n",
             "{head_extra}\n",
@@ -113,7 +131,7 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
             "</a>",
             "{nav}",
             "<span class=\"appbar__spacer\"></span>",
-            "<div class=\"appbar__right\">{switcher}{userbox}</div>",
+            "<div class=\"appbar__right\">{theme_switcher}{switcher}{userbox}</div>",
             "</header>\n",
             "<main class=\"console\">{body}</main>\n",
             "{footer}\n",
@@ -121,6 +139,8 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
             "</html>\n"
         ),
         lang = opts.locale.bcp47(),
+        theme_attr = theme_attr,
+        color_scheme_meta = color_scheme_meta,
         title = esc(chrome.title),
         css = APP_CSS,
         extra_css = opts.extra_css,
@@ -131,6 +151,7 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
         brand_name = esc(chrome.brand.name),
         brand_sub = esc(chrome.brand.sub),
         nav = nav,
+        theme_switcher = render_theme_switcher(opts.theme, opts.locale),
         switcher = render_switcher(opts.locale),
         userbox = render_userbox(&chrome.user, opts.locale),
         body = body,
@@ -160,6 +181,51 @@ fn render_switcher(locale: Locale) -> String {
             l.code(),
             current,
             esc(t(locale, key)).0
+        ));
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// The estate theme switcher: three icon toggles (Light / Dark / System) linking the gateway-owned
+/// `/_gw/theme?to=…` endpoint, which sets the display-only `__Secure-theme` cookie (Domain=.w33d.xyz,
+/// OUTSIDE both gateway HMACs) and bounces back. Pure SSR — works with no JavaScript; the current
+/// theme is marked active. Icons are inline SVG (sun / moon / monitor), sovereign and zero-network.
+fn render_theme_switcher(theme: &str, locale: Locale) -> String {
+    // (code, i18n key, inline SVG path body) for each state.
+    const OPTS: [(&str, &str, &str); 3] = [
+        (
+            "light",
+            "theme.light",
+            "<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4\"/>",
+        ),
+        (
+            "dark",
+            "theme.dark",
+            "<path d=\"M12 3a6.5 6.5 0 0 0 9 9 9 9 0 1 1-9-9Z\"/>",
+        ),
+        (
+            "auto",
+            "theme.auto",
+            "<rect x=\"2\" y=\"3\" width=\"20\" height=\"14\" rx=\"2\"/><path d=\"M8 21h8M12 17v4\"/>",
+        ),
+    ];
+    let label = esc(t(locale, "theme.label")).0;
+    let mut out = format!(
+        "<div class=\"themeswitch\" role=\"group\" aria-label=\"{}\">",
+        label
+    );
+    for (code, key, svg) in OPTS {
+        let (active, current) = if code == theme {
+            (" is-active", " aria-current=\"true\"")
+        } else {
+            ("", "")
+        };
+        let title = esc(t(locale, key)).0;
+        out.push_str(&format!(
+            "<a class=\"themeswitch__opt{}\" href=\"/_gw/theme?to={}\" title=\"{}\" aria-label=\"{}\"{}>\
+<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">{}</svg></a>",
+            active, code, title, title, current, svg
         ));
     }
     out.push_str("</div>");
@@ -426,6 +492,58 @@ mod tests {
         assert!(out.contains("href=\"/_gw/lang?to=ja\">日本語"));
         // The active locale is marked.
         assert!(out.contains("langswitch__opt is-active\" href=\"/_gw/lang?to=en\""));
+    }
+
+    #[test]
+    fn shell_stamps_theme_light_first() {
+        // Light (default): NO data-theme attr on <html>, NO color-scheme meta — byte-invariant tag.
+        // (The dark ramp `:root[data-theme=dark]` + `color-scheme:dark` live inside APP_CSS, so the
+        // assertions target the html tag / meta tag specifically, not the whole document.)
+        let light = page_shell(chrome(), Html::default(), ShellOpts::default());
+        assert!(light.contains("<html lang=\"en\">\n"));
+        assert!(!light.contains("<html lang=\"en\" data-theme"));
+        assert!(!light.contains("<meta name=\"color-scheme\""));
+
+        // Dark: data-theme attr glued onto <html> + the color-scheme meta.
+        let dark = page_shell(
+            chrome(),
+            Html::default(),
+            ShellOpts {
+                theme: "dark",
+                ..Default::default()
+            },
+        );
+        assert!(dark.contains("<html lang=\"en\" data-theme=\"dark\">"));
+        assert!(dark.contains("<meta name=\"color-scheme\" content=\"dark\">"));
+
+        // Auto: media-gated ramp advertises both schemes.
+        let auto = page_shell(
+            chrome(),
+            Html::default(),
+            ShellOpts {
+                theme: "auto",
+                ..Default::default()
+            },
+        );
+        assert!(auto.contains("<html lang=\"en\" data-theme=\"auto\">"));
+        assert!(auto.contains("<meta name=\"color-scheme\" content=\"light dark\">"));
+    }
+
+    #[test]
+    fn shell_renders_theme_switcher() {
+        // Three icon toggles linking the gateway theme endpoint; current theme marked active.
+        let dark = page_shell(
+            chrome(),
+            Html::default(),
+            ShellOpts {
+                theme: "dark",
+                ..Default::default()
+            },
+        );
+        assert!(dark.contains("href=\"/_gw/theme?to=light\""));
+        assert!(dark.contains("href=\"/_gw/theme?to=dark\""));
+        assert!(dark.contains("href=\"/_gw/theme?to=auto\""));
+        assert!(dark.contains("themeswitch__opt is-active\" href=\"/_gw/theme?to=dark\""));
     }
 
     #[test]
