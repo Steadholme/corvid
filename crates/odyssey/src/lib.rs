@@ -93,6 +93,10 @@ mod tests {
         assert!(WIRE_JS.contains("odyssey-wire v1"));
         assert!(WIRE_JS.contains("data-wire-target"));
         assert!(WIRE_JS.contains("data-wire-select"));
+        // Boost region navigation (mark a shell scope; nav links go instant, no full reload).
+        assert!(WIRE_JS.contains("data-wire-nav"));
+        assert!(WIRE_JS.contains("data-wire-off"));
+        assert!(WIRE_JS.contains("aria-current"));
         assert!(WIRE_JS.contains("wire:before"));
         assert!(WIRE_JS.contains("window.OdysseyWire"));
         assert!(WIRE_JS.contains("toast--ok"));
