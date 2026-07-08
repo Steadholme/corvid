@@ -344,6 +344,16 @@ const WEBMAIL_JS: &str = r#"
     if (/\/m\/[^/]+\/action$/.test(form.getAttribute('action') || '')) enhanceAction(form);
   });
 
+  // ---- view-transition open tile stamp (pane=off list -> read) -----------
+  document.addEventListener('mousedown', function (e) {
+    var link = e.target && e.target.closest ? e.target.closest('a.mailrow') : null;
+    if (!link) return;
+    if ((window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) || !document.startViewTransition || document.querySelector('.mailbox-layout')) return;
+    document.querySelectorAll('.co-tile.co-open').forEach(function (tile) { tile.classList.remove('co-open'); });
+    var tile = link.querySelector('.co-tile');
+    if (tile) tile.classList.add('co-open');
+  });
+
   // ---- multi-select + sticky bulk toolbar --------------------------------
   var bar = document.querySelector('[data-bulkbar]');
   if (bar) {
@@ -406,6 +416,8 @@ const WEBMAIL_JS: &str = r#"
     document.addEventListener('keydown', function (e) {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
       var t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      if (e.key === 'c') { e.preventDefault(); location.href = '/compose'; return; }
+      if (e.key === '/') { var search = document.querySelector('.search-box input[type=search]'); if (search) { e.preventDefault(); search.focus(); } return; }
       var rs = rows(); if (!rs.length) return; var i = cursorIndex(rs), cur = i >= 0 ? rs[i] : null;
       function clickBtn(val) { if (!cur || !cur.getAttribute('data-id')) return; var b = cur.querySelector('button[name=op][value=' + val + ']'); if (b) { e.preventDefault(); b.click(); setCursor(Math.min(i, rows().length - 1)); } }
       switch (e.key) {
@@ -416,6 +428,27 @@ const WEBMAIL_JS: &str = r#"
         case 'e': clickBtn('archive'); break;
         case '#': clickBtn('delete'); break;
         case 'r': if (cur && cur.getAttribute('data-id')) { e.preventDefault(); location.href = '/compose?reply=' + encodeURIComponent(cur.getAttribute('data-id')); } break;
+        case 's': if (cur) clickBtn(cur.getAttribute('data-starred') === 'true' ? 'unstar' : 'star'); break;
+      }
+    });
+  }
+
+  // ---- keyboard shortcuts (pane=off read view) ---------------------------
+  var readPane = document.querySelector('[data-read-pane]');
+  if (readPane && !document.querySelector('.maillist')) {
+    document.addEventListener('keydown', function (e) {
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+      var t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      var form = readPane.querySelector('form.row-actions');
+      function go(sel) { var a = readPane.querySelector(sel); if (a) { e.preventDefault(); location.href = a.getAttribute('href'); } }
+      function clickRead(val) { var b = form && form.querySelector('button[name=op][value=' + val + ']'); if (b) { e.preventDefault(); b.click(); } }
+      switch (e.key) {
+        case 'r': go('.msg-actions a[href^="/compose?reply="]'); break;
+        case 'f': go('.msg-actions a[href^="/compose?forward="]'); break;
+        case 'a':
+        case 'e': clickRead('archive'); break;
+        case '#': clickRead('delete'); break;
+        case 's': var star = form && form.querySelector('button[name=op][value=star],button[name=op][value=unstar]'); if (star) { e.preventDefault(); star.click(); } break;
       }
     });
   }
@@ -869,7 +902,10 @@ async fn healthz() -> impl IntoResponse {
 /// optimistic actions + multi-select bulk toolbar + keyboard nav + conversation collapse). Served
 /// as a cacheable static asset (not inlined) so the pages carry no inline `<script>`.
 async fn asset_webmail_js() -> Response {
-    js_asset(&format!("{TOAST_JS}\n{WEBMAIL_JS}"))
+    js_asset(&format!(
+        "{TOAST_JS}\n{WEBMAIL_JS}\n{}",
+        odyssey::MOTION_JS
+    ))
 }
 
 /// `GET /assets/compose.js` — the compose bundle (contacts autocomplete + toast + subject counter,
@@ -1535,7 +1571,7 @@ fn render_undo_bar(batch_id: Option<&str>, undo_until: Option<&str>, token: &str
 /// each action redirects back to.
 fn render_message_list(rows: &str, prefs: PagePrefs) -> String {
     format!(
-        r#"<section class="card mail-list-pane mail-list-pane--{density}" data-density="{density}"><ul class="maillist maillist--{density}" data-density="{density}">{rows}</ul></section>"#,
+        r#"<section class="card mail-list-pane mail-list-pane--{density}" data-density="{density}"><ul class="maillist maillist--{density}" data-density="{density}" data-motion-list>{rows}</ul></section>"#,
         density = esc(prefs.density),
     )
 }
@@ -1602,6 +1638,17 @@ fn render_row_inner(
     let from = query
         .map(|q| highlight_search_hits(&from_display, q))
         .unwrap_or_else(|| esc(&from_display));
+    let (from_name, from_addr) = from_display_parts(&m.msg_from);
+    let avatar_key = if from_addr.is_empty() {
+        from_name.as_str()
+    } else {
+        from_addr.as_str()
+    };
+    let tile = format!(
+        r#"<span class="co-tile avatar--h{hue}" aria-hidden="true">{initial}</span>"#,
+        hue = avatar_hue(avatar_key),
+        initial = esc(&avatar_initial(&from_name, &from_addr)),
+    );
     let star = star_mark(m.starred);
     let unread = if m.seen {
         String::new()
@@ -1636,7 +1683,7 @@ fn render_row_inner(
         format!("/m/{}", url_encode(&m.id))
     };
     format!(
-        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls} mailrow--{density}" href="{href}"><span class="{dot}"></span>{unread}<span class="star-slot">{star}</span><span class="from">{from}</span><span class="subject"><span class="subj-text">{subject}</span>{snip}</span>{att}<span class="date" title="{date_full}">{date}</span></a>{actions}</li>"#,
+        r#"<li class="mailrow-wrap {state_cls}" data-id="{id}" data-starred="{starred}" data-seen="{seen}" data-snooze-until="{snooze_until}" data-muted="{muted}"><label class="mailcheck"><input type="checkbox" class="rowcheck" aria-label="Select message"></label><a class="{cls} mailrow--{density}" href="{href}"><span class="{dot}"></span>{unread}<span class="star-slot">{star}</span>{tile}<span class="from">{from}</span><span class="subject"><span class="subj-text">{subject}</span>{snip}</span>{att}<span class="date" title="{date_full}">{date}</span></a>{actions}</li>"#,
         id = esc(&m.id),
         href = esc(&href),
         density = esc(prefs.density),
@@ -1645,6 +1692,7 @@ fn render_row_inner(
         snooze_until = m.snooze_until,
         muted = m.muted,
         state_cls = state_cls,
+        tile = tile,
         from = from,
         snip = snip_html,
         att = att,
@@ -2885,7 +2933,7 @@ async fn read_message(
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
       {convo}
     </div>
-    {actions}
+    <div class="co-actionbar">{actions}</div>
     {labels}
   </header>
   {spam_banner}
@@ -4206,7 +4254,7 @@ async fn compose_form(
 
     let content = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
-<section class="card pad compose-card">
+<section class="card pad compose-card co-composer">
   <div class="page-head"><h1>New message</h1></div>
   <form method="post" action="/send" enctype="multipart/form-data" data-current-signature-text="{current_signature_text}" data-current-signature-html="{current_signature_html}">
     <input type="hidden" name="csrf" value="{token}">
@@ -4239,7 +4287,7 @@ async fn compose_form(
         <button class="btn btn-ghost btn-sm" type="button" data-cmd="clear" title="Clear formatting" aria-label="Clear formatting">Tx</button>
       </div>
       {template_controls}
-      <div id="body-rich" class="compose-rich" role="textbox" aria-multiline="true" contenteditable="true" data-source="body" hidden></div>
+      <div id="body-rich" class="compose-rich" role="textbox" aria-multiline="true" contenteditable="true" data-source="body" data-placeholder="Write your message…" hidden></div>
       <textarea id="body" name="body">{body}</textarea>
     </div>
     <div class="field"><label for="attachments">Attachments</label><input id="attachments" name="attachments" type="file" multiple>{attachment_list}</div>
@@ -4247,8 +4295,7 @@ async fn compose_form(
       <span class="autosave-status" data-autosave-status aria-live="polite"></span>
       <div class="send-split">
         <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
-        {schedule_controls}
-        <button class="btn btn-ghost btn-schedule-send" type="submit" name="action" value="schedule">Schedule send</button>
+        <details class="co-schedule"><summary aria-label="Schedule send"></summary><div class="co-schedule__panel">{schedule_controls}<button class="btn btn-ghost btn-schedule-send" type="submit" name="action" value="schedule">Schedule send</button></div></details>
       </div>
       <button class="btn btn-ghost" type="submit" name="action" value="draft">Save draft</button>
       <a class="btn btn-ghost btn-sm" href="/">Cancel</a>

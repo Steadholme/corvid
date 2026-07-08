@@ -1610,3 +1610,72 @@ mark.search-hit {
      two lines instead of squeezing side-by-side. */
   .contact-duplicate { flex-wrap:wrap; }
 }
+
+/* ── 1 · BRAND · Raven ink-blue (single accent-family override; --brand/--app derive) ── */
+:root{
+  --accent:#37468a; --accent-2:#4a5aa6; --accent-ink:#2c3970;
+  --accent-soft:#eceffb; --accent-soft-2:#dde2f6; --ring:rgba(55,70,138,.32);
+}
+
+/* ── 2 · W8 held shell (each name unique per document) ── */
+.mail-side{ view-transition-name:co-mailside; }
+.mail-foot{ view-transition-name:co-mailfoot; }
+.mail-side__item.is-active{ view-transition-name:ody-tab-active; } /* inherits motion.css:31 group timing */
+/* .mail-main intentionally UNNAMED → content rides the free root fade+rise (motion.css:19-22) */
+
+/* ── 3 · Reading-pane split holds (only emitted when pane!=off) ── */
+.mailbox-layout > .mail-list-pane{ view-transition-name:co-listcol; }
+.mailbox-layout > .read-pane{ view-transition-name:co-readcol; }
+
+/* ── 4 · List row: sender tile (reuses avatar--h* pairs) + unread wash + cursor ── */
+.co-tile{ width:32px; height:32px; flex:none; border-radius:var(--r-sm); display:grid; place-items:center;
+  font-size:13px; font-weight:var(--fw-semibold); letter-spacing:0; }
+.mailrow--compact .co-tile{ width:26px; height:26px; font-size:12px; }
+.mailrow-wrap:not(.is-selected) .mailrow.unseen{ background:color-mix(in srgb,var(--accent-soft) 55%,var(--surface)); }
+.mailrow-wrap.is-cursor{ box-shadow:inset 3px 0 0 var(--brand), var(--elev-raised); } /* overrides service.css:331 */
+
+/* ── 5 · Money-shot morph anchors (one per side) ── */
+.co-tile.co-open{ view-transition-name:co-opentile; }        /* JS-stamped on the clicked row, pane=off only */
+.read-pane--message .msg-avatar{ view-transition-name:co-opentile; } /* unique: read-pane--message only at webmail.rs:2878 */
+
+/* ── 6 · Read view: two-tier action zone + comfortable measure (no shared-fn change) ── */
+.co-actionbar{ display:flex; flex-direction:column; gap:10px; margin-top:12px; }
+.co-actionbar .msg-actions{ order:0; } /* reply group first, brand-primary already */
+.co-actionbar .row-actions{ order:1; display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+  padding-top:10px; border-top:1px solid var(--hairline); }
+.co-actionbar .row-actions .move-select,
+.co-actionbar .row-actions .snooze-menu,
+.co-actionbar .row-actions .schedule-custom{ font-size:12.5px; color:var(--ink-3); margin-left:auto; } /* de-emphasize */
+.msg-body{ max-inline-size:70ch; } /* Proton-grade measure; sanitize output byte-identical */
+
+/* ── 7 · Compose sheet zones + split-send disclosure + dropzone ── */
+.co-composer .page-head{ display:flex; align-items:center; gap:12px; padding-bottom:14px; margin-bottom:8px; border-bottom:1px solid var(--hairline); }
+.co-composer .page-head h1{ font-size:19px; margin:0; }
+.co-composer .page-head .autosave-status{ margin-left:auto; } /* the "Draft saved" pill slot */
+.co-composer .page-head::before{ content:""; flex:none; width:30px; height:30px; border-radius:var(--r-sm); background:var(--brand);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='m3 7 9 6 9-6'/></svg>") center/17px no-repeat;
+          mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='5' width='18' height='14' rx='2'/><path d='m3 7 9 6 9-6'/></svg>") center/17px no-repeat; }
+.compose-card #to{ font-size:15px; font-weight:550; }
+.compose-card #from{ color:var(--ink-2); }
+.chip{ background:var(--brand-soft); color:var(--brand-ink); border:1px solid var(--brand-border); }
+.combo__list{ box-shadow:var(--sh-pop); border-radius:var(--r-md); padding:6px; }
+.combo__opt{ border-radius:var(--r-xs); }
+.combo__opt.is-active,.combo__opt:hover{ background:var(--brand-soft); }
+.send-split .btn-primary{ border-radius:var(--r-sm) 0 0 var(--r-sm); }
+.send-split .btn-primary::after{ content:none; }
+.co-schedule{ position:relative; display:inline-flex; }
+.co-schedule>summary{ list-style:none; cursor:pointer; width:34px; height:38px; margin-left:-1px; display:inline-flex; align-items:center; justify-content:center;
+  background:var(--brand); border:1px solid var(--brand); border-left-color:color-mix(in srgb,#fff 34%,var(--brand)); border-radius:0 var(--r-sm) var(--r-sm) 0; }
+.co-schedule>summary::-webkit-details-marker{ display:none; }
+.co-schedule>summary::after{ content:""; width:14px; height:14px; background:var(--surface);
+  -webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>") center/contain no-repeat;
+          mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'><path d='m6 9 6 6 6-6'/></svg>") center/contain no-repeat; }
+.co-schedule__panel{ position:absolute; top:calc(100% + 8px); left:0; z-index:20; min-width:236px; padding:12px; display:flex; flex-direction:column; gap:10px;
+  background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-md); box-shadow:var(--sh-pop); }
+.co-schedule__panel .schedule-menu,.co-schedule__panel .schedule-custom{ width:100%; }
+.compose-card #attachments{ display:block; width:100%; padding:16px; cursor:pointer; font-size:13px; color:var(--ink-3); background:var(--surface-2);
+  border:1.5px dashed var(--border-2); border-radius:var(--r-sm); transition:border-color var(--dur) var(--ease), background var(--dur) var(--ease); }
+.compose-card #attachments:hover{ border-color:var(--brand); background:var(--brand-soft); color:var(--brand-ink); }
+.compose-card #attachments::file-selector-button{ margin-right:12px; padding:6px 12px; font-weight:600; cursor:pointer; color:var(--ink-2); background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs); }
+
+/* Reduced-motion floor for all co- groups is inherited from motion.css:41-46 — no extra guard needed. */

@@ -86,6 +86,7 @@ fn check(target_repo: &Path) -> Result<(), String> {
 fn canonical_files() -> io::Result<Vec<PathBuf>> {
     let mut files = vec![PathBuf::from("Cargo.toml")];
     collect_files(Path::new("css"), &mut files)?;
+    collect_files(Path::new("js"), &mut files)?;
     collect_files(Path::new("src"), &mut files)?;
     files.sort();
     Ok(files)
@@ -142,6 +143,7 @@ fn stamp_for(path: &Path) -> &'static str {
     match path.extension().and_then(OsStr::to_str) {
         Some("rs") => "// GENERATED FROM odyssey — DO NOT EDIT\n",
         Some("css") => "/* GENERATED FROM odyssey — DO NOT EDIT */\n",
+        Some("js") => "// GENERATED FROM odyssey — DO NOT EDIT\n",
         Some("toml") => "# GENERATED FROM odyssey — DO NOT EDIT\n",
         _ => "// GENERATED FROM odyssey — DO NOT EDIT\n",
     }

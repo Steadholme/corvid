@@ -455,6 +455,9 @@ input[type="range"]:focus-visible { box-shadow:0 0 0 4px var(--ring); border-rad
 .toast--err { background:var(--down-ink); }
 .toast--err .toast__ico { color:var(--surface); background:color-mix(in srgb, var(--surface) 22%, transparent); }
 
+[hidden]{display:none!important;}
+[data-spark-cloak]{display:none!important;}
+
 /* ============ 13 · Modal / dialog(缺口补件)============ */
 .modal {
   position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:var(--sp-5);
@@ -757,3 +760,22 @@ details[open]>.accordion__head .accordion__caret{transform:rotate(180deg);}
 .notif-badge[hidden],.notif-badge.is-empty{display:none;}
 .notif-badge-wrap{position:relative;display:inline-flex;}
 .notif-badge-wrap>.notif-badge{position:absolute;top:-6px;right:-6px;}
+
+/* ============ W8 · frost 工具 + 暗色材质(随 motion 层)============ */
+/* 磨砂表面:支持 backdrop-filter 时半透明+模糊,否则回退不透明 --surface(零破坏)。 */
+.surface--frost{ background:var(--surface); }
+@supports ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  .surface--frost{
+    background:var(--frost-bg);
+    -webkit-backdrop-filter:var(--frost-blur);
+    backdrop-filter:var(--frost-blur);
+  }
+}
+/* 暗色下"深度靠材质"而非投影:抬升面提亮一档 + 顶部高光 + 发光边(暗底阴影不可见)。
+   仅当显式 opt-in 暗色时生效;light 默认输出逐字节不变。 */
+:root[data-theme="dark"] .card,
+:root[data-theme="dark"] .surface--raised{
+  background:var(--surface-2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+  border-color:var(--border);
+}

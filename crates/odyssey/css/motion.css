@@ -1,0 +1,46 @@
+/* GENERATED FROM odyssey — DO NOT EDIT */
+/* ============================================================================
+   Odyssey · motion.css — W8 跨文档 View Transitions + 运动地基
+   ----------------------------------------------------------------------------
+   全 estate 第一份运动层。核心是 100% CSS、零 JS 的跨文档 View Transitions:
+   SSR 整页导航自动交叉淡入,持久 shell 元素跨页 morph 而非白闪。
+   - 不支持 View Transitions 的浏览器:@view-transition / view-transition-name
+     被静默忽略 → 普通导航,零破坏。
+   - prefers-reduced-motion:本文件末尾的守卫覆盖 components.css 的全局
+     `*{animation:none}` 够不到的 ::view-transition-* 伪元素 + WAAPI。
+   view-transition-name 约定:一律 ody- 前缀,且【每个渲染文档内必须唯一】——
+   重复的 name 会静默中止【整个】过渡。canonical 只命名【共享 shell】;
+   各服务在自己的 theme/service.css 里命名自有 chrome。
+   ============================================================================ */
+
+/* 让新旧两个文档都 opt-in(跨文档过渡的硬性要求) */
+@view-transition{ navigation:auto; }
+
+/* 根过渡:旧文档快速淡出,新文档淡入 + 6px 上浮 */
+::view-transition-old(root){ animation-duration:var(--vt-out); animation-timing-function:var(--vt-ease); }
+::view-transition-new(root){ animation:ody-vt-rise var(--vt-dur) var(--vt-ease) both; }
+@keyframes ody-vt-rise{ from{ opacity:0; transform:translateY(6px); } }
+
+/* 共享 shell 命名:任何用了这些 canonical class 的服务,re-vendor 后免费获得
+   "导航时 shell 定住不动"。这些 class 在一个页面内天然唯一。 */
+.appbar{ view-transition-name:ody-appbar; }
+.site-foot{ view-transition-name:ody-footer; }
+.pagehead h1{ view-transition-name:ody-page-title; }
+
+/* 命名组过渡的统一节奏(如滑动激活指示条 ody-tab-active) */
+::view-transition-group(ody-tab-active){ animation-duration:var(--dur-3); animation-timing-function:var(--ease-out); }
+
+/* 静态元素进场 + 到达高亮(WAAPI 与 CSS 双通道用) */
+[data-motion-enter]{ animation:ody-rise var(--dur-3) var(--ease-out) both; }
+@keyframes ody-rise{ from{ opacity:0; transform:translateY(6px); } }
+@keyframes ody-line-flash{ 0%{ background:color-mix(in srgb,var(--warn) 22%,transparent); } 100%{ background:transparent; } }
+
+/* ---- prefers-reduced-motion 硬开关 ----
+   components.css:513 的 `*{animation:none}` 是后代选择器,够不到 ::view-transition-*
+   伪元素(它们不是 * 的后代)。这里补齐,让"减少动效"真的把过渡也关掉。 */
+@media (prefers-reduced-motion:reduce){
+  ::view-transition-group(*),
+  ::view-transition-image-pair(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*){ animation:none !important; }
+}

@@ -98,3 +98,55 @@ html[lang^="ja"] body,html[lang^="zh"] body{ letter-spacing:normal; }
   --fs-body:13.5px; --lh-body:1.45;
   --fs-h1:20px; --fs-h2:16px; --fs-h3:13.5px; --fs-stat:22px;
 }
+
+/* ============ L1.6 · motion / elevation / frost(W8 运动层地基)============
+   缓动/时长词汇 + 高度阶梯 + 磨砂令牌。--ease-out 与旧 --ease 逐字节同值,
+   故 --ease→var(--ease-out) 是纯别名(渲染零变化)。旧 --dur:140ms 保留不动。
+   跨文档 View Transitions 的实际规则住 motion.css。 */
+:root{
+  /* 缓动:全程 ease-out 收尾;spring 仅留给 toggle/check 的亚感知微交互 */
+  --ease-out:cubic-bezier(.2,.6,.25,1);
+  --ease-in-out:cubic-bezier(.65,0,.35,1);
+  --ease-spring:cubic-bezier(.32,1.22,.62,1);
+  --ease:var(--ease-out);
+  /* 时长梯:120–320ms,GitHub/Linear 式克制 */
+  --dur-1:120ms; --dur-2:180ms; --dur-3:240ms; --dur-4:320ms;
+  /* View Transition 标量 */
+  --vt-dur:200ms; --vt-out:140ms; --vt-ease:var(--ease-out);
+  /* 高度阶梯:纯别名映射 --sh-*,严禁重命名原语(30+ 调用点) */
+  --elev-rest:none; --elev-raised:var(--sh-sm); --elev-hover:var(--sh-md);
+  --elev-sticky:var(--sh-md); --elev-overlay:var(--sh-lg); --elev-modal:var(--sh-pop);
+  /* z 层级 */
+  --z-sticky:20; --z-nav:30; --z-dropdown:40; --z-overlay:60; --z-toast:80;
+  /* 磨砂(@supports 守卫,不支持时 components 回退不透明 --surface) */
+  --frost-bg:color-mix(in srgb, var(--surface) 82%, transparent);
+  --frost-blur:saturate(1.4) blur(12px);
+}
+
+/* ============ 暗色主题 scaffold(一等 opt-in;light 为不可变默认)============
+   仅当 <html data-theme="dark">(显式)或 data-theme="auto"+系统暗色 时生效。
+   本轮不落地任何 toggle、不给任何服务盖章 → 光色输出逐字节不变、零测试/截图翻转。
+   语义名不变,只是把 L1 映射改指一套暗色 L0 值(GitHub/Linear 暗调)。 */
+:root[data-theme="dark"], :root[data-theme="auto"]{
+  --c-white:#161b22;
+  --bg:#0d1117; --bg-2:#010409;
+  --surface:#161b22; --surface-2:#1c2128; --surface-3:#21262d;
+  --border:#30363d; --border-2:#3d444d; --hairline:#21262d;
+  --ink:#e6edf3; --ink-2:#adbac7; --ink-3:#768390; --ink-4:#636e7b;
+  --accent:var(--c-indigo-500); --accent-2:#818cf8; --accent-ink:#a5b4fc;
+  --accent-soft:#1c2333; --accent-soft-2:#232b3d;
+  --brand:var(--accent); --brand-soft:var(--accent-soft);
+  --ok:#3fb950; --ok-soft:#12261a; --ok-ink:#56d364;
+  --warn:#d29922; --warn-soft:#271c0e; --warn-ink:#e3b341;
+  --down:#f85149; --down-soft:#2a1416; --down-ink:#ff7b72;
+  --info:#39c5cf; --info-soft:#0e2a2c; --info-ink:#56d4dd;
+  /* 暗色下阴影改用更深的投影(浅色 rgba 在暗底不可见) */
+  --sh-xs:0 1px 1px rgba(1,4,9,.5);
+  --sh-sm:0 1px 2px rgba(1,4,9,.6),0 1px 3px rgba(1,4,9,.5);
+  --sh-md:0 4px 12px rgba(1,4,9,.6),0 2px 4px rgba(1,4,9,.5);
+  --sh-lg:0 12px 32px rgba(1,4,9,.7),0 4px 8px rgba(1,4,9,.5);
+  --sh-pop:0 8px 28px rgba(1,4,9,.75);
+}
+@media (prefers-color-scheme:dark){
+  :root[data-theme="auto"]{ color-scheme:dark; }
+}
