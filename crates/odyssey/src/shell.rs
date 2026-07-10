@@ -2,7 +2,7 @@
 use crate::html::{esc, raw, Html};
 use crate::i18n::{t, Locale};
 use crate::icons;
-use crate::APP_CSS;
+use crate::{dynamic_scripts_with, RuntimeOpts, APP_CSS};
 
 pub struct Brand {
     pub tile_svg: &'static str,
@@ -64,6 +64,46 @@ impl Default for ShellOpts {
     }
 }
 
+/// Additive dynamic-shell options for Odyssey Wire navigation.
+///
+/// The generated app navigation swaps the children of the named `<main>` region. The fields are
+/// private so the integration contract can grow without breaking downstream struct literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireShellOpts<'a> {
+    region_id: &'a str,
+    runtime: RuntimeOpts<'a>,
+}
+
+impl<'a> WireShellOpts<'a> {
+    pub const fn new(region_id: &'a str) -> Self {
+        Self {
+            region_id,
+            runtime: RuntimeOpts::new(),
+        }
+    }
+
+    pub const fn runtime(mut self, runtime: RuntimeOpts<'a>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    pub const fn with_motion(mut self) -> Self {
+        self.runtime = self.runtime.with_motion();
+        self
+    }
+
+    pub const fn with_nonce(mut self, nonce: &'a str) -> Self {
+        self.runtime = self.runtime.with_nonce(nonce);
+        self
+    }
+}
+
+impl<'a> Default for WireShellOpts<'a> {
+    fn default() -> Self {
+        Self::new("odyssey-main")
+    }
+}
+
 pub struct PageHead<'a> {
     pub eyebrow: Option<&'a str>,
     pub glyph: Option<Html>,
@@ -81,6 +121,29 @@ pub struct PageChrome<'a> {
 }
 
 pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String {
+    page_shell_impl(chrome, body, opts, None)
+}
+
+/// Render the standard shell with Wire-boosted app navigation and the internal runtime bundle.
+///
+/// This is additive to [`page_shell`]: existing services keep byte-identical static output, while
+/// dynamic services get a stable main-region id, `data-wire-nav`, and Wire/Spark scripts. Motion
+/// and a CSP nonce are opt-in through [`WireShellOpts`].
+pub fn wire_page_shell(
+    chrome: PageChrome<'_>,
+    body: Html,
+    opts: ShellOpts,
+    wire: WireShellOpts<'_>,
+) -> String {
+    page_shell_impl(chrome, body, opts, Some(wire))
+}
+
+fn page_shell_impl(
+    chrome: PageChrome<'_>,
+    body: Html,
+    opts: ShellOpts,
+    wire: Option<WireShellOpts<'_>>,
+) -> String {
     let mut body_attr = String::new();
     if !opts.body_class.is_empty() {
         body_attr.push_str(&format!(" class=\"{}\"", esc(opts.body_class)));
@@ -88,7 +151,14 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
     if opts.compact {
         body_attr.push_str(" data-density=\"compact\"");
     }
-    let nav = render_nav(chrome.nav);
+    let wire_target = wire.map(|opts| format!("#{}", opts.region_id));
+    let nav = render_nav(chrome.nav, wire_target.as_deref());
+    let main_attr = wire
+        .map(|opts| format!(" id=\"{}\"", esc(opts.region_id)))
+        .unwrap_or_default();
+    let runtime_scripts = wire
+        .map(|opts| format!("{}\n", dynamic_scripts_with(opts.runtime)))
+        .unwrap_or_default();
     let footer = if chrome.footer.as_str().is_empty() {
         String::new()
     } else {
@@ -133,8 +203,9 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
             "<span class=\"appbar__spacer\"></span>",
             "<div class=\"appbar__right\">{theme_switcher}{switcher}{userbox}</div>",
             "</header>\n",
-            "<main class=\"console\">{body}</main>\n",
+            "<main{main_attr} class=\"console\">{body}</main>\n",
             "{footer}\n",
+            "{runtime_scripts}",
             "</body>\n",
             "</html>\n"
         ),
@@ -146,6 +217,7 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
         extra_css = opts.extra_css,
         head_extra = opts.head_extra,
         body_attr = body_attr,
+        main_attr = main_attr,
         tile_style = tile_style,
         tile_svg = raw(chrome.brand.tile_svg),
         brand_name = esc(chrome.brand.name),
@@ -155,8 +227,32 @@ pub fn page_shell(chrome: PageChrome<'_>, body: Html, opts: ShellOpts) -> String
         switcher = render_switcher(opts.locale),
         userbox = render_userbox(&chrome.user, opts.locale),
         body = body,
-        footer = footer
+        footer = footer,
+        runtime_scripts = runtime_scripts
     )
+}
+
+/// Render the standard app navigation as a standalone Wire boost scope.
+///
+/// `target` is a CSS selector such as `#odyssey-main`. Attribute names are fixed and the selector,
+/// link URLs, and labels are HTML-escaped.
+pub fn wire_nav(nav: &[NavItem], target: &str) -> Html {
+    raw(render_nav(nav, Some(target)))
+}
+
+/// The estate language switcher as standalone markup, for services that render their OWN shell
+/// (not [`page_shell`]) and want the switcher in their appbar. Emits the SAME SSR markup
+/// `page_shell` uses: three script-native autonyms linking `/_gw/lang?to=…`, current locale marked
+/// active, `role="group" aria-label="Language"`, zero JavaScript. Pair it with `locale.bcp47()` on
+/// `<html lang>` and a per-request [`resolve_locale`](crate::resolve_locale).
+pub fn lang_switcher(locale: Locale) -> Html {
+    raw(render_switcher(locale))
+}
+
+/// The estate theme switcher as standalone markup, for own-shell services (see [`lang_switcher`]).
+/// `theme` is the resolved `light` | `dark` | `auto`.
+pub fn theme_switcher(theme: &str, locale: Locale) -> Html {
+    raw(render_theme_switcher(theme, locale))
 }
 
 /// The estate language switcher: three script-native autonyms linking to the gateway-owned
@@ -335,18 +431,27 @@ pub fn pagehead(h: PageHead<'_>) -> Html {
     ))
 }
 
-fn render_nav(nav: &[NavItem]) -> String {
+fn render_nav(nav: &[NavItem], wire_target: Option<&str>) -> String {
     if nav.is_empty() {
         return String::new();
     }
 
-    let mut out = String::from("<nav class=\"appbar__nav\">");
+    let wire_attr = wire_target
+        .map(|target| format!(" data-wire-nav=\"{}\"", esc(target)))
+        .unwrap_or_default();
+    let mut out = format!("<nav class=\"appbar__nav\"{wire_attr}>");
     for item in nav {
         let active = if item.active { " is-active" } else { "" };
+        let current = if item.active {
+            " aria-current=\"page\""
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "<a class=\"appnav{}\" href=\"{}\">{}<span>{}</span></a>",
+            "<a class=\"appnav{}\" href=\"{}\"{}>{}<span>{}</span></a>",
             active,
             esc(item.href),
+            current,
             raw(item.icon),
             esc(item.label)
         ));
@@ -431,6 +536,21 @@ fn local_part(email: &str) -> String {
 mod tests {
     use super::*;
 
+    static NAV: [NavItem; 2] = [
+        NavItem {
+            href: "/services",
+            label: "Services",
+            icon: "",
+            active: true,
+        },
+        NavItem {
+            href: "/deploys?state=running&region=fsn1",
+            label: "Deploys & jobs",
+            icon: "",
+            active: false,
+        },
+    ];
+
     fn chrome() -> PageChrome<'static> {
         PageChrome {
             title: "Test",
@@ -447,6 +567,12 @@ mod tests {
             },
             footer: Html::default(),
         }
+    }
+
+    fn chrome_with_nav() -> PageChrome<'static> {
+        let mut chrome = chrome();
+        chrome.nav = &NAV;
+        chrome
     }
 
     #[test]
@@ -651,5 +777,104 @@ mod tests {
             },
         );
         assert!(compact_with_class.contains("<body class=\"console-x\" data-density=\"compact\">"));
+    }
+
+    #[test]
+    fn lang_switcher_standalone_matches_page_shell() {
+        // The exported switcher (for own-shell services) renders the three autonyms, the /_gw/lang
+        // links, the group aria-label, and marks the current locale active.
+        let sw = lang_switcher(Locale::Ja).0;
+        assert!(sw.contains("aria-label=\"Language\""));
+        assert!(sw.contains("/_gw/lang?to=en"));
+        assert!(sw.contains("/_gw/lang?to=zh"));
+        assert!(sw.contains("/_gw/lang?to=ja"));
+        assert!(sw.contains("is-active"));
+        assert!(sw.contains("aria-current=\"true\""));
+        // It is byte-identical to what page_shell embeds for the same locale.
+        let full = page_shell(
+            chrome(),
+            Html::default(),
+            ShellOpts {
+                locale: Locale::Ja,
+                ..Default::default()
+            },
+        );
+        assert!(full.contains(&sw));
+        // theme_switcher is likewise exported and links the gateway theme endpoint.
+        assert!(theme_switcher("dark", Locale::En)
+            .0
+            .contains("/_gw/theme?to="));
+    }
+
+    #[test]
+    fn wire_nav_is_a_typed_escaped_boost_scope() {
+        let nav = wire_nav(&NAV, "#workspace\" onmouseover=\"bad");
+
+        assert!(nav.as_str().starts_with(
+            "<nav class=\"appbar__nav\" data-wire-nav=\"#workspace&quot; onmouseover=&quot;bad\">"
+        ));
+        assert!(nav
+            .as_str()
+            .contains("href=\"/deploys?state=running&amp;region=fsn1\""));
+        assert!(nav.as_str().contains("Deploys &amp; jobs"));
+        assert!(nav
+            .as_str()
+            .contains("class=\"appnav is-active\" href=\"/services\" aria-current=\"page\""));
+        assert_eq!(nav.as_str().matches("aria-current=\"page\"").count(), 1);
+        assert!(!nav.as_str().contains("\" onmouseover=\""));
+    }
+
+    #[test]
+    fn wire_page_shell_connects_nav_region_and_default_runtime() {
+        let out = wire_page_shell(
+            chrome_with_nav(),
+            raw("<section id=\"services\">Ready</section>"),
+            ShellOpts::default(),
+            WireShellOpts::default(),
+        );
+
+        assert!(out.contains("<nav class=\"appbar__nav\" data-wire-nav=\"#odyssey-main\">"));
+        assert!(out.contains(
+            "<main id=\"odyssey-main\" class=\"console\"><section id=\"services\">Ready</section></main>"
+        ));
+        assert_eq!(out.matches("<script").count(), 1);
+        assert!(out.contains("odyssey-wire v1"));
+        assert!(out.contains("odyssey-spark v1"));
+        assert!(!out.contains("odyssey-motion v1"));
+        assert!(out.find("odyssey-wire v1") < out.find("odyssey-spark v1"));
+    }
+
+    #[test]
+    fn wire_page_shell_can_add_motion_and_a_csp_nonce() {
+        let out = wire_page_shell(
+            chrome_with_nav(),
+            Html::default(),
+            ShellOpts {
+                head_extra: raw("<meta name=\"application-name\" content=\"Ops\">"),
+                ..Default::default()
+            },
+            WireShellOpts::new("workspace")
+                .with_motion()
+                .with_nonce("request-42\" data-bad=\"x"),
+        );
+
+        assert!(out.contains("<main id=\"workspace\" class=\"console\">"));
+        assert!(out.contains("data-wire-nav=\"#workspace\""));
+        assert!(out.contains("<meta name=\"application-name\" content=\"Ops\">"));
+        assert!(out.contains("<script nonce=\"request-42&quot; data-bad=&quot;x\">"));
+        assert!(!out.contains("\" data-bad=\""));
+        assert!(out.contains("odyssey-motion v1"));
+        assert!(out.find("odyssey-spark v1") < out.find("odyssey-motion v1"));
+    }
+
+    #[test]
+    fn static_page_shell_keeps_legacy_markup_and_scripts_opt_in() {
+        let out = page_shell(chrome_with_nav(), Html::default(), ShellOpts::default());
+
+        assert!(out.contains("<nav class=\"appbar__nav\">"));
+        assert!(!out.contains("<nav class=\"appbar__nav\" data-wire-nav"));
+        assert!(out.contains("<main class=\"console\"></main>"));
+        assert!(!out.contains("<main id="));
+        assert!(!out.contains("<script"));
     }
 }

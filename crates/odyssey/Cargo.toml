@@ -6,7 +6,3 @@ edition = "2021"
 
 [lib]
 path = "src/lib.rs"
-
-[[bin]]
-name = "odyssey-vendor"
-path = "src/bin/vendor.rs"

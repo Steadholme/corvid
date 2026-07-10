@@ -21,17 +21,12 @@ pub mod zh;
 
 /// The supported UI locales. `repr(u8)` mirrors the catalog selector; add a locale by adding a
 /// variant, a `mod`, a `TABLE`, and the `table()`/`bcp47()`/`code()` arms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Locale {
+    #[default]
     En,
     Zh,
     Ja,
-}
-
-impl Default for Locale {
-    fn default() -> Self {
-        Locale::En
-    }
 }
 
 impl Locale {
@@ -141,7 +136,11 @@ fn negotiate(al: &str) -> Option<Locale> {
                 q = qs.parse().unwrap_or(0.0);
             }
         }
-        let primary = tag.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+        let primary = tag
+            .split(['-', '_'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let loc = match primary.as_str() {
             "zh" => Some(Locale::Zh),
             "ja" => Some(Locale::Ja),
@@ -149,7 +148,7 @@ fn negotiate(al: &str) -> Option<Locale> {
             _ => None,
         };
         if let Some(l) = loc {
-            if best.map_or(true, |(bq, _)| q > bq) {
+            if best.is_none_or(|(bq, _)| q > bq) {
                 best = Some((q, l));
             }
         }
@@ -209,7 +208,10 @@ const EN_MONTHS: [&str; 12] = [
 /// and Japanese use the numeric `N月` form via [`fmt_date`], so this returns `""` for them.
 pub fn month_abbr(locale: Locale, m: u8) -> &'static str {
     match locale {
-        Locale::En => EN_MONTHS.get(m.saturating_sub(1) as usize).copied().unwrap_or(""),
+        Locale::En => EN_MONTHS
+            .get(m.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(""),
         _ => "",
     }
 }
@@ -235,7 +237,7 @@ pub fn fmt_int(_locale: Locale, n: i64) -> String {
         out.push('-');
     }
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -255,7 +257,12 @@ mod tests {
     fn tables_are_sorted_by_key() {
         for (name, tbl) in tables() {
             for w in tbl.windows(2) {
-                assert!(w[0].0 < w[1].0, "{name} not sorted: {:?} !< {:?}", w[0].0, w[1].0);
+                assert!(
+                    w[0].0 < w[1].0,
+                    "{name} not sorted: {:?} !< {:?}",
+                    w[0].0,
+                    w[1].0
+                );
             }
         }
     }
@@ -272,7 +279,10 @@ mod tests {
         let has_en = |k: &str| en::TABLE.binary_search_by(|(kk, _)| (*kk).cmp(k)).is_ok();
         for (name, tbl) in [("zh", zh::TABLE), ("ja", ja::TABLE)] {
             for (k, _) in tbl {
-                assert!(has_en(k), "{name} key {k} is not in en (untranslatable / typo)");
+                assert!(
+                    has_en(k),
+                    "{name} key {k} is not in en (untranslatable / typo)"
+                );
             }
         }
     }
@@ -285,9 +295,15 @@ mod tests {
             Locale::Ja
         );
         // Unknown cookie value falls through to Accept-Language.
-        assert_eq!(resolve_locale(Some("__Secure-lang=fr"), Some("zh-CN")), Locale::Zh);
+        assert_eq!(
+            resolve_locale(Some("__Secure-lang=fr"), Some("zh-CN")),
+            Locale::Zh
+        );
         // No cookie → Accept-Language negotiation (highest q wins).
-        assert_eq!(resolve_locale(None, Some("fr;q=1.0, ja;q=0.9, en;q=0.2")), Locale::Ja);
+        assert_eq!(
+            resolve_locale(None, Some("fr;q=1.0, ja;q=0.9, en;q=0.2")),
+            Locale::Ja
+        );
         // Unsupported tags are skipped, not defaulted on.
         assert_eq!(resolve_locale(None, Some("fr, de")), Locale::En);
         // Nothing → default En.
@@ -314,8 +330,14 @@ mod tests {
 
     #[test]
     fn tf_interpolates_named_args() {
-        assert_eq!(tf(Locale::En, "clips.saved", &[("n", "3")]), "Saved 3 clips");
-        assert_eq!(tf(Locale::Zh, "clips.saved", &[("n", "3")]), "已保存 3 条剪辑");
+        assert_eq!(
+            tf(Locale::En, "clips.saved", &[("n", "3")]),
+            "Saved 3 clips"
+        );
+        assert_eq!(
+            tf(Locale::Zh, "clips.saved", &[("n", "3")]),
+            "已保存 3 条剪辑"
+        );
     }
 
     #[test]

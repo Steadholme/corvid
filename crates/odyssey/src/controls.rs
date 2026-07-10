@@ -43,6 +43,107 @@ impl Default for BtnOpts {
 
 pub struct Csrf<'a>(pub &'a str);
 
+/// The HTML replacement mode used by Odyssey Wire.
+///
+/// This mirrors the audited runtime allowlist; callers cannot emit an arbitrary
+/// `data-wire-swap` value through the typed helpers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WireSwap {
+    #[default]
+    Outer,
+    Inner,
+    Append,
+    Prepend,
+    Delete,
+}
+
+impl WireSwap {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Outer => "outer",
+            Self::Inner => "inner",
+            Self::Append => "append",
+            Self::Prepend => "prepend",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Typed, allowlisted Odyssey Wire attributes for links and forms.
+///
+/// Values are always HTML-escaped and attribute names are fixed by Odyssey.
+/// Keeping the fields private also lets the contract grow without breaking
+/// downstream struct literals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WireOpts<'a> {
+    target: &'a str,
+    select: Option<&'a str>,
+    swap: WireSwap,
+    busy: Option<&'a str>,
+    success: Option<&'a str>,
+    error: Option<&'a str>,
+    push_history: bool,
+    optimistic_delete: bool,
+}
+
+impl<'a> WireOpts<'a> {
+    pub const fn new(target: &'a str) -> Self {
+        Self {
+            target,
+            select: None,
+            swap: WireSwap::Outer,
+            busy: None,
+            success: None,
+            error: None,
+            push_history: false,
+            optimistic_delete: false,
+        }
+    }
+
+    pub const fn select(mut self, selector: &'a str) -> Self {
+        self.select = Some(selector);
+        self
+    }
+
+    pub const fn swap(mut self, swap: WireSwap) -> Self {
+        self.swap = swap;
+        self.optimistic_delete = false;
+        self
+    }
+
+    pub const fn busy_label(mut self, label: &'a str) -> Self {
+        self.busy = Some(label);
+        self
+    }
+
+    pub const fn success_message(mut self, message: &'a str) -> Self {
+        self.success = Some(message);
+        self
+    }
+
+    pub const fn error_message(mut self, message: &'a str) -> Self {
+        self.error = Some(message);
+        self
+    }
+
+    /// Push the final response URL into browser history for a wired link or GET form.
+    /// POST forms deliberately ignore this option to avoid replayable mutation entries.
+    pub const fn push_history(mut self) -> Self {
+        self.push_history = true;
+        self
+    }
+
+    /// Remove a wired form's target immediately and restore it if the request fails.
+    /// The runtime only permits optimistic updates for delete swaps, so this builder
+    /// selects that mode atomically. Link helpers intentionally ignore this flag so a
+    /// state-changing optimistic action cannot be issued as an unsafe GET.
+    pub const fn optimistic_delete(mut self) -> Self {
+        self.swap = WireSwap::Delete;
+        self.optimistic_delete = true;
+        self
+    }
+}
+
 pub fn button(label: &str, v: Variant, o: BtnOpts) -> Html {
     let classes = btn_classes(v, o);
     let busy = if o.busy {
@@ -60,6 +161,29 @@ pub fn button(label: &str, v: Variant, o: BtnOpts) -> Html {
 }
 
 pub fn link_button(href: &str, label: &str, v: Variant, o: BtnOpts) -> Html {
+    link_button_impl(href, label, v, o, "")
+}
+
+/// A progressively enhanced button-link backed by Odyssey Wire.
+///
+/// The ordinary `href` remains present, so navigation still works without JavaScript.
+pub fn link_button_with_wire(
+    href: &str,
+    label: &str,
+    v: Variant,
+    o: BtnOpts,
+    wire: WireOpts<'_>,
+) -> Html {
+    link_button_impl(
+        href,
+        label,
+        v,
+        o,
+        &render_wire_attrs(wire, WireElement::Link),
+    )
+}
+
+fn link_button_impl(href: &str, label: &str, v: Variant, o: BtnOpts, wire_attrs: &str) -> Html {
     let classes = btn_classes(v, o);
     let busy = if o.busy {
         " aria-busy=\"true\" aria-disabled=\"true\""
@@ -67,27 +191,111 @@ pub fn link_button(href: &str, label: &str, v: Variant, o: BtnOpts) -> Html {
         ""
     };
     Html(format!(
-        "<a class=\"{}\" href=\"{}\" role=\"button\"{}>{}</a>",
+        "<a class=\"{}\" href=\"{}\" role=\"button\"{}{}>{}</a>",
         classes,
         esc(href),
         busy,
+        wire_attrs,
+        esc(label)
+    ))
+}
+
+/// A plain progressively enhanced link backed by Odyssey Wire.
+pub fn link_with_wire(href: &str, label: &str, wire: WireOpts<'_>) -> Html {
+    Html(format!(
+        "<a href=\"{}\"{}>{}</a>",
+        esc(href),
+        render_wire_attrs(wire, WireElement::Link),
         esc(label)
     ))
 }
 
 pub fn form(method: &'static str, action: &str, csrf: Csrf<'_>, body: Html) -> Html {
-    Html(format!(
-        concat!(
-            "<form method=\"{}\" action=\"{}\">",
+    form_impl(method, action, csrf, body, "", true)
+}
+
+/// A progressively enhanced form backed by Odyssey Wire.
+///
+/// The native method and action are retained as the no-JavaScript floor. Mutation forms include
+/// the CSRF field; GET forms omit it so secrets never leak into URLs or browser history.
+pub fn form_with_wire(
+    method: &'static str,
+    action: &str,
+    csrf: Csrf<'_>,
+    body: Html,
+    wire: WireOpts<'_>,
+) -> Html {
+    let is_get = method.eq_ignore_ascii_case("get");
+    form_impl(
+        method,
+        action,
+        csrf,
+        body,
+        &render_wire_attrs(wire, WireElement::Form(is_get)),
+        !is_get,
+    )
+}
+
+fn form_impl(
+    method: &'static str,
+    action: &str,
+    csrf: Csrf<'_>,
+    body: Html,
+    wire_attrs: &str,
+    include_csrf: bool,
+) -> Html {
+    let csrf_field = if include_csrf {
+        format!(
             "<input type=\"hidden\" name=\"csrf_token\" value=\"{}\">",
-            "{}",
-            "</form>"
-        ),
+            esc(csrf.0)
+        )
+    } else {
+        String::new()
+    };
+    Html(format!(
+        "<form method=\"{}\" action=\"{}\"{}>{}{}</form>",
         esc(method),
         esc(action),
-        esc(csrf.0),
+        wire_attrs,
+        csrf_field,
         body
     ))
+}
+
+#[derive(Clone, Copy)]
+enum WireElement {
+    Form(bool),
+    Link,
+}
+
+fn render_wire_attrs(wire: WireOpts<'_>, element: WireElement) -> String {
+    let action = match element {
+        WireElement::Form(_) => "submit",
+        WireElement::Link => "get",
+    };
+    let mut out = format!(
+        " data-wire=\"{}\" data-wire-target=\"{}\" data-wire-swap=\"{}\"",
+        action,
+        esc(wire.target),
+        wire.swap.as_str()
+    );
+    for (name, value) in [
+        ("data-wire-select", wire.select),
+        ("data-wire-busy", wire.busy),
+        ("data-wire-ok", wire.success),
+        ("data-wire-err", wire.error),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!(" {name}=\"{}\"", esc(value)));
+        }
+    }
+    if matches!(element, WireElement::Link | WireElement::Form(true)) && wire.push_history {
+        out.push_str(" data-wire-push");
+    }
+    if matches!(element, WireElement::Form(_)) && wire.optimistic_delete {
+        out.push_str(" data-wire-optimistic");
+    }
+    out
 }
 
 pub fn field(label: &str, control: Html) -> Html {
@@ -413,5 +621,134 @@ mod tests {
             .as_str()
             .contains("placeholder=\"&quot;notes&quot;\""));
         assert!(textarea.as_str().contains("Keep &lt;safe&gt;"));
+    }
+
+    #[test]
+    fn wired_form_keeps_native_contract_and_emits_allowlisted_attributes() {
+        let html = form_with_wire(
+            "post",
+            "/services?scope=a&scope=b",
+            Csrf("token<&\""),
+            Html::default(),
+            WireOpts::new("#service-grid")
+                .select("#fresh-grid")
+                .swap(WireSwap::Inner)
+                .busy_label("Saving <now>")
+                .success_message("Saved & replicated")
+                .error_message("Try \"again\"")
+                .push_history(),
+        );
+
+        assert!(html.as_str().starts_with(
+            "<form method=\"post\" action=\"/services?scope=a&amp;scope=b\" data-wire=\"submit\""
+        ));
+        assert!(html.as_str().contains("data-wire-target=\"#service-grid\""));
+        assert!(html.as_str().contains("data-wire-select=\"#fresh-grid\""));
+        assert!(html.as_str().contains("data-wire-swap=\"inner\""));
+        assert!(html
+            .as_str()
+            .contains("data-wire-busy=\"Saving &lt;now&gt;\""));
+        assert!(html
+            .as_str()
+            .contains("data-wire-ok=\"Saved &amp; replicated\""));
+        assert!(html
+            .as_str()
+            .contains("data-wire-err=\"Try &quot;again&quot;\""));
+        assert!(!html.as_str().contains("data-wire-push"));
+        assert!(html
+            .as_str()
+            .contains("name=\"csrf_token\" value=\"token&lt;&amp;&quot;\""));
+
+        let get = form_with_wire(
+            "get",
+            "/services",
+            Csrf("must-not-leak"),
+            Html::default(),
+            WireOpts::new("#service-grid").push_history(),
+        );
+        assert!(get.as_str().contains("data-wire-push"));
+        assert!(!get.as_str().contains("csrf_token"));
+        assert!(!get.as_str().contains("must-not-leak"));
+    }
+
+    #[test]
+    fn wired_links_preserve_href_and_avoid_unsafe_optimistic_gets() {
+        let wire = WireOpts::new("#service-grid")
+            .swap(WireSwap::Inner)
+            .push_history();
+        let button = link_button_with_wire(
+            "/services/7?confirm=1&hard=0",
+            "Remove <relay>",
+            Variant::Danger,
+            BtnOpts::default(),
+            wire,
+        );
+
+        assert!(button
+            .as_str()
+            .contains("href=\"/services/7?confirm=1&amp;hard=0\""));
+        assert!(button
+            .as_str()
+            .contains("role=\"button\" data-wire=\"get\""));
+        assert!(button.as_str().contains("data-wire-swap=\"inner\""));
+        assert!(button.as_str().contains("data-wire-push"));
+        assert!(!button.as_str().contains("data-wire-optimistic"));
+        assert!(button.as_str().contains("Remove &lt;relay&gt;"));
+
+        let plain = link_with_wire("/next", "Next", WireOpts::new("#main"));
+        assert!(plain
+            .as_str()
+            .starts_with("<a href=\"/next\" data-wire=\"get\""));
+
+        let unsafe_get = link_with_wire(
+            "/delete",
+            "Delete",
+            WireOpts::new("#row-7").optimistic_delete(),
+        );
+        assert!(unsafe_get.as_str().contains("data-wire-swap=\"delete\""));
+        assert!(!unsafe_get.as_str().contains("data-wire-optimistic"));
+    }
+
+    #[test]
+    fn wire_values_cannot_break_out_into_unreviewed_attributes() {
+        let html = link_with_wire(
+            "/safe",
+            "Safe",
+            WireOpts::new("#main\" onclick=\"alert(1)").success_message("ok\" autofocus=\"true"),
+        );
+
+        assert!(html.as_str().contains("#main&quot; onclick=&quot;alert(1)"));
+        assert!(html.as_str().contains("ok&quot; autofocus=&quot;true"));
+        assert!(!html.as_str().contains("\" onclick=\""));
+        assert!(!html.as_str().contains("\" autofocus=\""));
+
+        let reset = link_with_wire(
+            "/safe",
+            "Safe",
+            WireOpts::new("#main")
+                .optimistic_delete()
+                .swap(WireSwap::Append),
+        );
+        assert!(reset.as_str().contains("data-wire-swap=\"append\""));
+        assert!(!reset.as_str().contains("data-wire-optimistic"));
+
+        let delete_form = form_with_wire(
+            "post",
+            "/rows/7/delete",
+            Csrf("token"),
+            Html::default(),
+            WireOpts::new("#row-7").optimistic_delete(),
+        );
+        assert!(delete_form.as_str().contains("data-wire-swap=\"delete\""));
+        assert!(delete_form.as_str().contains("data-wire-optimistic"));
+    }
+
+    #[test]
+    fn legacy_form_and_link_button_remain_unwired() {
+        let legacy_form = form("post", "/save", Csrf("token"), Html::default());
+        let legacy_link = link_button("/next", "Next", Variant::Primary, BtnOpts::default());
+
+        assert!(!legacy_form.as_str().contains("data-wire"));
+        assert!(!legacy_link.as_str().contains("data-wire"));
     }
 }

@@ -8,7 +8,7 @@
 //! never forge identity, only repaint. Three states:
 //!
 //! * `light`  — the default; `<html>` gets NO `data-theme` attr so light output stays byte-identical
-//!              to the pre-theme era (a hard contract: `beacon` asserts light token bytes).
+//!   to the pre-theme era (a hard contract: `beacon` asserts light token bytes).
 //! * `dark`   — `<html data-theme="dark">`; the dark ramp applies unconditionally.
 //! * `auto`   — `<html data-theme="auto">`; the dark ramp is media-gated by `prefers-color-scheme`.
 //!

@@ -3,7 +3,10 @@
 (function(d,w){
   'use strict';
   if(window.OdysseyWire)return;
-  var version='1',inFlight=new WeakMap(),links=new WeakMap(),popCtl=null;
+  var version='1',inFlight=new WeakMap(),links=new WeakMap(),popCtl=null,wireIndex=0,scrolls={};
+  var bootWire=history.state&&history.state.odysseyWire;
+  if(bootWire&&typeof bootWire.index==='number')wireIndex=bootWire.index;
+  scrolls[wireIndex]=history.state&&typeof history.state.owy==='number'?history.state.owy:(w.pageYOffset||0);
   function fire(el,n,detail,cancel){return el.dispatchEvent(new CustomEvent(n,{bubbles:true,cancelable:!!cancel,detail:detail}));}
   function warn(s){if(w.console&&console.warn)console.warn('odyssey-wire: '+s);}
   function cookie(n){var p=d.cookie?d.cookie.split('; '):[];for(var i=0;i<p.length;i++){var e=p[i].indexOf('=');if(e>-1&&p[i].slice(0,e)===n)return decodeURIComponent(p[i].slice(e+1));}return '';}
@@ -17,13 +20,52 @@
     if(/(^|\s)external(\s|$)/.test(a.getAttribute('rel')||''))return null;
     var region=boostRegion(a);if(!region)return null;
     var u=urlOf(a.getAttribute('href'));if(!u||u.href===w.location.href)return null;
+    // Gateway control endpoints (/_gw/theme, /_gw/lang, /_gw/auth/*) set a cookie + redirect; they
+    // repaint <html>/<head> which a region inner-swap never touches. Never boost them — full nav.
+    if(u.pathname.indexOf('/_gw/')===0)return null;
     if(u.pathname===w.location.pathname&&u.search===w.location.search&&u.hash)return null;
     return{u:u,region:region};
   }
+  function reduced(){return w.matchMedia&&w.matchMedia('(prefers-reduced-motion:reduce)').matches;}
+  // Run the DOM mutation inside a View Transition when boost-navigating: prefer OdysseyMotion
+  // (shared timing) but fall back to a direct startViewTransition so boost animates even if the
+  // motion module was not loaded; plain call when VT is unsupported or motion is reduced.
+  function vtCommit(commit,vt){
+    if(vt&&!reduced()){
+      if(w.OdysseyMotion&&w.OdysseyMotion.swap){w.OdysseyMotion.swap(commit);return;}
+      if(d.startViewTransition){d.startViewTransition(commit);return;}
+    }
+    commit();
+  }
+  // Scroll: forward boost nav lands at the top (like a normal link); back/forward restores the
+  // saved position. history.scrollRestoration=manual so the browser does not fight us.
+  try{if('scrollRestoration' in history)history.scrollRestoration='manual';}catch(e){}
+  function wireState(c){return{t:c.t,s:c.s,m:c.m,vt:c.vt};}
+  function historyEntry(raw){
+    if(raw&&typeof raw.index==='number')return{index:raw.index,incoming:raw.incoming||null,outgoing:raw.outgoing||null};
+    if(raw&&raw.t)return{index:wireIndex,incoming:raw,outgoing:raw};
+    return{index:wireIndex,incoming:null,outgoing:null};
+  }
+  function historyWire(raw,from){
+    if(!raw)return null;
+    if(raw.t)return raw;
+    if(typeof raw.index!=='number')return null;
+    if(raw.index<from)return raw.outgoing||raw.incoming;
+    if(raw.index>from)return raw.incoming||raw.outgoing;
+    return raw.incoming||raw.outgoing;
+  }
+  function saveScroll(c,y){try{
+    var s=Object.assign({},history.state||{}),entry=historyEntry(s.odysseyWire);
+    y=y==null?(w.pageYOffset||0):y;entry.index=wireIndex;if(c)entry.outgoing=wireState(c);
+    s.odysseyWire=entry;s.owy=y;scrolls[wireIndex]=y;history.replaceState(s,'');
+  }catch(e){}}
+  function trackScroll(){saveScroll(null,w.pageYOffset||0);}
+  function flushScroll(){saveScroll(null,Object.prototype.hasOwnProperty.call(scrolls,wireIndex)?scrolls[wireIndex]:(w.pageYOffset||0));}
   function markCurrent(){
-    var links=d.querySelectorAll('[data-wire-nav] a[href]'),here=w.location.pathname+w.location.search,i,a,lu;
-    for(i=0;i<links.length;i++){a=links[i];if(a.hasAttribute('data-wire-off')){a.removeAttribute('aria-current');continue;}
-      lu=urlOf(a.getAttribute('href'));if(lu&&(lu.pathname+lu.search)===here)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');}
+    var links=d.querySelectorAll('[data-wire-nav] a[href]'),i,a,lu,current;
+    for(i=0;i<links.length;i++){a=links[i];if(a.hasAttribute('data-wire-off')){a.removeAttribute('aria-current');a.classList.remove('is-active');continue;}
+      lu=urlOf(a.getAttribute('href'));current=!!(lu&&lu.pathname===w.location.pathname&&(!lu.search||lu.search===w.location.search));
+      if(current)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');a.classList.toggle('is-active',current);}
   }
   function toast(msg,ok){
     if(!msg)return;
@@ -55,7 +97,7 @@
     if(!u)return null;
     fd=new FormData(form);
     if(submitter&&submitter.name)fd.append(submitter.name,submitter.value);
-    if(method==='GET'){new URLSearchParams(fd).forEach(function(v,k){u.searchParams.append(k,v);});}
+    if(method==='GET'){u.search=new URLSearchParams(fd).toString();}
     else{
       if(!addCookieCsrf(fd))return null;
       if((form.enctype||'').toLowerCase()==='multipart/form-data')body=fd;
@@ -100,7 +142,7 @@
   function rollback(snaps){snaps.forEach(function(x){x.n.classList.remove('is-removing');if(!x.n.parentNode&&x.p)x.p.insertBefore(x.n,x.next);});}
   function finish(trigger,evt,detail,inserted){fire(trigger.isConnected?trigger:(inserted&&inserted[0])||d,evt,detail);}
   function run(trigger,req,c,submitter,push){
-    var before={url:req.url.href,method:req.method,targets:c.t,submitter:submitter||null};
+    var before={url:req.url.href,method:req.method,targets:c.t,submitter:submitter||null},originY=push?(w.pageYOffset||0):0;
     if(!fire(trigger,'wire:before',before,true))return false;
     var ctl=new AbortController(),snaps=null;
     if(trigger.tagName==='A'){var old=links.get(trigger);if(old)old.abort();links.set(trigger,ctl);}
@@ -115,28 +157,35 @@
         for(var i=0;i<c.t.length;i++){cur=q(d,c.t[i]);fresh=q(doc,c.s[i]);if(!cur||!fresh){w.location.assign(ru.href);return null;}pairs.push([cur,fresh,c.t[i]]);}
         var active=focusedIn(pairs.map(function(p){return p[0];})),ins=[];
         function commit(){pairs.forEach(function(p){var n=apply(c.m,p[0],p[1]);ins.push(n);fire(n,'odyssey:swap',{url:res.url,mode:c.m,selector:p[2]});});restoreFocus(active,ins);}
-        if(c.vt&&w.OdysseyMotion&&w.OdysseyMotion.swap)w.OdysseyMotion.swap(commit);else commit();
+        vtCommit(commit,c.vt);
         return{res:res,nodes:ins};
       });
     }).then(function(out){
       if(!out)return;
+      if(push){
+        var incoming=wireState(c),next=wireIndex+1,destY=c.vt?0:(w.pageYOffset||0);
+        saveScroll(c,originY);
+        history.pushState({odysseyWire:{index:next,incoming:incoming,outgoing:null},owy:destY},'',out.res.url);
+        wireIndex=next;scrolls[wireIndex]=destY;if(c.vt)w.scrollTo(0,0);
+      }
       finish(trigger,'wire:after',{url:out.res.url,status:out.res.status,redirected:out.res.redirected,targets:c.t},out.nodes);
       toast(trigger.getAttribute('data-wire-ok'),true);
-      if(push)history.pushState({odysseyWire:{t:c.t,s:c.s,m:c.m,vt:c.vt}},'',out.res.url);
     }).catch(function(err){
       if(snaps)rollback(snaps);
+      if(err&&err.name==='AbortError')return;
       fire(trigger,'wire:error',{status:err&&err.status||0,error:err});
       toast(trigger.getAttribute('data-wire-err')||'Could not save — try again',false);
     }).finally(function(){busy(trigger,c.t,false,submitter);if(trigger.tagName==='FORM')inFlight.delete(trigger);});
     return true;
   }
   d.addEventListener('submit',function(e){
-    var f=e.target,c,req;
+    var f=e.target,c,req,push;
     if(!(f instanceof HTMLFormElement)||!f.hasAttribute('data-wire'))return;
     c=cfg(f);req=c&&formReq(f,e.submitter);
     if(!c||!req)return;
     if(inFlight.has(f)){e.preventDefault();return;}
-    if(run(f,req,c,e.submitter,false)){e.preventDefault();inFlight.set(f,1);}
+    push=req.method==='GET'&&f.hasAttribute('data-wire-push');
+    if(run(f,req,c,e.submitter,push)){e.preventDefault();inFlight.set(f,1);}
   });
   d.addEventListener('click',function(e){
     if(e.defaultPrevented||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;
@@ -151,17 +200,29 @@
     if(run(link,{url:b.u,method:'GET',body:null,headers:H},{t:[b.region],s:[b.region],m:'inner',vt:true},null,true))e.preventDefault();
   });
   w.addEventListener('popstate',function(e){
-    var s=e.state&&e.state.odysseyWire;if(!s){return;}
-    if(popCtl)popCtl.abort();popCtl=new AbortController();
-    fetch(w.location.href,{credentials:'same-origin',headers:{'Accept':'text/html','X-Wire':'1'},signal:popCtl.signal}).then(function(r){if(!r.ok)throw 0;return r.text();}).then(function(text){
+    var from=wireIndex,raw=e.state&&e.state.odysseyWire,s=historyWire(raw,from),ctl,restoreY;
+    if(!s)return;
+    // Append/prepend/delete do not have a reversible DOM operation. Preserve native History
+    // correctness by reloading the destination instead of trying to replay a lossy mutation.
+    if(s.m!=='outer'&&s.m!=='inner'){w.location.reload();return;}
+    if(popCtl)popCtl.abort();ctl=new AbortController();popCtl=ctl;
+    if(raw&&typeof raw.index==='number')wireIndex=raw.index;
+    restoreY=Object.prototype.hasOwnProperty.call(scrolls,wireIndex)?scrolls[wireIndex]:(e.state&&typeof e.state.owy==='number'?e.state.owy:0);
+    fetch(w.location.href,{credentials:'same-origin',headers:{'Accept':'text/html','X-Wire':'1'},signal:ctl.signal}).then(function(r){
+      var ru=urlOf(r.url),ct=r.headers.get('Content-Type')||'';
+      if(!ru||!r.ok||ct.toLowerCase().indexOf('text/html')<0)throw{status:r.status};
+      return r.text();
+    }).then(function(text){
       var doc=new DOMParser().parseFromString(text,'text/html'),ok=true,nodes=[];
       s.t.forEach(function(t,i){var cur=q(d,t),fresh=q(doc,s.s[i]);if(!cur||!fresh)ok=false;else nodes.push([cur,fresh,t]);});
       if(!ok){w.location.reload();return;}
-      function commit(){nodes.forEach(function(p){var n=apply(s.m,p[0],p[1]);fire(n,'odyssey:swap',{url:w.location.href,mode:s.m,selector:p[2]});});markCurrent();}
-      if(s.vt&&w.OdysseyMotion&&w.OdysseyMotion.swap)w.OdysseyMotion.swap(commit);else commit();
-    }).catch(function(){w.location.reload();});
+      function commit(){nodes.forEach(function(p){var n=apply(s.m,p[0],p[1]);fire(n,'odyssey:swap',{url:w.location.href,mode:s.m,selector:p[2]});});markCurrent();w.scrollTo(0,restoreY);}
+      vtCommit(commit,s.vt);
+    }).catch(function(err){if(err&&err.name==='AbortError')return;w.location.reload();}).finally(function(){if(popCtl===ctl)popCtl=null;});
   });
   d.addEventListener('wire:after',function(){markCurrent();});
+  w.addEventListener('scroll',trackScroll,{passive:true});
+  w.addEventListener('pagehide',flushScroll);
   if(d.readyState!=='loading')markCurrent();else d.addEventListener('DOMContentLoaded',markCurrent);
   window.OdysseyWire={version:version,toast:toast,post:function(url,data,csrfField){
     var u=urlOf(url),fd=new URLSearchParams(data||{}),c=cookie('__Host-csrf'),field=csrfField||'csrf_token';
