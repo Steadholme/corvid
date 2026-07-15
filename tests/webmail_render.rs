@@ -67,7 +67,7 @@ async fn inbox_lists_messages_and_read_marks_seen() {
     let req = Request::builder()
         .uri("/")
         .header("x-auth-subject", "w33d")
-        .header("x-auth-email", "w33d@holdfast.local")
+        .header("x-auth-email", "w33d@steadholme.local")
         .body(Body::empty())
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();

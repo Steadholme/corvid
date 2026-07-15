@@ -90,7 +90,7 @@ def get(path, headers=None):
     return urllib.request.urlopen(req, timeout=10)
 
 # 2) inbox lists the injected message
-r = get("/", {"X-Auth-Subject": "w33d", "X-Auth-Email": "w33d@holdfast.local"})
+r = get("/", {"X-Auth-Subject": "w33d", "X-Auth-Email": "w33d@steadholme.local"})
 body = r.read().decode(errors="replace")
 assert r.status == 200, r.status
 assert "Corvid Smoke Inbound" in body, "injected subject missing from inbox"
