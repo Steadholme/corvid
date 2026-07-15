@@ -1,12 +1,12 @@
 // GENERATED FROM odyssey — DO NOT EDIT
 use crate::html::{raw, Html};
 
-/// Canonical HOLDFAST product mark. The geometry is stable while `currentColor` lets each
+/// Canonical Steadholme product mark. The geometry is stable while `currentColor` lets each
 /// Odyssey shell inherit its semantic product/accent color instead of freezing an old palette.
-pub const HOLDFAST_MARK_SVG: &str = r#"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" stroke="currentColor" stroke-width="2.5" stroke-linejoin="miter"/><rect x="20" y="19" width="8" height="13" rx="1" fill="currentColor"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="currentColor" stroke-width="2.5"/></svg>"#;
+pub const STEADHOLME_MARK_SVG: &str = r#"<svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M24 4 8 9.5V22c0 11 7 17.4 16 21.5C33 39.4 40 33 40 22V9.5L24 4Z" stroke="currentColor" stroke-width="2.5" stroke-linejoin="miter"/><rect x="20" y="19" width="8" height="13" rx="1" fill="currentColor"/><path d="M20 19v-2.5a4 4 0 0 1 8 0V19" stroke="currentColor" stroke-width="2.5"/></svg>"#;
 
-pub fn holdfast_mark() -> Html {
-    raw(HOLDFAST_MARK_SVG)
+pub fn steadholme_mark() -> Html {
+    raw(STEADHOLME_MARK_SVG)
 }
 
 pub fn icon(name: &'static str) -> Html {
@@ -59,9 +59,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn holdfast_mark_inherits_the_product_color() {
-        assert!(HOLDFAST_MARK_SVG.contains("currentColor"));
-        assert!(!HOLDFAST_MARK_SVG.contains("#4F46E5"));
-        assert_eq!(holdfast_mark().as_str(), HOLDFAST_MARK_SVG);
+    fn steadholme_mark_inherits_the_product_color() {
+        assert!(STEADHOLME_MARK_SVG.contains("currentColor"));
+        assert!(!STEADHOLME_MARK_SVG.contains("#4F46E5"));
+        assert_eq!(steadholme_mark().as_str(), STEADHOLME_MARK_SVG);
     }
 }

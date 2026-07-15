@@ -1,6 +1,6 @@
 /* GENERATED FROM odyssey — DO NOT EDIT */
 /* ============================================================================
-   Odyssey · tokens.css — HOLDFAST 设计语言的 token 层(L0 + L1)
+   Odyssey · tokens.css — Steadholme 设计语言的 token 层(L0 + L1)
    ----------------------------------------------------------------------------
    L0 primitive  : 纯原始色阶/尺度值,全 estate 唯一允许出现 raw hex 的位置。
    L1 semantic   : 语义名 → L0 的映射。组件 CSS(components.css)只准引这一层。
@@ -14,7 +14,7 @@
   --c-white:#ffffff; --c-slate-25:#f7f8fa; --c-slate-50:#f6f7f9; --c-slate-75:#f0f2f6;
   --c-slate-100:#eef0f4; --c-slate-200:#e5e7ec; --c-slate-300:#d3d7e0;
   --c-ink-900:#1a1d24; --c-ink-700:#4a5160; --c-ink-500:#727a8a; --c-ink-400:#9aa2b1;
-  /* HOLDFAST mineral paper / basalt / oxide */
+  /* Steadholme mineral paper / basalt / oxide */
   --c-paper-0:#faf9f4; --c-paper-25:#f5f3ec; --c-paper-50:#f2f0e8;
   --c-paper-75:#ece9df; --c-paper-100:#e9e6dc; --c-paper-200:#cfcabd; --c-paper-300:#8d887c;
   --c-basalt-900:#191c18; --c-basalt-700:#454b43; --c-basalt-500:#5f665b; --c-basalt-400:#6d7469;

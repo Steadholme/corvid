@@ -1,5 +1,5 @@
 // GENERATED FROM odyssey — DO NOT EDIT
-/*! odyssey-motion v1 — sovereign motion helpers, HOLDFAST internal line.
+/*! odyssey-motion v1 — sovereign motion helpers, Steadholme internal line.
    The headline (cross-document View Transitions, held chrome, sliding indicators) is 100% CSS in
    motion.css and works with THIS FILE ABSENT. This is optional polish for same-document motion:
    a startViewTransition() wrapper + a FLIP list animator. Zero eval / zero network / audited IIFE,

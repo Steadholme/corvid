@@ -1,5 +1,5 @@
 // GENERATED FROM odyssey — DO NOT EDIT
-//! Sovereign, zero-dependency internationalization for the HOLDFAST estate.
+//! Sovereign, zero-dependency internationalization for the Steadholme estate.
 //!
 //! This module folds i18n into the `odyssey` design-system crate so it rides the SAME
 //! `odyssey-vendor` distribution channel (and its `--check` CI gate) that already ships `APP_CSS`

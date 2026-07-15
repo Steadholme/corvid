@@ -1,5 +1,5 @@
 // GENERATED FROM odyssey — DO NOT EDIT
-/*! odyssey-wire v1 — HTML-over-the-wire, HOLDFAST internal line */
+/*! odyssey-wire v1 — HTML-over-the-wire, Steadholme internal line */
 (function(d,w){
   'use strict';
   if(window.OdysseyWire)return;
