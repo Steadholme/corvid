@@ -16,6 +16,7 @@ async fn ctx() -> Arc<SmtpContext> {
         .upsert_mailbox(&Mailbox {
             addr: "w33d@w33d.xyz".to_string(),
             owner_sub: "w33d".to_string(),
+            expires_at: 0,
         })
         .await
         .unwrap();
@@ -89,6 +90,59 @@ async fn full_inbound_flow_stores_message() {
     assert!(full.raw_rfc822.contains("Received-SPF:"));
     assert_eq!(full.folder, "INBOX");
     assert!(!full.seen);
+}
+
+#[tokio::test]
+async fn temporary_domains_accept_only_provisioned_full_addresses() {
+    let mut config = Config::dev();
+    config.temp_mail_domains = vec!["mx.w33d.xyz".to_string()];
+    let store = Arc::new(InMemoryStore::new());
+    let provisioned = "g0123456789abcdef01234567@mx.w33d.xyz";
+    store
+        .upsert_mailbox(&Mailbox {
+            addr: provisioned.to_string(),
+            owner_sub: format!("temp:{provisioned}"),
+            expires_at: 0,
+        })
+        .await
+        .unwrap();
+    let non_api_mailbox = "g111111111111111111111111@mx.w33d.xyz";
+    store
+        .upsert_mailbox(&Mailbox {
+            addr: non_api_mailbox.to_string(),
+            owner_sub: "ordinary-owner".to_string(),
+            expires_at: 0,
+        })
+        .await
+        .unwrap();
+    let ctx = Arc::new(SmtpContext {
+        config: Arc::new(config),
+        store,
+        signer: None,
+        tls_acceptor: None,
+    });
+    let mut session = Session::new(ctx, SmtpRole::Mta, false, None);
+    session.handle_line("EHLO client.example.com").await;
+    session.handle_line("MAIL FROM:<alice@example.com>").await;
+
+    let unknown = session
+        .handle_line("RCPT TO:<gffffffffffffffffffffffff@mx.w33d.xyz>")
+        .await;
+    assert!(unknown.text.starts_with("550"), "got: {}", unknown.text);
+
+    let not_api_provisioned = session
+        .handle_line(&format!("RCPT TO:<{non_api_mailbox}>"))
+        .await;
+    assert!(
+        not_api_provisioned.text.starts_with("550"),
+        "got: {}",
+        not_api_provisioned.text
+    );
+
+    let known = session
+        .handle_line(&format!("RCPT TO:<{}>", provisioned.to_ascii_uppercase()))
+        .await;
+    assert!(known.text.starts_with("250"), "got: {}", known.text);
 }
 
 #[tokio::test]

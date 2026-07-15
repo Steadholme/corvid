@@ -86,6 +86,14 @@ pub trait Store: Send + Sync {
     /// Total message count across all folders for a mailbox (admin quota view).
     async fn message_count(&self, mailbox: &str) -> Result<i64, StoreError>;
 
+    /// Temporary mailboxes owned by the synthetic `owner_sub` (`temp:{user}`), newest expiry
+    /// first. Backs the per-user "my temporary addresses" listing and the quota check.
+    async fn list_temp_mailboxes(&self, owner_sub: &str) -> Result<Vec<Mailbox>, StoreError>;
+    /// Delete a mailbox and every message it holds (temporary-mailbox release and TTL GC).
+    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError>;
+    /// Addresses of temporary mailboxes whose TTL elapsed at/before `now` (GC candidates).
+    async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError>;
+
     /// Upsert a mail alias (idempotent; re-points an existing local-part to `mailbox`).
     async fn add_alias(&self, alias: &Alias) -> Result<(), StoreError>;
     /// Every alias, ordered by local-part (admin listing).
@@ -829,6 +837,42 @@ impl Store for InMemoryStore {
             .clone();
         v.sort_by(|a, b| a.addr.cmp(&b.addr));
         Ok(v)
+    }
+
+    async fn list_temp_mailboxes(&self, owner_sub: &str) -> Result<Vec<Mailbox>, StoreError> {
+        let mut v: Vec<Mailbox> = self
+            .mailboxes
+            .lock()
+            .expect("mailboxes lock poisoned")
+            .iter()
+            .filter(|m| m.owner_sub == owner_sub)
+            .cloned()
+            .collect();
+        v.sort_by_key(|m| std::cmp::Reverse(m.expires_at));
+        Ok(v)
+    }
+
+    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError> {
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .retain(|m| m.mailbox != addr);
+        self.mailboxes
+            .lock()
+            .expect("mailboxes lock poisoned")
+            .retain(|m| m.addr != addr);
+        Ok(())
+    }
+
+    async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .mailboxes
+            .lock()
+            .expect("mailboxes lock poisoned")
+            .iter()
+            .filter(|m| m.expires_at > 0 && m.expires_at <= now)
+            .map(|m| m.addr.clone())
+            .collect())
     }
 
     async fn message_count(&self, mailbox: &str) -> Result<i64, StoreError> {
@@ -2558,7 +2602,8 @@ impl PgStore {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS mailboxes (\
                  addr TEXT PRIMARY KEY, \
-                 owner_sub TEXT NOT NULL\
+                 owner_sub TEXT NOT NULL, \
+                 expires_at BIGINT NOT NULL DEFAULT 0\
              )",
         )
         .execute(&self.pool)
@@ -2585,6 +2630,11 @@ impl PgStore {
         .await?;
         // Star/flag: added out-of-band (idempotent) so an already-provisioned `messages` table
         // gains the column without a destructive rebuild. Nullable (existing rows read as unset).
+        sqlx::query(
+            "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS starred BOOLEAN DEFAULT FALSE")
             .execute(&self.pool)
             .await?;
@@ -2952,6 +3002,7 @@ impl PgStore {
         Ok(Mailbox {
             addr: row.try_get("addr")?,
             owner_sub: row.try_get("owner_sub")?,
+            expires_at: row.try_get("expires_at").unwrap_or(0),
         })
     }
 
@@ -3170,11 +3221,12 @@ impl PgStore {
 impl Store for PgStore {
     async fn upsert_mailbox(&self, mb: &Mailbox) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO mailboxes (addr, owner_sub) VALUES ($1, $2) \
+            "INSERT INTO mailboxes (addr, owner_sub, expires_at) VALUES ($1, $2, $3) \
              ON CONFLICT (addr) DO UPDATE SET owner_sub = EXCLUDED.owner_sub",
         )
         .bind(&mb.addr)
         .bind(&mb.owner_sub)
+        .bind(mb.expires_at)
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -3182,7 +3234,7 @@ impl Store for PgStore {
     }
 
     async fn get_mailbox(&self, addr: &str) -> Result<Option<Mailbox>, StoreError> {
-        let row = sqlx::query("SELECT addr, owner_sub FROM mailboxes WHERE addr = $1")
+        let row = sqlx::query("SELECT addr, owner_sub, expires_at FROM mailboxes WHERE addr = $1")
             .bind(addr)
             .fetch_optional(&self.pool)
             .await
@@ -3195,7 +3247,7 @@ impl Store for PgStore {
 
     async fn mailbox_for_owner(&self, owner_sub: &str) -> Result<Option<Mailbox>, StoreError> {
         let row = sqlx::query(
-            "SELECT addr, owner_sub FROM mailboxes WHERE owner_sub = $1 ORDER BY addr LIMIT 1",
+            "SELECT addr, owner_sub, expires_at FROM mailboxes WHERE owner_sub = $1 ORDER BY addr LIMIT 1",
         )
         .bind(owner_sub)
         .fetch_optional(&self.pool)
@@ -3208,7 +3260,7 @@ impl Store for PgStore {
     }
 
     async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError> {
-        let rows = sqlx::query("SELECT addr, owner_sub FROM mailboxes ORDER BY addr ASC")
+        let rows = sqlx::query("SELECT addr, owner_sub, expires_at FROM mailboxes ORDER BY addr ASC")
             .fetch_all(&self.pool)
             .await
             .map_err(backend)?;
@@ -3225,6 +3277,49 @@ impl Store for PgStore {
             .await
             .map_err(backend)?;
         row.try_get("n").map_err(backend)
+    }
+
+    async fn list_temp_mailboxes(&self, owner_sub: &str) -> Result<Vec<Mailbox>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT addr, owner_sub, expires_at FROM mailboxes WHERE owner_sub = $1 \
+             ORDER BY expires_at DESC",
+        )
+        .bind(owner_sub)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter()
+            .map(Self::mailbox_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
+    }
+
+    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError> {
+        // Messages first so a crash never orphans a message under a removed mailbox.
+        sqlx::query("DELETE FROM messages WHERE mailbox = $1")
+            .bind(addr)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        sqlx::query("DELETE FROM mailboxes WHERE addr = $1")
+            .bind(addr)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError> {
+        let rows =
+            sqlx::query("SELECT addr FROM mailboxes WHERE expires_at > 0 AND expires_at <= $1")
+                .bind(now)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(backend)?;
+        rows.iter()
+            .map(|r| r.try_get::<String, _>("addr"))
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)
     }
 
     async fn add_alias(&self, alias: &Alias) -> Result<(), StoreError> {

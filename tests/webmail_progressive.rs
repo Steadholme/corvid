@@ -551,7 +551,7 @@ async fn api_bulk_archives_only_owned() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".into(),
             owner_sub: "alice".into(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     let mine = seed("w33d@w33d.xyz", "mine");

@@ -379,16 +379,45 @@ impl Session {
         }
 
         match self.role {
-            SmtpRole::Mta => match self.ctx.config.resolve_local(&addr) {
-                Some(mb) => {
-                    if !self.rcpt_local.contains(&mb) {
-                        self.rcpt_local.push(mb);
-                    }
-                    self.rcpt_addrs.push(addr);
-                    Reply::say("250 2.1.5 Ok\r\n")
+            SmtpRole::Mta => {
+                // Temporary-mail domains are never catch-alls: only a complete address that was
+                // provisioned through the isolated API is accepted. A backend outage is a 4xx
+                // temporary failure so senders retry instead of treating the mailbox as absent.
+                if domain_of(&addr)
+                    .as_deref()
+                    .is_some_and(|domain| self.ctx.config.is_temp_mail_domain(domain))
+                {
+                    let mailbox = addr.to_ascii_lowercase();
+                    return match self.ctx.store.get_mailbox(&mailbox).await {
+                        Ok(Some(mb))
+                            if crate::temp_mail::is_temporary_mailbox(&mb)
+                                && crate::temp_mail::is_live(&mb, crate::now_secs()) =>
+                        {
+                            if !self.rcpt_local.contains(&mb.addr) {
+                                self.rcpt_local.push(mb.addr);
+                            }
+                            self.rcpt_addrs.push(addr);
+                            Reply::say("250 2.1.5 Ok\r\n")
+                        }
+                        Ok(_) => Reply::say("550 5.1.1 No such user here\r\n"),
+                        Err(error) => {
+                            tracing::warn!(%error, %mailbox, "temporary recipient lookup failed");
+                            Reply::say("451 4.3.0 Temporary recipient lookup failure\r\n")
+                        }
+                    };
                 }
-                None => Reply::say("550 5.1.1 No such user here\r\n"),
-            },
+
+                match self.ctx.config.resolve_local(&addr) {
+                    Some(mb) => {
+                        if !self.rcpt_local.contains(&mb) {
+                            self.rcpt_local.push(mb);
+                        }
+                        self.rcpt_addrs.push(addr);
+                        Reply::say("250 2.1.5 Ok\r\n")
+                    }
+                    None => Reply::say("550 5.1.1 No such user here\r\n"),
+                }
+            }
             SmtpRole::Submission => {
                 if domain_of(&addr).is_none() {
                     return Reply::say("501 5.1.3 Bad recipient address\r\n");

@@ -9,7 +9,12 @@ pub struct Mailbox {
     /// Canonical address, primary key (e.g. `w33d@w33d.xyz`).
     pub addr: String,
     /// Steadholme `sub` of the owner (matches the gateway-injected `X-Auth-Subject`).
+    /// Temporary mailboxes use the synthetic owner `temp:{user_sub}` binding them to their
+    /// SSO creator while keeping them out of the primary-inbox `owner_sub == user_sub` view.
     pub owner_sub: String,
+    /// Expiry epoch (seconds). `0` for permanent mailboxes; temporary mailboxes carry a real
+    /// TTL and are garbage-collected once `expires_at <= now`.
+    pub expires_at: i64,
 }
 
 /// A mail alias: an address local-part that forwards to a target [`Mailbox::addr`].

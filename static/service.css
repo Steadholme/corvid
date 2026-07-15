@@ -1679,3 +1679,34 @@ mark.search-hit {
 .compose-card #attachments::file-selector-button{ margin-right:12px; padding:6px 12px; font-weight:600; cursor:pointer; color:var(--ink-2); background:var(--surface); border:1px solid var(--border-2); border-radius:var(--r-xs); }
 
 /* Reduced-motion floor for all co- groups is inherited from motion.css:41-46 — no extra guard needed. */
+
+/* ---- Temporary mail (SSO-owned disposable addresses) ---- */
+.tm-wrap { max-width: 720px; margin: 0 auto; padding: 24px 20px; }
+.tm-head { margin-bottom: 20px; }
+.tm-head h1 { font-size: 1.4rem; margin: 0 0 6px; }
+.tm-sub { color: var(--muted, #6b7280); font-size: .9rem; line-height: 1.5; margin: 0; }
+.tm-back { display: inline-block; color: var(--accent, #4f46e5); text-decoration: none; font-size: .85rem; margin-bottom: 8px; }
+.tm-back:hover { text-decoration: underline; }
+.tm-gen { margin-bottom: 20px; }
+.tm-btn { border: 1px solid var(--line, #d1d5db); background: var(--surface, #fff); color: var(--ink, #111827); border-radius: 8px; padding: 8px 14px; font-size: .88rem; cursor: pointer; }
+.tm-btn--primary { background: var(--accent, #4f46e5); border-color: var(--accent, #4f46e5); color: #fff; }
+.tm-btn--danger { color: var(--danger, #b91c1c); border-color: var(--line, #d1d5db); padding: 4px 10px; font-size: .8rem; }
+.tm-note { color: var(--muted, #6b7280); font-size: .88rem; background: var(--surface-2, #f9fafb); border: 1px solid var(--line, #e5e7eb); border-radius: 8px; padding: 10px 12px; }
+.tm-list, .tm-msgs { display: flex; flex-direction: column; gap: 8px; }
+.tm-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line, #e5e7eb); border-radius: 8px; }
+.tm-addr { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9rem; color: var(--ink, #111827); text-decoration: none; }
+.tm-addr:hover { text-decoration: underline; }
+.tm-meta { color: var(--muted, #6b7280); font-size: .8rem; margin-left: auto; }
+.tm-del { margin: 0 0 0 8px; }
+.tm-empty { color: var(--muted, #6b7280); font-size: .9rem; padding: 20px 0; text-align: center; }
+.tm-msg { display: grid; grid-template-columns: 180px 1fr auto; gap: 12px; align-items: baseline; padding: 10px 12px; border: 1px solid var(--line, #e5e7eb); border-radius: 8px; text-decoration: none; color: var(--ink, #111827); }
+.tm-msg:hover { background: var(--surface-2, #f9fafb); }
+.tm-from { font-weight: 600; font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tm-subj { font-size: .88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tm-ago { color: var(--muted, #6b7280); font-size: .78rem; }
+.tm-addr-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1.1rem; margin: 4px 0; word-break: break-all; }
+.tm-subj-title { font-size: 1.15rem; margin: 4px 0; }
+.tm-from-line { color: var(--muted, #6b7280); font-size: .85rem; margin: 0; }
+.tm-body { margin-top: 16px; border-top: 1px solid var(--line, #e5e7eb); padding-top: 16px; font-size: .92rem; line-height: 1.55; word-break: break-word; }
+.tm-text { white-space: pre-wrap; font-family: inherit; margin: 0; }
+@media (max-width: 560px) { .tm-msg { grid-template-columns: 1fr; gap: 2px; } .tm-meta { margin-left: 0; } .tm-row { flex-wrap: wrap; } }

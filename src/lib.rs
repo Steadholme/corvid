@@ -1,4 +1,4 @@
-//! Corvid — sovereign mail server for the HOLDFAST stack.
+//! Corvid — sovereign mail server for the Steadholme stack.
 //!
 //! One cohesive service with four cooperating parts, all sharing one [`Store`]:
 //! 1. an inbound ESMTP MTA ([`smtp`]) that accepts mail for the local mailboxes and stores it,
@@ -20,6 +20,7 @@ pub mod sanitize;
 pub mod smtp;
 pub mod spf;
 pub mod store;
+pub mod temp_mail;
 pub mod util;
 pub mod webmail;
 
@@ -54,6 +55,7 @@ fn primary_mailbox(config: &Config) -> Mailbox {
     Mailbox {
         addr: config.primary_mailbox(),
         owner_sub: "w33d".to_string(),
+        expires_at: 0,
     }
 }
 
@@ -94,11 +96,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
         }
         "memory" => {
             // Refuse to ride the volatile in-memory store when durability is required
-            // (HOLDFAST_PROFILE=prod or REQUIRE_PERSISTENCE): every accepted message would be
+            // (STEADHOLME_PROFILE=prod or REQUIRE_PERSISTENCE): every accepted message would be
             // lost on restart. Startup-only hard failure — never mid-request.
             if require_persistence {
                 return Err(
-                    "durability required (HOLDFAST_PROFILE=prod or REQUIRE_PERSISTENCE) but \
+                    "durability required (STEADHOLME_PROFILE=prod or REQUIRE_PERSISTENCE) but \
                      CORVID_STORE resolves to the volatile in-memory store: set CORVID_STORE=postgres \
                      and DATABASE_URL to persist mail"
                         .to_string(),
@@ -133,11 +135,11 @@ pub async fn build_state_from_env() -> Result<AppState, String> {
     })
 }
 
-/// True when this deployment must run on a durable store: `HOLDFAST_PROFILE=prod`
+/// True when this deployment must run on a durable store: `STEADHOLME_PROFILE=prod`
 /// (case-insensitive) OR a truthy `REQUIRE_PERSISTENCE`. When false (the default, e.g. dev with
-/// `HOLDFAST_PROFILE` unset) the in-memory store stays permitted.
+/// `STEADHOLME_PROFILE` unset) the in-memory store stays permitted.
 fn require_persistence() -> bool {
-    let profile_prod = std::env::var("HOLDFAST_PROFILE")
+    let profile_prod = std::env::var("STEADHOLME_PROFILE")
         .map(|v| v.trim().eq_ignore_ascii_case("prod"))
         .unwrap_or(false);
     profile_prod || env_truthy("REQUIRE_PERSISTENCE")
@@ -191,6 +193,9 @@ pub async fn run() -> Result<(), String> {
     let state = build_state_from_env().await?;
     let config = state.config.clone();
 
+    // Temporary mail no longer uses a separate anonymous listener — provisioning is SSO-gated
+    // inside the webmail (see `temp_mail` + the /temp routes).
+
     let tls_acceptor = build_tls_acceptor(&config).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "TLS disabled (STARTTLS unavailable)");
         None
@@ -230,6 +235,21 @@ pub async fn run() -> Result<(), String> {
         let try_tls = std::env::var("RELAY_STARTTLS").map(|v| v != "0").unwrap_or(true);
         tokio::spawn(async move {
             relay::run_worker(store, hostname, try_tls).await;
+        });
+    }
+    // Temporary-mail TTL garbage collector. SSO users provision disposable addresses from the
+    // webmail itself (no separate listener); this background task reaps expired mailboxes hourly.
+    if config.temp_mail_enabled() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let removed = temp_mail::gc_expired(&state).await;
+                if removed > 0 {
+                    tracing::info!(removed, "temporary-mail GC reaped expired mailboxes");
+                }
+            }
         });
     }
 

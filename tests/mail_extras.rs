@@ -392,7 +392,7 @@ async fn contacts_harvest_suggest_ranking_and_scope() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: MAILBOX.to_string(),
             owner_sub: "w33d".to_string(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     // Deliver two messages from the same sender (frequency 2) + one from another.
@@ -708,7 +708,7 @@ async fn label_assign_denied_across_mailboxes() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".into(),
             owner_sub: "alice".into(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     let foreign = inbound("x@y.com", "s", "raw", 1);

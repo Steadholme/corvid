@@ -24,7 +24,7 @@ async fn ctx() -> Arc<SmtpContext> {
         .upsert_mailbox(&Mailbox {
             addr: MAILBOX.to_string(),
             owner_sub: "w33d".to_string(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     Arc::new(SmtpContext {

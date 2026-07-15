@@ -822,6 +822,11 @@ pub fn app(state: AppState) -> Router {
         .route("/api/m/bulk", post(api_bulk_action))
         .route("/m/{id}/labels", post(message_labels_post))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
+        .route("/temp", get(temp_index))
+        .route("/temp/new", post(temp_new))
+        .route("/temp/delete", post(temp_delete))
+        .route("/temp/box/{addr}", get(temp_box))
+        .route("/temp/box/{addr}/msg/{id}", get(temp_read))
         .route("/compose", get(compose_form))
         .route("/compose/autosave", post(compose_autosave))
         .route("/send", post(send))
@@ -2654,6 +2659,15 @@ fn mail_sidebar(
         "/?folder=Archive",
         ICO_ARCHIVE,
         "Archive",
+        String::new(),
+    ));
+    secondary.push_str(&sidebar_item(
+        active,
+        active_label,
+        "temp",
+        "/temp",
+        ICO_CLOCK,
+        "Temporary",
         String::new(),
     ));
     secondary.push_str(&sidebar_item(
@@ -5767,6 +5781,7 @@ async fn admin_create_mailbox(
     let mb = Mailbox {
         addr: addr.clone(),
         owner_sub: owner_sub.clone(),
+        expires_at: 0,
     };
     if let Err(e) = state.store.upsert_mailbox(&mb).await {
         return error_page(
@@ -8774,6 +8789,247 @@ fn render_page_with_prefs(
     prefs: PagePrefs,
 ) -> String {
     render_shell(title, email_display, content, nav_active, prefs, "")
+}
+
+// ============================ Temporary mail (SSO-owned) ============================
+// Disposable addresses provisioned by the signed-in user from the webmail. The global
+// `require_gateway_sig` layer rejects any forged/unsigned gateway identity, so every handler
+// below runs only for a genuine SSO session. Reads and deletes additionally verify per-user
+// ownership (`temp:{sub}`), so one user can never reach another user's temporary mail.
+// Provisioning and deletion are CSRF-guarded. Received mail is untrusted and is always rendered
+// through the shared HTML sanitizer.
+
+#[derive(Deserialize, Default)]
+struct TempCsrfForm {
+    csrf: String,
+}
+
+#[derive(Deserialize, Default)]
+struct TempDeleteForm {
+    csrf: String,
+    #[serde(default)]
+    address: String,
+}
+
+fn temp_forbidden() -> Response {
+    error_page(
+        StatusCode::UNAUTHORIZED,
+        "Sign in required",
+        "Temporary mail needs a signed-in session.",
+    )
+}
+
+fn temp_not_found() -> Response {
+    error_page(StatusCode::NOT_FOUND, "Not found", "No such temporary address.")
+}
+
+fn temp_csrf_error() -> Response {
+    error_page(
+        StatusCode::FORBIDDEN,
+        "Request blocked",
+        "CSRF token missing or mismatched.",
+    )
+}
+
+/// Compact "1d 3h" / "12m" for a positive second count.
+fn fmt_short_duration(secs: i64) -> String {
+    if secs <= 0 {
+        return "moments".to_string();
+    }
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Wrap temp-mail content in the standard mail shell + page chrome.
+async fn temp_page(state: &AppState, headers: &HeaderMap, title: &str, main: &str) -> String {
+    let email = email_display(headers);
+    let settings = match resolve_mailbox(state, headers).await {
+        Some(mb) => settings_for_page(state, &mb.addr).await,
+        None => settings_for_page(state, "").await,
+    };
+    let prefs = page_prefs(&settings, estate_theme(headers));
+    let content = mail_shell(
+        mail_sidebar("temp", "", &[], &FolderCounts::default()),
+        main.to_string(),
+    );
+    render_mail_page(title, &email, &content, prefs)
+}
+
+/// Owner-checked lookup shared by the box + read views: returns the mailbox iff it is a
+/// temporary mailbox owned by `sub`.
+async fn temp_owned_mailbox(state: &AppState, sub: &str, addr: &str) -> Option<Mailbox> {
+    let mb = state.store.get_mailbox(addr).await.ok().flatten()?;
+    (crate::temp_mail::is_temporary_mailbox(&mb) && crate::temp_mail::owned_by(&mb, sub)).then_some(mb)
+}
+
+/// `GET /temp` — the signed-in user's temporary addresses + a generate control.
+async fn temp_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(sub) = identity_subject(&headers) else {
+        return temp_forbidden();
+    };
+    let (token, set_cookie) = ensure_csrf(&headers);
+    let enabled = state.config.temp_mail_enabled();
+    let limit = state.config.temp_mail_max_per_user;
+    let now = crate::now_secs();
+    let owner = crate::temp_mail::temporary_mailbox_owner(&sub);
+    let mut boxes = state.store.list_temp_mailboxes(&owner).await.unwrap_or_default();
+    boxes.retain(|mb| crate::temp_mail::is_live(mb, now));
+
+    let mut list = String::new();
+    if boxes.is_empty() {
+        list.push_str(r#"<p class="tm-empty">You have no temporary addresses yet.</p>"#);
+    } else {
+        for mb in &boxes {
+            let count = state.store.message_count(&mb.addr).await.unwrap_or(0);
+            let rem = fmt_short_duration(mb.expires_at - now);
+            list.push_str(&format!(
+                r#"<div class="tm-row"><a class="tm-addr" href="/temp/box/{href}">{addr}</a><span class="tm-meta">{count} mail · expires in {rem}</span><form method="post" action="/temp/delete" class="tm-del"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="address" value="{addr}"><button type="submit" class="tm-btn tm-btn--danger">Delete</button></form></div>"#,
+                href = url_encode(&mb.addr),
+                addr = esc(&mb.addr),
+                rem = esc(&rem),
+                csrf = esc(&token),
+            ));
+        }
+    }
+
+    let control = if !enabled {
+        r#"<p class="tm-note">Temporary mail is not configured on this server.</p>"#.to_string()
+    } else if boxes.len() >= limit {
+        format!(r#"<p class="tm-note">You are at your limit of {limit} temporary addresses. Delete one to create another.</p>"#)
+    } else {
+        format!(
+            r#"<form method="post" action="/temp/new" class="tm-gen"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="tm-btn tm-btn--primary">Generate a temporary address</button></form>"#,
+            csrf = esc(&token),
+        )
+    };
+
+    let main = format!(
+        r#"<div class="tm-wrap"><header class="tm-head"><h1>Temporary addresses</h1><p class="tm-sub">Disposable inboxes for sign-ups you don't want in your real mail. Up to {limit} active at a time; each self-destructs when it expires. Receive-only — they cannot send.</p></header>{control}<section class="tm-list">{list}</section></div>"#,
+    );
+
+    let page = temp_page(&state, &headers, "Temporary addresses", &main).await;
+    match set_cookie {
+        Some(c) => ([(header::SET_COOKIE, c)], Html(page)).into_response(),
+        None => Html(page).into_response(),
+    }
+}
+
+/// `POST /temp/new` — provision a fresh address (CSRF + quota enforced in `provision`).
+async fn temp_new(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TempCsrfForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return temp_csrf_error();
+    }
+    let Some(sub) = identity_subject(&headers) else {
+        return temp_forbidden();
+    };
+    match crate::temp_mail::provision(&state, &sub).await {
+        Ok(_)
+        | Err(crate::temp_mail::ProvisionError::QuotaExceeded)
+        | Err(crate::temp_mail::ProvisionError::Disabled) => Redirect::to("/temp").into_response(),
+        Err(crate::temp_mail::ProvisionError::Storage) => error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            "Could not create the temporary address.",
+        ),
+    }
+}
+
+/// `POST /temp/delete` — release an address (CSRF + owner check inside `release`).
+async fn temp_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TempDeleteForm>,
+) -> Response {
+    if !verify_csrf(&headers, &form.csrf) {
+        return temp_csrf_error();
+    }
+    let Some(sub) = identity_subject(&headers) else {
+        return temp_forbidden();
+    };
+    let _ = crate::temp_mail::release(&state, &sub, &form.address).await;
+    Redirect::to("/temp").into_response()
+}
+
+/// `GET /temp/box/{addr}` — messages received by one of the user's temporary addresses.
+async fn temp_box(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(addr): Path<String>,
+) -> Response {
+    let Some(sub) = identity_subject(&headers) else {
+        return temp_forbidden();
+    };
+    let addr = addr.to_ascii_lowercase();
+    if temp_owned_mailbox(&state, &sub, &addr).await.is_none() {
+        return temp_not_found();
+    }
+    let msgs = state.store.list_messages(&addr, 100).await.unwrap_or_default();
+    let now = crate::now_secs();
+    let mut rows = String::new();
+    if msgs.is_empty() {
+        rows.push_str(r#"<p class="tm-empty">No mail yet. Anything sent to this address lands here.</p>"#);
+    } else {
+        for m in &msgs {
+            let ago = fmt_short_duration(now - m.received_at);
+            let subj = if m.subject.is_empty() { "(no subject)" } else { &m.subject };
+            rows.push_str(&format!(
+                r#"<a class="tm-msg" href="/temp/box/{bx}/msg/{id}"><span class="tm-from">{from}</span><span class="tm-subj">{subj}</span><span class="tm-ago">{ago} ago</span></a>"#,
+                bx = url_encode(&addr),
+                id = url_encode(&m.id),
+                from = esc(&m.msg_from),
+                subj = esc(subj),
+                ago = esc(&ago),
+            ));
+        }
+    }
+    let main = format!(
+        r#"<div class="tm-wrap"><header class="tm-head"><a class="tm-back" href="/temp">← Temporary addresses</a><h1 class="tm-addr-title">{addr}</h1></header><section class="tm-msgs">{rows}</section></div>"#,
+        addr = esc(&addr),
+    );
+    Html(temp_page(&state, &headers, &addr, &main).await).into_response()
+}
+
+/// `GET /temp/box/{addr}/msg/{id}` — read one message (owner-checked, sanitized render).
+async fn temp_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((addr, id)): Path<(String, String)>,
+) -> Response {
+    let Some(sub) = identity_subject(&headers) else {
+        return temp_forbidden();
+    };
+    let addr = addr.to_ascii_lowercase();
+    if temp_owned_mailbox(&state, &sub, &addr).await.is_none() {
+        return temp_not_found();
+    }
+    let msg = match state.store.get_message(&id).await {
+        Ok(Some(m)) if m.mailbox == addr => m,
+        _ => return temp_not_found(),
+    };
+    let body = if !msg.body_html.trim().is_empty() {
+        crate::sanitize::sanitize_html(&msg.body_html)
+    } else {
+        format!("<pre class=\"tm-text\">{}</pre>", esc(&msg.body_text))
+    };
+    let subj = if msg.subject.is_empty() { "(no subject)" } else { &msg.subject };
+    let main = format!(
+        r#"<div class="tm-wrap"><header class="tm-head"><a class="tm-back" href="/temp/box/{bx}">← {addr}</a><h1 class="tm-subj-title">{subj}</h1><p class="tm-from-line">From {from}</p></header><article class="tm-body">{body}</article></div>"#,
+        bx = url_encode(&addr),
+        addr = esc(&addr),
+        subj = esc(subj),
+        from = esc(&msg.msg_from),
+    );
+    Html(temp_page(&state, &headers, subj, &main).await).into_response()
 }
 
 fn render_mail_page(title: &str, email_display: &str, content: &str, prefs: PagePrefs) -> String {

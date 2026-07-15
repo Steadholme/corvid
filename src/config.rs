@@ -52,6 +52,14 @@ pub struct Config {
     pub max_rcpts: usize,
     /// Bearer token guarding the internal send API (`MAIL_SEND_TOKEN`). Empty disables the API.
     pub mail_send_token: String,
+    /// Dedicated domains for SSO-provisioned temporary mailboxes (`TEMP_MAIL_DOMAINS`,
+    /// comma-separated). MUST be distinct from `mail_hosts` so a temp address can never shadow a
+    /// real mailbox. Empty disables temporary mail; a fresh address picks a random domain.
+    pub temp_mail_domains: Vec<String>,
+    /// Max active temporary mailboxes one SSO user may hold (`TEMP_MAIL_MAX_PER_USER`, default 10).
+    pub temp_mail_max_per_user: usize,
+    /// Temporary mailbox lifetime in seconds (`TEMP_MAIL_TTL_DAYS` days, default 7). GC'd after.
+    pub temp_mail_ttl_secs: i64,
     /// SMTP submission (:587) AUTH username (`SUBMISSION_USER`). Empty falls back to the
     /// primary mailbox address.
     pub submission_user: String,
@@ -84,6 +92,9 @@ impl Config {
             max_msg_size: 10 * 1024 * 1024,
             max_rcpts: 100,
             mail_send_token: String::new(),
+            temp_mail_domains: Vec::new(),
+            temp_mail_max_per_user: 10,
+            temp_mail_ttl_secs: 7 * 24 * 60 * 60,
             submission_user: String::new(),
             submission_password: String::new(),
         }
@@ -140,6 +151,18 @@ impl Config {
         if let Some(v) = env_nonempty("MAIL_SEND_TOKEN") {
             c.mail_send_token = v;
         }
+        if let Some(v) = env_nonempty("TEMP_MAIL_MAX_PER_USER").and_then(|s| s.parse().ok()) {
+            c.temp_mail_max_per_user = v;
+        }
+        if let Some(v) = env_nonempty("TEMP_MAIL_TTL_DAYS").and_then(|s| s.parse::<i64>().ok()) {
+            c.temp_mail_ttl_secs = v.max(1) * 24 * 60 * 60;
+        }
+        if let Some(v) = env_nonempty("TEMP_MAIL_DOMAINS") {
+            c.temp_mail_domains = split_csv(&v)
+                .into_iter()
+                .map(|domain| domain.to_ascii_lowercase())
+                .collect();
+        }
         if let Some(v) = env_nonempty("SUBMISSION_USER") {
             c.submission_user = v;
         }
@@ -173,6 +196,24 @@ impl Config {
     /// True when STARTTLS material is configured.
     pub fn tls_enabled(&self) -> bool {
         !self.tls_cert.is_empty() && !self.tls_key.is_empty()
+    }
+
+    /// Whether `domain` is explicitly allowlisted for temporary mailboxes.
+    pub fn is_temp_mail_domain(&self, domain: &str) -> bool {
+        self.temp_mail_domains
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(domain.trim()))
+    }
+
+    /// Whether SSO-provisioned temporary mail is enabled (at least one dedicated domain).
+    pub fn temp_mail_enabled(&self) -> bool {
+        !self.temp_mail_domains.is_empty()
+    }
+
+    /// Pick a random allowlisted temporary-mail domain (uniform over the pool).
+    pub fn random_temp_mail_domain(&self) -> Option<String> {
+        use rand::seq::SliceRandom;
+        self.temp_mail_domains.choose(&mut rand::rngs::OsRng).cloned()
     }
 
     /// Resolve a recipient address to its local mailbox, or `None` when not deliverable here.
@@ -247,5 +288,21 @@ mod tests {
         c.catchall = true;
         assert_eq!(c.resolve_local("random@w33d.xyz").as_deref(), Some("w33d@w33d.xyz"));
         assert!(c.resolve_local("random@elsewhere.net").is_none());
+    }
+
+    #[test]
+    fn temp_mail_domains_are_exact_and_do_not_enable_catchall() {
+        let mut c = Config::dev();
+        c.temp_mail_domains = vec![
+            "mx.w33d.xyz".to_string(),
+            "inbox.box.mx.w33d.xyz".to_string(),
+        ];
+
+        assert!(c.is_temp_mail_domain("MX.W33D.XYZ"));
+        assert!(c.is_temp_mail_domain("inbox.box.mx.w33d.xyz"));
+        assert!(!c.is_temp_mail_domain("w33d.xyz"));
+        assert!(!c.is_temp_mail_domain("evil-mx.w33d.xyz"));
+        assert!(c.resolve_local("anything@mx.w33d.xyz").is_none());
+        assert!(c.resolve_local("anything@w33d.xyz").is_none());
     }
 }

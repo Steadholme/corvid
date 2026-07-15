@@ -52,13 +52,13 @@ async fn pg_store_full_integration() {
     pg.upsert_mailbox(&Mailbox {
         addr: "w33d@w33d.xyz".into(),
         owner_sub: "w33d".into(),
-    })
+        expires_at: 0,    })
     .await
     .unwrap();
     pg.upsert_mailbox(&Mailbox {
         addr: "w33d@w33d.xyz".into(),
         owner_sub: "w33d".into(),
-    })
+        expires_at: 0,    })
     .await
     .unwrap();
     assert_eq!(
@@ -463,7 +463,7 @@ async fn pg_store_full_integration() {
     pg.upsert_mailbox(&Mailbox {
         addr: "thr@w33d.xyz".into(),
         owner_sub: "thr".into(),
-    })
+        expires_at: 0,    })
     .await
     .unwrap();
     let thr = |id: &str, tid: &str, mid: &str, subj: &str, at: i64| Message {

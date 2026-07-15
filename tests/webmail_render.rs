@@ -1000,7 +1000,7 @@ async fn attachment_download_denied_across_mailboxes() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     let mut msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");
@@ -1695,7 +1695,7 @@ async fn settings_rule_run_denies_other_mailbox_rule_id() {
         .upsert_mailbox(&Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     let rule = filter_rule("fr_alice", "alice@w33d.xyz", "star", "Secret");
@@ -1753,7 +1753,7 @@ async fn message_action_denied_across_mailboxes() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-        })
+            expires_at: 0,        })
         .await
         .unwrap();
     let msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");
