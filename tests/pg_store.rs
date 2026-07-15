@@ -642,7 +642,7 @@ async fn pg_store_full_integration() {
             addr: "vip@example.com".into(),
             name: "VIP".into(),
             phone: "123".into(),
-            company: "Holdfast".into(),
+            company: "Steadholme".into(),
             title: "Ops".into(),
             notes: "manual note".into(),
             manual: true,
@@ -657,7 +657,7 @@ async fn pg_store_full_integration() {
         .find(|c| c.addr == "vip@example.com")
         .expect("full contact saved");
     assert_eq!(vip.phone, "123");
-    assert_eq!(vip.company, "Holdfast");
+    assert_eq!(vip.company, "Steadholme");
     let group = ContactGroup {
         id: "cg_pg".into(),
         user: "w33d@w33d.xyz".into(),

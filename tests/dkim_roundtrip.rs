@@ -13,7 +13,7 @@ use corvid::dkim::{self, DkimSigner};
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
-const MSG: &str = "From: HOLDFAST <w33d@w33d.xyz>\r\n\
+const MSG: &str = "From: Steadholme <w33d@w33d.xyz>\r\n\
 To: Bob <bob@example.com>\r\n\
 Subject: Corvid DKIM test\r\n\
 Date: Mon, 29 Jun 2026 12:00:00 +0000\r\n\

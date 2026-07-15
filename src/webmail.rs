@@ -7512,7 +7512,7 @@ fn render_identities_section(
   <form method="post" action="/settings/identities">
     <input type="hidden" name="csrf" value="{token}">
     <div class="field"><label for="idn_addr">From address</label><input id="idn_addr" name="from_addr" placeholder="info@w33d.xyz"></div>
-    <div class="field"><label for="idn_name">Display name</label><input id="idn_name" name="display_name" placeholder="HOLDFAST Info"></div>
+    <div class="field"><label for="idn_name">Display name</label><input id="idn_name" name="display_name" placeholder="Steadholme Info"></div>
     <div class="field"><label><input type="checkbox" name="is_default" value="on"> Make this my default From</label></div>
     <div class="form-actions"><button class="btn btn-primary" type="submit">Add identity</button></div>
   </form>
@@ -8875,7 +8875,7 @@ fn email_display(headers: &HeaderMap) -> String {
 }
 
 fn no_mailbox_page(email: &str) -> Response {
-    let content = r#"<section class="card empty-card"><h1 class="empty-title">No mailbox provisioned</h1><p class="muted">Your HOLDFAST identity has no Corvid mailbox yet. Ask an administrator to provision one.</p></section>"#;
+    let content = r#"<section class="card empty-card"><h1 class="empty-title">No mailbox provisioned</h1><p class="muted">Your Steadholme identity has no Corvid mailbox yet. Ask an administrator to provision one.</p></section>"#;
     Html(render_page("No mailbox", email, content, "")).into_response()
 }
 
@@ -9733,7 +9733,7 @@ mod tests {
     fn extract_addr_handles_angle_and_bare() {
         assert_eq!(extract_addr("no-reply@w33d.xyz"), "no-reply@w33d.xyz");
         assert_eq!(
-            extract_addr("HOLDFAST <no-reply@w33d.xyz>"),
+            extract_addr("Steadholme <no-reply@w33d.xyz>"),
             "no-reply@w33d.xyz"
         );
         assert_eq!(extract_addr("  bare@x.com  "), "bare@x.com");

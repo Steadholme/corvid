@@ -3,12 +3,12 @@
 use serde::Serialize;
 use time::{Date, Month};
 
-/// A mailbox: an address that receives mail, owned by a HOLDFAST identity (`owner_sub`).
+/// A mailbox: an address that receives mail, owned by a Steadholme identity (`owner_sub`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Mailbox {
     /// Canonical address, primary key (e.g. `w33d@w33d.xyz`).
     pub addr: String,
-    /// HOLDFAST `sub` of the owner (matches the gateway-injected `X-Auth-Subject`).
+    /// Steadholme `sub` of the owner (matches the gateway-injected `X-Auth-Subject`).
     pub owner_sub: String,
 }
 

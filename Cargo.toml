@@ -2,7 +2,7 @@
 name = "corvid"
 version = "0.1.0"
 edition = "2021"
-description = "Corvid — sovereign mail server (inbound SMTP MTA + outbound relay + DKIM + webmail) for the HOLDFAST stack."
+description = "Corvid — sovereign mail server (inbound SMTP MTA + outbound relay + DKIM + webmail) for the Steadholme stack."
 license = "MIT OR Apache-2.0"
 
 [lib]

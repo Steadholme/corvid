@@ -273,7 +273,7 @@ async fn identity_add_ownership_and_outbound_from() {
     let (token, cookie) = mint_csrf(&state).await;
 
     // Add a self-managed identity at the mail domain.
-    let form = format!("csrf={token}&from_addr=info%40w33d.xyz&display_name=HOLDFAST%20Info");
+    let form = format!("csrf={token}&from_addr=info%40w33d.xyz&display_name=Steadholme%20Info");
     let resp = app(state.clone())
         .oneshot(post("/settings/identities", &cookie, form))
         .await
@@ -301,7 +301,7 @@ async fn identity_add_ownership_and_outbound_from() {
     let html = body_string(app(state.clone()).oneshot(req).await.unwrap()).await;
     assert!(html.contains(r#"name="identity""#), "From selector present");
     assert!(
-        html.contains("HOLDFAST Info &lt;info@w33d.xyz&gt;"),
+        html.contains("Steadholme Info &lt;info@w33d.xyz&gt;"),
         "identity listed"
     );
 
@@ -321,7 +321,7 @@ async fn identity_add_ownership_and_outbound_from() {
         "envelope sender is the identity"
     );
     assert!(
-        due[0].raw.contains("From: HOLDFAST Info <info@w33d.xyz>"),
+        due[0].raw.contains("From: Steadholme Info <info@w33d.xyz>"),
         "From header is the identity"
     );
     let sent = state
@@ -338,7 +338,7 @@ async fn identity_add_ownership_and_outbound_from() {
             .unwrap()
             .unwrap()
             .msg_from,
-        "HOLDFAST Info <info@w33d.xyz>"
+        "Steadholme Info <info@w33d.xyz>"
     );
 }
 
@@ -497,7 +497,7 @@ async fn contacts_crud_groups_import_export_and_group_send() {
     let (token, cookie) = mint_csrf(&state).await;
 
     let form = format!(
-        "csrf={token}&cmd=add&addr=alice%40example.com&name=Alice&phone=123&company=Holdfast&title=Ops&notes=Primary"
+        "csrf={token}&cmd=add&addr=alice%40example.com&name=Alice&phone=123&company=Steadholme&title=Ops&notes=Primary"
     );
     let resp = app(state.clone())
         .oneshot(post("/settings/contacts", &cookie, form))
@@ -507,7 +507,7 @@ async fn contacts_crud_groups_import_export_and_group_send() {
     let contacts = state.store.list_contacts(MAILBOX, 10).await.unwrap();
     assert_eq!(contacts.len(), 1);
     assert_eq!(contacts[0].phone, "123");
-    assert_eq!(contacts[0].company, "Holdfast");
+    assert_eq!(contacts[0].company, "Steadholme");
 
     let req = Request::builder()
         .uri("/settings")

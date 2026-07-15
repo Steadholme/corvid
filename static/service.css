@@ -15,7 +15,7 @@
 .compose-card { overflow:visible; }
 
 /* ============================================================================
-   HOLDFAST · Corvid webmail — DOMAIN layer (folder list / mail rows / read view /
+   Steadholme · Corvid webmail — DOMAIN layer (folder list / mail rows / read view /
    compose form / admin tables). Retargeted onto the Odyssey v2 tokens above.
    Every existing webmail class name is preserved so no template or test breaks.
    ============================================================================ */
@@ -313,7 +313,7 @@ a.label-pill:hover { color:var(--accent-ink); }
 .combo__name { color:var(--ink-3); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
 /* ============================================================================
-   HOLDFAST · Corvid webmail — progressive-enhancement layer (ADDITIVE).
+   Steadholme · Corvid webmail — progressive-enhancement layer (ADDITIVE).
    Selection checkboxes, sticky bulk toolbar, keyboard cursor, in-flight/toast
    affordances, compose chips/char-counter, conversation collapse. Every rule
    below is new; no pre-existing selector is modified. Motion stays within the
@@ -1556,7 +1556,7 @@ mark.search-hit {
 }
 
 /* ============================================================================
-   HOLDFAST · Corvid webmail — narrow-viewport hardening (ADDITIVE)
+   Steadholme · Corvid webmail — narrow-viewport hardening (ADDITIVE)
    Tablet (<=900px) + phone (<=640px) rules for the Corvid-specific fixed /
    multi-column surfaces the desktop sheet above lays out at ~1440px. These are
    NEW @media blocks only — every desktop (non-@media) rule stays byte-for-byte.
