@@ -25,7 +25,7 @@
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
@@ -33,7 +33,7 @@ use axum::{Form, Json, Router};
 use crate::rfc822::Attachment;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::{Date, Month, OffsetDateTime};
 
@@ -828,7 +828,30 @@ pub fn app(state: AppState) -> Router {
         .route("/temp/delete", post(temp_delete))
         .route(
             "/api/v1/temp-mailboxes",
-            delete(api_temp_mailbox_delete).layer(DefaultBodyLimit::max(4096)),
+            get(api_temp_mailboxes_list)
+                .post(api_temp_mailbox_create)
+                .delete(api_temp_mailbox_delete)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/temp-mailboxes/renew",
+            post(api_temp_mailbox_renew).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/temp-mailboxes/messages/list",
+            post(api_temp_messages_list).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/temp-mailboxes/messages/get",
+            post(api_temp_message_get).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/temp-mailboxes/messages",
+            delete(api_temp_message_delete).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/v1/temp-mailboxes/messages/attachments/get",
+            post(api_temp_attachment_get).layer(DefaultBodyLimit::max(4096)),
         )
         .route("/temp/box/{addr}", get(temp_box))
         .route("/temp/box/{addr}/msg/{id}", get(temp_read))
@@ -891,8 +914,12 @@ async fn require_gateway_sig(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let temp_delete_api = req.uri().path() == "/api/v1/temp-mailboxes";
-    let mut response = if gateway_identity_ok(req.headers()) {
+    let path = req.uri().path();
+    let temp_mail_api =
+        path == "/api/v1/temp-mailboxes" || path.starts_with("/api/v1/temp-mailboxes/");
+    let gateway_auth_ok = gateway_identity_ok(req.headers())
+        && (!temp_mail_api || temp_api_scope_signature_ok(req.headers()));
+    let mut response = if gateway_auth_ok {
         next.run(req).await
     } else {
         (
@@ -901,7 +928,7 @@ async fn require_gateway_sig(
         )
             .into_response()
     };
-    if temp_delete_api {
+    if temp_mail_api {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
@@ -926,10 +953,7 @@ async fn healthz() -> impl IntoResponse {
 /// optimistic actions + multi-select bulk toolbar + keyboard nav + conversation collapse). Served
 /// as a cacheable static asset (not inlined) so the pages carry no inline `<script>`.
 async fn asset_webmail_js() -> Response {
-    js_asset(&format!(
-        "{TOAST_JS}\n{WEBMAIL_JS}\n{}",
-        odyssey::MOTION_JS
-    ))
+    js_asset(&format!("{TOAST_JS}\n{WEBMAIL_JS}\n{}", odyssey::MOTION_JS))
 }
 
 /// `GET /assets/compose.js` — the compose bundle (contacts autocomplete + toast + subject counter,
@@ -8710,6 +8734,9 @@ pub const HEADER_GROUPS: &str = "x-auth-groups";
 /// HMAC binding the injected identity to a 1-minute window (set by Sluice when GATEWAY_HMAC_KEY
 /// is configured). See [`gateway_identity_ok`].
 pub const HEADER_SIG: &str = "x-auth-sig";
+/// HMAC binding a PAT-authenticated request's complete scope context to the injected subject.
+pub const HEADER_SCOPE_SIG: &str = "x-auth-scope-sig";
+const TEMP_API_SCOPE_SIG_DOMAIN: &str = "holdfast.pat-scope.v1";
 
 /// The shared gateway HMAC key, read once from `GATEWAY_HMAC_KEY`. Empty (unset) disables
 /// verification — the pre-signature behavior, fully backward compatible.
@@ -8757,6 +8784,57 @@ fn sign_identity(key: &str, subject: &str, groups: &str, window: i64) -> String 
     mac.update(b"\n");
     mac.update(groups.as_bytes());
     mac.update(b"\n");
+    mac.update(window.to_string().as_bytes());
+    to_hex(&mac.finalize().into_bytes())
+}
+
+/// Verify the PAT scope context without changing the legacy identity-signature wire format.
+/// When gateway signing is enabled, a temp-mail API request carrying a subject must provide the
+/// current or previous minute's scope signature. Missing subjects are left to the API's explicit
+/// 401 check, matching [`gateway_identity_ok`]'s health/local-development compatibility behavior.
+fn temp_api_scope_signature_ok(headers: &HeaderMap) -> bool {
+    temp_api_scope_signature_ok_at(headers, gateway_key(), now_unix() / 60)
+}
+
+fn temp_api_scope_signature_ok_at(headers: &HeaderMap, key: &str, window: i64) -> bool {
+    if key.is_empty() {
+        return true;
+    }
+    let Some(subject) = identity_subject(headers) else {
+        return true;
+    };
+    let scope = headers
+        .get(HEADER_SCOPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let Some(signature) = header_value(headers, HEADER_SCOPE_SIG) else {
+        return false;
+    };
+    [window, window.saturating_sub(1)].iter().any(|&minute| {
+        ct_eq(
+            signature.as_bytes(),
+            sign_temp_api_scope_context(key, &subject, scope, TEMP_MAIL_MANAGE_SCOPE, minute)
+                .as_bytes(),
+        )
+    })
+}
+
+/// Byte-identical to Sluice's PAT scope-context signature:
+/// `domain "\n" subject "\n" full_scope "\n" required_scope "\n" epoch_minute`.
+fn sign_temp_api_scope_context(
+    key: &str,
+    subject: &str,
+    scope: &str,
+    required_scope: &str,
+    window: i64,
+) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key len");
+    for component in [TEMP_API_SCOPE_SIG_DOMAIN, subject, scope, required_scope] {
+        mac.update(component.as_bytes());
+        mac.update(b"\n");
+    }
     mac.update(window.to_string().as_bytes());
     to_hex(&mac.finalize().into_bytes())
 }
@@ -8828,16 +8906,186 @@ struct TempDeleteForm {
     address: String,
 }
 
-/// The sole OAuth scope accepted by the temporary-mailbox deletion API. Scope matching is an
+/// The sole OAuth scope accepted by the receive-only temporary-mail API. Scope matching is an
 /// exact token comparison against Sluice's injected `X-Auth-Scope`; Corvid never parses a bearer
 /// token or accepts identity/ownership fields from the request body.
-pub const TEMP_MAIL_DELETE_SCOPE: &str = "corvid:temp-mail:delete";
+pub const TEMP_MAIL_MANAGE_SCOPE: &str = "corvid:temp-mail:manage";
 const HEADER_SCOPE: &str = "x-auth-scope";
+const TEMP_API_PAGE_DEFAULT: i64 = 50;
+const TEMP_API_PAGE_MAX: i64 = 100;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TempMailboxDeleteRequest {
+struct TempMailboxCreateRequest {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TempMailboxAddressRequest {
     address: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TempMessageCursor {
+    received_at: i64,
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TempMessageListRequest {
+    address: String,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    before: Option<TempMessageCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TempMessageRequest {
+    address: String,
+    message_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TempAttachmentRequest {
+    address: String,
+    message_id: String,
+    index: usize,
+}
+
+#[derive(Serialize)]
+struct TempMailboxResponse {
+    address: String,
+    expires_at: i64,
+}
+
+impl From<Mailbox> for TempMailboxResponse {
+    fn from(mailbox: Mailbox) -> Self {
+        Self {
+            address: mailbox.addr,
+            expires_at: mailbox.expires_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TempMailboxListItem {
+    address: String,
+    expires_at: i64,
+    message_count: i64,
+}
+
+#[derive(Serialize)]
+struct TempMailboxListResponse {
+    mailboxes: Vec<TempMailboxListItem>,
+    limit: usize,
+}
+
+#[derive(Serialize)]
+struct TempMessageSummaryResponse {
+    id: String,
+    #[serde(rename = "from")]
+    msg_from: String,
+    subject: String,
+    snippet: String,
+    has_attachment: bool,
+    received_at: i64,
+    seen: bool,
+}
+
+impl From<crate::model::MessageSummary> for TempMessageSummaryResponse {
+    fn from(message: crate::model::MessageSummary) -> Self {
+        Self {
+            id: message.id,
+            msg_from: message.msg_from,
+            subject: message.subject,
+            snippet: message.snippet,
+            has_attachment: message.has_attachment,
+            received_at: message.received_at,
+            seen: message.seen,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TempMessageListResponse {
+    messages: Vec<TempMessageSummaryResponse>,
+    next_before: Option<TempMessageCursor>,
+    limit: i64,
+}
+
+#[derive(Serialize)]
+struct TempAttachmentMetaResponse {
+    index: usize,
+    filename: String,
+    content_type: String,
+    size: usize,
+}
+
+#[derive(Serialize)]
+struct TempMessageResponse {
+    id: String,
+    #[serde(rename = "from")]
+    msg_from: String,
+    to: String,
+    subject: String,
+    body_text: String,
+    body_html: String,
+    received_at: i64,
+    seen: bool,
+    attachments: Vec<TempAttachmentMetaResponse>,
+}
+
+#[derive(Clone, Copy)]
+struct TempApiError {
+    status: StatusCode,
+    message: &'static str,
+}
+
+impl IntoResponse for TempApiError {
+    fn into_response(self) -> Response {
+        json_status(self.status, self.message)
+    }
+}
+
+fn temp_api_identity(headers: &HeaderMap) -> Result<String, TempApiError> {
+    let Some(subject) = identity_subject(headers) else {
+        return Err(TempApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "gateway identity required",
+        });
+    };
+    let has_scope = header_value(headers, HEADER_SCOPE).is_some_and(|scope| {
+        scope
+            .split_ascii_whitespace()
+            .any(|token| token == TEMP_MAIL_MANAGE_SCOPE)
+    });
+    if !has_scope {
+        return Err(TempApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "required scope missing",
+        });
+    }
+    Ok(subject)
+}
+
+fn invalid_temp_api_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, TempApiError> {
+    payload.map(|Json(payload)| payload).map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            TempApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                message: "JSON body too large",
+            }
+        } else {
+            TempApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "invalid JSON body",
+            }
+        }
+    })
 }
 
 fn temp_forbidden() -> Response {
@@ -8849,7 +9097,11 @@ fn temp_forbidden() -> Response {
 }
 
 fn temp_not_found() -> Response {
-    error_page(StatusCode::NOT_FOUND, "Not found", "No such temporary address.")
+    error_page(
+        StatusCode::NOT_FOUND,
+        "Not found",
+        "No such temporary address.",
+    )
 }
 
 fn temp_csrf_error() -> Response {
@@ -8860,9 +9112,9 @@ fn temp_csrf_error() -> Response {
     )
 }
 
-/// Conservative dot-atom validation for the API input. It is intentionally syntax-only: deletion
-/// must also work for an old temporary domain that is no longer in the current runtime allowlist.
-fn canonical_delete_address(raw: &str) -> Option<String> {
+/// Conservative dot-atom validation for API input. It is intentionally syntax-only: management
+/// must also work for an old temporary domain that is no longer in the runtime allowlist.
+fn canonical_temp_address(raw: &str) -> Option<String> {
     let address = raw.trim();
     if address.is_empty() || address.len() > 320 || !address.is_ascii() {
         return None;
@@ -8927,6 +9179,342 @@ fn canonical_delete_address(raw: &str) -> Option<String> {
     Some(address.to_ascii_lowercase())
 }
 
+fn canonical_temp_message_id(raw: &str) -> Option<String> {
+    let id = raw.trim();
+    (!id.is_empty()
+        && id.len() <= 256
+        && id.is_ascii()
+        && !id
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control()))
+    .then(|| id.to_string())
+}
+
+/// `GET /api/v1/temp-mailboxes` — list the caller's active temporary inboxes.
+async fn api_temp_mailboxes_list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
+    let now = crate::now_secs();
+    let mailboxes = match state.store.list_temp_mailboxes(&owner).await {
+        Ok(mailboxes) => mailboxes,
+        Err(_) => return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
+    };
+    let mut items = Vec::with_capacity(mailboxes.len());
+    for mailbox in mailboxes
+        .into_iter()
+        .filter(|mailbox| crate::temp_mail::is_live(mailbox, now))
+    {
+        let message_count = match state.store.message_count(&mailbox.addr).await {
+            Ok(count) => count,
+            Err(_) => {
+                return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure")
+            }
+        };
+        items.push(TempMailboxListItem {
+            address: mailbox.addr,
+            expires_at: mailbox.expires_at,
+            message_count,
+        });
+    }
+    (
+        StatusCode::OK,
+        Json(TempMailboxListResponse {
+            mailboxes: items,
+            limit: state.config.temp_mail_max_per_user,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/temp-mailboxes` — generate a fresh receive-only temporary inbox.
+async fn api_temp_mailbox_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMailboxCreateRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = invalid_temp_api_json(payload) {
+        return error.into_response();
+    }
+    match crate::temp_mail::provision(&state, &subject).await {
+        Ok(mailbox) => {
+            tracing::info!(
+                target: "corvid::audit",
+                actor = %subject,
+                "temporary mailbox create API completed"
+            );
+            (
+                StatusCode::CREATED,
+                Json(TempMailboxResponse::from(mailbox)),
+            )
+                .into_response()
+        }
+        Err(crate::temp_mail::ProvisionError::Disabled) => json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporary mail is disabled",
+        ),
+        Err(crate::temp_mail::ProvisionError::QuotaExceeded) => {
+            json_status(StatusCode::CONFLICT, "temporary mailbox quota reached")
+        }
+        Err(crate::temp_mail::ProvisionError::Storage) => {
+            json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure")
+        }
+    }
+}
+
+/// `POST /api/v1/temp-mailboxes/renew` — extend an owned temporary inbox's TTL.
+async fn api_temp_mailbox_renew(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMailboxAddressRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
+    };
+    let Some(address) = canonical_temp_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    match crate::temp_mail::renew(&state, &subject, &address).await {
+        Ok(mailbox) => (StatusCode::OK, Json(TempMailboxResponse::from(mailbox))).into_response(),
+        Err(crate::temp_mail::RenewError::NotFound) => {
+            json_status(StatusCode::NOT_FOUND, "temporary mailbox not found")
+        }
+        Err(crate::temp_mail::RenewError::QuotaExceeded) => {
+            json_status(StatusCode::CONFLICT, "temporary mailbox quota reached")
+        }
+        Err(crate::temp_mail::RenewError::Storage) => {
+            json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure")
+        }
+    }
+}
+
+/// `POST /api/v1/temp-mailboxes/messages/list` — keyset-paginated Inbox summaries.
+async fn api_temp_messages_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMessageListRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
+    };
+    let Some(address) = canonical_temp_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    let before = match payload.before {
+        Some(cursor) => {
+            let Some(id) = canonical_temp_message_id(&cursor.id) else {
+                return json_status(StatusCode::BAD_REQUEST, "invalid cursor");
+            };
+            Some((cursor.received_at, id))
+        }
+        None => None,
+    };
+    let limit = payload
+        .limit
+        .unwrap_or(TEMP_API_PAGE_DEFAULT)
+        .clamp(1, TEMP_API_PAGE_MAX);
+    let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
+    let messages = match state
+        .store
+        .list_owned_temp_messages(
+            &address,
+            &owner,
+            crate::now_secs(),
+            before,
+            limit.saturating_add(1),
+        )
+        .await
+    {
+        Ok(Some(messages)) => messages,
+        Ok(None) => return json_status(StatusCode::NOT_FOUND, "temporary mailbox not found"),
+        Err(_) => return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
+    };
+    let mut messages = messages;
+    let has_more = messages.len() > limit as usize;
+    messages.truncate(limit as usize);
+    let next_before = has_more.then(|| {
+        let last = messages
+            .last()
+            .expect("a page with an overflow row has a retained row");
+        TempMessageCursor {
+            received_at: last.received_at,
+            id: last.id.clone(),
+        }
+    });
+    (
+        StatusCode::OK,
+        Json(TempMessageListResponse {
+            messages: messages
+                .into_iter()
+                .map(TempMessageSummaryResponse::from)
+                .collect(),
+            next_before,
+            limit,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/temp-mailboxes/messages/get` — read one owned message without exposing RFC822.
+async fn api_temp_message_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMessageRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
+    };
+    let Some(address) = canonical_temp_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    let Some(message_id) = canonical_temp_message_id(&payload.message_id) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid message id");
+    };
+    let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
+    let message = match state
+        .store
+        .get_owned_temp_message(&address, &owner, &message_id, crate::now_secs())
+        .await
+    {
+        Ok(Some(message)) => message,
+        Ok(None) => return json_status(StatusCode::NOT_FOUND, "message not found"),
+        Err(_) => return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
+    };
+    let attachments = crate::rfc822::list_attachments(&message.raw_rfc822)
+        .into_iter()
+        .map(|attachment| TempAttachmentMetaResponse {
+            index: attachment.index,
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            size: attachment.size,
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(TempMessageResponse {
+            id: message.id,
+            msg_from: message.msg_from,
+            to: message.msg_to,
+            subject: message.subject,
+            body_text: message.body_text,
+            body_html: crate::sanitize::sanitize_html(&message.body_html),
+            received_at: message.received_at,
+            seen: message.seen,
+            attachments,
+        }),
+    )
+        .into_response()
+}
+
+/// `DELETE /api/v1/temp-mailboxes/messages` — idempotently delete one owned message.
+async fn api_temp_message_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMessageRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
+    };
+    let Some(address) = canonical_temp_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    let Some(message_id) = canonical_temp_message_id(&payload.message_id) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid message id");
+    };
+    let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
+    match state
+        .store
+        .delete_owned_temp_message(&address, &owner, &message_id, crate::now_secs())
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
+    }
+}
+
+/// `POST /api/v1/temp-mailboxes/messages/attachments/get` — download a non-inline attachment.
+async fn api_temp_attachment_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempAttachmentRequest>, JsonRejection>,
+) -> Response {
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
+    };
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
+    };
+    let Some(address) = canonical_temp_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+    let Some(message_id) = canonical_temp_message_id(&payload.message_id) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid message id");
+    };
+    let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
+    let message = match state
+        .store
+        .get_owned_temp_message(&address, &owner, &message_id, crate::now_secs())
+        .await
+    {
+        Ok(Some(message)) => message,
+        Ok(None) => return json_status(StatusCode::NOT_FOUND, "message not found"),
+        Err(_) => return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
+    };
+    let Some((attachment, inline)) =
+        crate::rfc822::extract_attachment_with_inline(&message.raw_rfc822, payload.index)
+    else {
+        return json_status(StatusCode::NOT_FOUND, "attachment not found");
+    };
+    if inline {
+        return json_status(StatusCode::NOT_FOUND, "attachment not found");
+    }
+    let disposition = format!("attachment; filename=\"{}\"", attachment.filename);
+    let content_type = HeaderValue::try_from(attachment.content_type.as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let disposition = HeaderValue::try_from(disposition.as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    let mut response = attachment.data.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_DISPOSITION, disposition);
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 /// `DELETE /api/v1/temp-mailboxes` — Sluice-authenticated, scope-gated, owner-scoped deletion.
 /// All not-found/foreign/permanent/repeated cases deliberately collapse to 204 to avoid an address
 /// ownership oracle. `require_gateway_sig` attaches the non-cacheable response headers uniformly,
@@ -8934,23 +9522,17 @@ fn canonical_delete_address(raw: &str) -> Option<String> {
 async fn api_temp_mailbox_delete(
     State(state): State<AppState>,
     headers: HeaderMap,
-    payload: Result<Json<TempMailboxDeleteRequest>, JsonRejection>,
+    payload: Result<Json<TempMailboxAddressRequest>, JsonRejection>,
 ) -> Response {
-    let Some(subject) = identity_subject(&headers) else {
-        return json_status(StatusCode::UNAUTHORIZED, "gateway identity required");
+    let subject = match temp_api_identity(&headers) {
+        Ok(subject) => subject,
+        Err(error) => return error.into_response(),
     };
-    let has_scope = header_value(&headers, HEADER_SCOPE).is_some_and(|scope| {
-        scope
-            .split_ascii_whitespace()
-            .any(|s| s == TEMP_MAIL_DELETE_SCOPE)
-    });
-    if !has_scope {
-        return json_status(StatusCode::FORBIDDEN, "required scope missing");
-    }
-    let Ok(Json(payload)) = payload else {
-        return json_status(StatusCode::BAD_REQUEST, "invalid JSON body");
+    let payload = match invalid_temp_api_json(payload) {
+        Ok(payload) => payload,
+        Err(error) => return error.into_response(),
     };
-    let Some(address) = canonical_delete_address(&payload.address) else {
+    let Some(address) = canonical_temp_address(&payload.address) else {
         return json_status(StatusCode::BAD_REQUEST, "invalid address");
     };
 
@@ -9021,7 +9603,11 @@ async fn temp_index(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let limit = state.config.temp_mail_max_per_user;
     let now = crate::now_secs();
     let owner = crate::temp_mail::temporary_mailbox_owner(&sub);
-    let mut boxes = state.store.list_temp_mailboxes(&owner).await.unwrap_or_default();
+    let mut boxes = state
+        .store
+        .list_temp_mailboxes(&owner)
+        .await
+        .unwrap_or_default();
     boxes.retain(|mb| crate::temp_mail::is_live(mb, now));
 
     let mut list = String::new();
@@ -9044,7 +9630,9 @@ async fn temp_index(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let control = if !enabled {
         r#"<p class="tm-note">Temporary mail is not configured on this server.</p>"#.to_string()
     } else if boxes.len() >= limit {
-        format!(r#"<p class="tm-note">You are at your limit of {limit} temporary addresses. Delete one to create another.</p>"#)
+        format!(
+            r#"<p class="tm-note">You are at your limit of {limit} temporary addresses. Delete one to create another.</p>"#
+        )
     } else {
         format!(
             r#"<form method="post" action="/temp/new" class="tm-gen"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="tm-btn tm-btn--primary">Generate a temporary address</button></form>"#,
@@ -9125,15 +9713,25 @@ async fn temp_box(
     if temp_owned_mailbox(&state, &sub, &addr).await.is_none() {
         return temp_not_found();
     }
-    let msgs = state.store.list_messages(&addr, 100).await.unwrap_or_default();
+    let msgs = state
+        .store
+        .list_messages(&addr, 100)
+        .await
+        .unwrap_or_default();
     let now = crate::now_secs();
     let mut rows = String::new();
     if msgs.is_empty() {
-        rows.push_str(r#"<p class="tm-empty">No mail yet. Anything sent to this address lands here.</p>"#);
+        rows.push_str(
+            r#"<p class="tm-empty">No mail yet. Anything sent to this address lands here.</p>"#,
+        );
     } else {
         for m in &msgs {
             let ago = fmt_short_duration(now - m.received_at);
-            let subj = if m.subject.is_empty() { "(no subject)" } else { &m.subject };
+            let subj = if m.subject.is_empty() {
+                "(no subject)"
+            } else {
+                &m.subject
+            };
             rows.push_str(&format!(
                 r#"<a class="tm-msg" href="/temp/box/{bx}/msg/{id}"><span class="tm-from">{from}</span><span class="tm-subj">{subj}</span><span class="tm-ago">{ago} ago</span></a>"#,
                 bx = url_encode(&addr),
@@ -9173,7 +9771,11 @@ async fn temp_read(
     } else {
         format!("<pre class=\"tm-text\">{}</pre>", esc(&msg.body_text))
     };
-    let subj = if msg.subject.is_empty() { "(no subject)" } else { &msg.subject };
+    let subj = if msg.subject.is_empty() {
+        "(no subject)"
+    } else {
+        &msg.subject
+    };
     let main = format!(
         r#"<div class="tm-wrap"><header class="tm-head"><a class="tm-back" href="/temp/box/{bx}">← {addr}</a><h1 class="tm-subj-title">{subj}</h1><p class="tm-from-line">From {from}</p></header><article class="tm-body">{body}</article></div>"#,
         bx = url_encode(&addr),
@@ -9458,6 +10060,98 @@ mod tests {
             sign_identity("test-key", "usr_bob", "", 2),
             "930f82fb1224e69c9c5bc46e545c3b108b1eeb6c9078c7a33fc24f30c595f658"
         );
+    }
+
+    #[test]
+    fn temp_api_scope_signature_matches_go_vector_and_rejects_context_tampering() {
+        const KEY: &str = "test-key";
+        const SUBJECT: &str = "usr_alice";
+        const SCOPE: &str = "profile corvid:temp-mail:manage";
+        const WINDOW: i64 = 1;
+
+        // MUST equal Sluice's fixed vector for the canonical PAT scope-context payload.
+        assert_eq!(
+            sign_temp_api_scope_context(KEY, SUBJECT, SCOPE, TEMP_MAIL_MANAGE_SCOPE, WINDOW),
+            "405cea451b81706349a89dfcccb4db503e972d7afe8019c4cf54beedebd530aa"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_SUBJECT, HeaderValue::from_static(SUBJECT));
+        headers.insert(HEADER_SCOPE, HeaderValue::from_static(SCOPE));
+        headers.insert(
+            HEADER_SCOPE_SIG,
+            HeaderValue::try_from(sign_temp_api_scope_context(
+                KEY,
+                SUBJECT,
+                SCOPE,
+                TEMP_MAIL_MANAGE_SCOPE,
+                WINDOW,
+            ))
+            .unwrap(),
+        );
+        assert!(temp_api_scope_signature_ok_at(&headers, KEY, WINDOW));
+        assert!(temp_api_scope_signature_ok_at(&headers, "", WINDOW));
+
+        let mut previous = headers.clone();
+        previous.insert(
+            HEADER_SCOPE_SIG,
+            HeaderValue::try_from(sign_temp_api_scope_context(
+                KEY,
+                SUBJECT,
+                SCOPE,
+                TEMP_MAIL_MANAGE_SCOPE,
+                WINDOW - 1,
+            ))
+            .unwrap(),
+        );
+        assert!(temp_api_scope_signature_ok_at(&previous, KEY, WINDOW));
+
+        let mut scope_tampered = headers.clone();
+        scope_tampered.insert(
+            HEADER_SCOPE,
+            HeaderValue::from_static("openid corvid:temp-mail:manage"),
+        );
+        assert!(!temp_api_scope_signature_ok_at(
+            &scope_tampered,
+            KEY,
+            WINDOW
+        ));
+
+        let mut subject_tampered = headers.clone();
+        subject_tampered.insert(HEADER_SUBJECT, HeaderValue::from_static("user-bob"));
+        assert!(!temp_api_scope_signature_ok_at(
+            &subject_tampered,
+            KEY,
+            WINDOW
+        ));
+
+        let mut required_tampered = headers.clone();
+        required_tampered.insert(
+            HEADER_SCOPE_SIG,
+            HeaderValue::try_from(sign_temp_api_scope_context(
+                KEY,
+                SUBJECT,
+                SCOPE,
+                "corvid:temp-mail:delete",
+                WINDOW,
+            ))
+            .unwrap(),
+        );
+        assert!(!temp_api_scope_signature_ok_at(
+            &required_tampered,
+            KEY,
+            WINDOW
+        ));
+
+        // A legacy identity signature by itself cannot authorize the PAT scope context.
+        let mut identity_only = HeaderMap::new();
+        identity_only.insert(HEADER_SUBJECT, HeaderValue::from_static(SUBJECT));
+        identity_only.insert(HEADER_SCOPE, HeaderValue::from_static(SCOPE));
+        identity_only.insert(
+            HEADER_SIG,
+            HeaderValue::try_from(sign_identity(KEY, SUBJECT, "", WINDOW)).unwrap(),
+        );
+        assert!(!temp_api_scope_signature_ok_at(&identity_only, KEY, WINDOW));
     }
 
     #[test]

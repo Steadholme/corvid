@@ -89,6 +89,14 @@ pub trait Store: Send + Sync {
     /// Temporary mailboxes owned by the synthetic `owner_sub` (`temp:{user}`), newest expiry
     /// first. Backs the per-user "my temporary addresses" listing and the quota check.
     async fn list_temp_mailboxes(&self, owner_sub: &str) -> Result<Vec<Mailbox>, StoreError>;
+    /// Atomically extend/recover a temporary mailbox only for its exact synthetic owner. Returns
+    /// the updated mailbox, or `None` for missing, foreign, or permanent rows.
+    async fn renew_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        expires_at: i64,
+    ) -> Result<Option<Mailbox>, StoreError>;
     /// Atomically delete a temporary mailbox and all mailbox-scoped data, but only when its
     /// synthetic owner exactly matches `owner_sub`. Returns whether anything was removed.
     async fn delete_owned_temp_mailbox(
@@ -113,6 +121,32 @@ pub trait Store: Send + Sync {
     /// and insert serialize with temporary-mailbox deletion, preventing post-delete orphan rows.
     async fn store_temp_message_if_live(&self, msg: &Message, now: i64)
         -> Result<bool, StoreError>;
+    /// Fetch one message only through an exact owner-bound, still-live temporary mailbox.
+    async fn get_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<Option<Message>, StoreError>;
+    /// List one owner-bound live temporary inbox. `None` hides missing/foreign/permanent/expired
+    /// mailboxes; `Some(empty)` represents an authorized empty inbox.
+    async fn list_owned_temp_messages(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Option<Vec<MessageSummary>>, StoreError>;
+    /// Atomically delete one message only from an exact owner-bound, still-live temporary mailbox.
+    async fn delete_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError>;
     /// Insert or replace an editable Drafts message by id, scoped to its owning mailbox.
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError>;
     /// Delete a Drafts message by id, scoped to its owning mailbox. Returns whether a row changed.
@@ -525,9 +559,14 @@ impl InMemoryStore {
     /// Remove every row keyed by a mailbox. Callers must hold `mailboxes` for the whole operation;
     /// that lock is the in-memory equivalent of the PostgreSQL mailbox-row transaction lock.
     fn purge_mailbox_data(&self, addr: &str) {
-        // Joins/dependants first, then their parents. Each guard is intentionally short-lived, but
-        // the caller's mailbox coordinator guard keeps the overall mutation indivisible to temp
-        // delivery and to every other temp deletion.
+        // Each guard is intentionally short-lived, but the caller's mailbox coordinator guard
+        // keeps the overall mutation indivisible to temp delivery and every other temp deletion.
+        // `messages` is always the first dependent lock after `mailboxes`; owner-scoped message
+        // deletion follows the same order before cleaning its joins/annotation.
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .retain(|message| message.mailbox != addr);
         self.message_labels
             .lock()
             .expect("message_labels lock poisoned")
@@ -598,10 +637,6 @@ impl InMemoryStore {
             .lock()
             .expect("labels lock poisoned")
             .retain(|label| label.mailbox != addr);
-        self.messages
-            .lock()
-            .expect("messages lock poisoned")
-            .retain(|message| message.mailbox != addr);
     }
 }
 
@@ -946,6 +981,24 @@ impl Store for InMemoryStore {
         Ok(v)
     }
 
+    async fn renew_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        expires_at: i64,
+    ) -> Result<Option<Mailbox>, StoreError> {
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let Some(mailbox) = mailboxes.iter_mut().find(|mailbox| {
+            mailbox.addr == addr
+                && mailbox.owner_sub == owner_sub
+                && mailbox.owner_sub.starts_with("temp:")
+        }) else {
+            return Ok(None);
+        };
+        mailbox.expires_at = expires_at;
+        Ok(Some(mailbox.clone()))
+    }
+
     async fn delete_owned_temp_mailbox(
         &self,
         addr: &str,
@@ -1045,6 +1098,100 @@ impl Store for InMemoryStore {
             .push(msg.clone());
         drop(mailboxes);
         Ok(true)
+    }
+
+    async fn get_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<Option<Message>, StoreError> {
+        let mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let authorized = mailboxes.iter().any(|mailbox| {
+            mailbox.addr == addr
+                && mailbox.owner_sub == owner_sub
+                && mailbox.owner_sub.starts_with("temp:")
+                && mailbox.expires_at > now
+        });
+        if !authorized {
+            return Ok(None);
+        }
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        Ok(messages
+            .iter()
+            .find(|message| message.mailbox == addr && message.id == message_id)
+            .cloned())
+    }
+
+    async fn list_owned_temp_messages(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Option<Vec<MessageSummary>>, StoreError> {
+        let mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let authorized = mailboxes.iter().any(|mailbox| {
+            mailbox.addr == addr
+                && mailbox.owner_sub == owner_sub
+                && mailbox.owner_sub.starts_with("temp:")
+                && mailbox.expires_at > now
+        });
+        if !authorized {
+            return Ok(None);
+        }
+        let messages = self.messages.lock().expect("messages lock poisoned");
+        let mut rows: Vec<Message> = messages
+            .iter()
+            .filter(|message| message.mailbox == addr && message.folder == "INBOX")
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.received_at
+                .cmp(&a.received_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        apply_before(&mut rows, before);
+        rows.truncate(limit.max(0) as usize);
+        Ok(Some(rows.iter().map(summary).collect()))
+    }
+
+    async fn delete_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let authorized = mailboxes.iter().any(|mailbox| {
+            mailbox.addr == addr
+                && mailbox.owner_sub == owner_sub
+                && mailbox.owner_sub.starts_with("temp:")
+                && mailbox.expires_at > now
+        });
+        if !authorized {
+            return Ok(false);
+        }
+        let mut messages = self.messages.lock().expect("messages lock poisoned");
+        let before = messages.len();
+        messages.retain(|message| !(message.mailbox == addr && message.id == message_id));
+        let removed = messages.len() != before;
+        if removed {
+            self.message_labels
+                .lock()
+                .expect("message_labels lock poisoned")
+                .retain(|(mailbox, id, _)| !(mailbox == addr && id == message_id));
+            self.spam_annotations
+                .lock()
+                .expect("spam_annotations lock poisoned")
+                .retain(|annotation| {
+                    !(annotation.mailbox == addr && annotation.message_id == message_id)
+                });
+        }
+        Ok(removed)
     }
 
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
@@ -3435,10 +3582,11 @@ impl Store for PgStore {
     }
 
     async fn list_mailboxes(&self) -> Result<Vec<Mailbox>, StoreError> {
-        let rows = sqlx::query("SELECT addr, owner_sub, expires_at FROM mailboxes ORDER BY addr ASC")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(backend)?;
+        let rows =
+            sqlx::query("SELECT addr, owner_sub, expires_at FROM mailboxes ORDER BY addr ASC")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(backend)?;
         rows.iter()
             .map(Self::mailbox_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -3467,6 +3615,42 @@ impl Store for PgStore {
             .map(Self::mailbox_from_row)
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(backend)
+    }
+
+    async fn renew_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        expires_at: i64,
+    ) -> Result<Option<Mailbox>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let owned = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub = $2 AND owner_sub LIKE 'temp:%' \
+             FOR UPDATE",
+        )
+        .bind(addr)
+        .bind(owner_sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !owned {
+            tx.commit().await.map_err(backend)?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "UPDATE mailboxes SET expires_at = $2 WHERE addr = $1 \
+             RETURNING addr, owner_sub, expires_at",
+        )
+        .bind(addr)
+        .bind(expires_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let mailbox = Self::mailbox_from_row(&row).map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(Some(mailbox))
     }
 
     async fn delete_owned_temp_mailbox(
@@ -3643,6 +3827,160 @@ impl Store for PgStore {
         .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(true)
+    }
+
+    async fn get_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<Option<Message>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let authorized = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub = $2 AND owner_sub LIKE 'temp:%' \
+               AND expires_at > $3 \
+             FOR SHARE",
+        )
+        .bind(addr)
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !authorized {
+            tx.commit().await.map_err(backend)?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
+                    received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id \
+             FROM messages WHERE mailbox = $1 AND id = $2",
+        )
+        .bind(addr)
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let message = row
+            .as_ref()
+            .map(Self::message_from_row)
+            .transpose()
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(message)
+    }
+
+    async fn list_owned_temp_messages(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        now: i64,
+        before: Option<(i64, String)>,
+        limit: i64,
+    ) -> Result<Option<Vec<MessageSummary>>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let authorized = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub = $2 AND owner_sub LIKE 'temp:%' \
+               AND expires_at > $3 \
+             FOR SHARE",
+        )
+        .bind(addr)
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !authorized {
+            tx.commit().await.map_err(backend)?;
+            return Ok(None);
+        }
+        let (cursor_ts, cursor_id) = Self::cursor(before);
+        let rows = sqlx::query(
+            "SELECT id, msg_from, subject, substr(COALESCE(body_text, ''), 1, 240) AS snippet, \
+                    COALESCE(has_attachment, 0) AS has_attachment, received_at, seen, starred, \
+                    snooze_until, muted, folder \
+             FROM messages WHERE mailbox = $1 AND folder = 'INBOX' \
+               AND (received_at < $2 OR (received_at = $2 AND id < $3)) \
+             ORDER BY received_at DESC, id DESC LIMIT $4",
+        )
+        .bind(addr)
+        .bind(cursor_ts)
+        .bind(&cursor_id)
+        .bind(limit.max(0))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let messages = rows
+            .iter()
+            .map(summary_from_row)
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(Some(messages))
+    }
+
+    async fn delete_owned_temp_message(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+        message_id: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let authorized = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub = $2 AND owner_sub LIKE 'temp:%' \
+               AND expires_at > $3 \
+             FOR UPDATE",
+        )
+        .bind(addr)
+        .bind(owner_sub)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !authorized {
+            tx.commit().await.map_err(backend)?;
+            return Ok(false);
+        }
+        let message_exists =
+            sqlx::query("SELECT id FROM messages WHERE mailbox = $1 AND id = $2 FOR UPDATE")
+                .bind(addr)
+                .bind(message_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(backend)?
+                .is_some();
+        if !message_exists {
+            tx.commit().await.map_err(backend)?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM message_labels WHERE mailbox = $1 AND message_id = $2")
+            .bind(addr)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        sqlx::query("DELETE FROM spam_annotations WHERE mailbox = $1 AND message_id = $2")
+            .bind(addr)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let result = sqlx::query("DELETE FROM messages WHERE mailbox = $1 AND id = $2")
+            .bind(addr)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(result.rows_affected() == 1)
     }
 
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
@@ -5763,6 +6101,211 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn owned_temp_renew_and_message_mutations_are_live_and_owner_scoped() {
+        let store = InMemoryStore::new();
+        let now = 1_000;
+        let owner = "temp:alice";
+        let other_owner = "temp:bob";
+        let mine = "mine@temp.example";
+        let other = "other@temp.example";
+        let expired = "expired@temp.example";
+        let empty = "empty@temp.example";
+        for mailbox in [
+            Mailbox {
+                addr: mine.into(),
+                owner_sub: owner.into(),
+                expires_at: 0,
+            },
+            Mailbox {
+                addr: other.into(),
+                owner_sub: other_owner.into(),
+                expires_at: now + 100,
+            },
+            Mailbox {
+                addr: expired.into(),
+                owner_sub: owner.into(),
+                expires_at: now,
+            },
+            Mailbox {
+                addr: empty.into(),
+                owner_sub: owner.into(),
+                expires_at: now + 100,
+            },
+            Mailbox {
+                addr: "permanent@example.com".into(),
+                owner_sub: "ordinary-owner".into(),
+                expires_at: 0,
+            },
+        ] {
+            store.upsert_mailbox(&mailbox).await.unwrap();
+        }
+
+        assert!(store
+            .renew_owned_temp_mailbox(mine, other_owner, now + 200)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .renew_owned_temp_mailbox("permanent@example.com", "ordinary-owner", now + 200)
+            .await
+            .unwrap()
+            .is_none());
+        let renewed = store
+            .renew_owned_temp_mailbox(mine, owner, now + 200)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.expires_at, now + 200);
+
+        let mut mine_old = msg("temp-mine-old", now + 1);
+        mine_old.mailbox = mine.into();
+        let mut mine_new = msg("temp-mine-new", now + 2);
+        mine_new.mailbox = mine.into();
+        let mut other_message = msg("temp-other", now + 3);
+        other_message.mailbox = other.into();
+        let mut expired_message = msg("temp-expired", now + 4);
+        expired_message.mailbox = expired.into();
+        let mut archived_message = msg("temp-mine-archived", now + 5);
+        archived_message.mailbox = mine.into();
+        archived_message.folder = "Archive".into();
+        for message in [
+            &mine_old,
+            &mine_new,
+            &other_message,
+            &expired_message,
+            &archived_message,
+        ] {
+            store.store_message(message).await.unwrap();
+        }
+        store
+            .add_label(&Label {
+                id: "temp-delete-label".into(),
+                mailbox: mine.into(),
+                name: "Delete".into(),
+                color: String::new(),
+            })
+            .await
+            .unwrap();
+        store
+            .assign_label(mine, &mine_old.id, "temp-delete-label")
+            .await
+            .unwrap();
+        store
+            .set_spam_annotation(&SpamAnnotation {
+                mailbox: mine.into(),
+                message_id: mine_old.id.clone(),
+                score: 1,
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_owned_temp_messages(mine, owner, now, None, 1)
+                .await
+                .unwrap()
+                .unwrap()[0]
+                .id,
+            mine_new.id
+        );
+        let page = store
+            .list_owned_temp_messages(
+                mine,
+                owner,
+                now,
+                Some((mine_new.received_at, mine_new.id.clone())),
+                10,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            [mine_old.id.as_str()]
+        );
+        assert_eq!(
+            store
+                .list_owned_temp_messages(empty, owner, now, None, 10)
+                .await
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert!(store
+            .list_owned_temp_messages(mine, other_owner, now, None, 10)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .list_owned_temp_messages(expired, owner, now, None, 10)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert_eq!(
+            store
+                .get_owned_temp_message(mine, owner, &mine_old.id, now)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            mine_old.id
+        );
+        assert!(store
+            .get_owned_temp_message(mine, owner, &other_message.id, now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_owned_temp_message(expired, owner, &expired_message.id, now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delete_owned_temp_message(mine, owner, &other_message.id, now)
+            .await
+            .unwrap());
+        assert!(!store
+            .delete_owned_temp_message(expired, owner, &expired_message.id, now)
+            .await
+            .unwrap());
+        assert!(!store
+            .delete_owned_temp_message(mine, other_owner, &mine_old.id, now)
+            .await
+            .unwrap());
+        assert!(store
+            .delete_owned_temp_message(mine, owner, &mine_old.id, now)
+            .await
+            .unwrap());
+        assert!(store
+            .labels_for_message(mine, &mine_old.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .spam_annotation(mine, &mine_old.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!store
+            .delete_owned_temp_message(mine, owner, &mine_old.id, now)
+            .await
+            .unwrap());
+        assert!(store
+            .get_message(&other_message.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_message(&expired_message.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

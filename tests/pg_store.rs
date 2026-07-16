@@ -56,13 +56,15 @@ async fn pg_store_full_integration() {
     pg.upsert_mailbox(&Mailbox {
         addr: "w33d@w33d.xyz".into(),
         owner_sub: "w33d".into(),
-        expires_at: 0,    })
+        expires_at: 0,
+    })
     .await
     .unwrap();
     pg.upsert_mailbox(&Mailbox {
         addr: "w33d@w33d.xyz".into(),
         owner_sub: "w33d".into(),
-        expires_at: 0,    })
+        expires_at: 0,
+    })
     .await
     .unwrap();
     assert_eq!(
@@ -467,7 +469,8 @@ async fn pg_store_full_integration() {
     pg.upsert_mailbox(&Mailbox {
         addr: "thr@w33d.xyz".into(),
         owner_sub: "thr".into(),
-        expires_at: 0,    })
+        expires_at: 0,
+    })
     .await
     .unwrap();
     let thr = |id: &str, tid: &str, mid: &str, subj: &str, at: i64| Message {
@@ -981,6 +984,287 @@ async fn pg_store_full_integration() {
         .unwrap();
     assert!(!pg.delete_expired_temp_mailbox(stale_gc, now).await.unwrap());
     assert!(pg.get_mailbox(stale_gc).await.unwrap().is_some());
+
+    // Renewal is exact-owner scoped and can recover both expired and historical zero-TTL rows.
+    let renew_owner = "temp:renew-owner";
+    for (addr, expires_at) in [
+        ("renew-zero@temp.example", 0),
+        ("renew-expired@temp.example", now - 1),
+    ] {
+        pg.upsert_mailbox(&Mailbox {
+            addr: addr.into(),
+            owner_sub: renew_owner.into(),
+            expires_at,
+        })
+        .await
+        .unwrap();
+        assert!(pg
+            .renew_owned_temp_mailbox(addr, "temp:foreign-owner", now + 7200)
+            .await
+            .unwrap()
+            .is_none());
+        let renewed = pg
+            .renew_owned_temp_mailbox(addr, renew_owner, now + 7200)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.owner_sub, renew_owner);
+        assert_eq!(renewed.expires_at, now + 7200);
+    }
+    pg.upsert_mailbox(&Mailbox {
+        addr: "renew-permanent@example.com".into(),
+        owner_sub: "ordinary-owner".into(),
+        expires_at: 0,
+    })
+    .await
+    .unwrap();
+    assert!(pg
+        .renew_owned_temp_mailbox("renew-permanent@example.com", "ordinary-owner", now + 7200)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Renewal and GC lock the same mailbox row. Either renewal wins and GC revalidates to false,
+    // or GC wins and renewal returns None; no stale scan may delete a successfully renewed row.
+    let renew_race_store = Arc::new(PgStore::connect(&url).await.unwrap());
+    let renew_race_addr = "renew-gc-race@temp.example";
+    let renew_race_owner = "temp:renew-race-owner";
+    renew_race_store
+        .upsert_mailbox(&Mailbox {
+            addr: renew_race_addr.into(),
+            owner_sub: renew_race_owner.into(),
+            expires_at: now - 1,
+        })
+        .await
+        .unwrap();
+    let renew_barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let renewing = {
+        let store = renew_race_store.clone();
+        let barrier = renew_barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .renew_owned_temp_mailbox(renew_race_addr, renew_race_owner, now + 7200)
+                .await
+                .unwrap()
+        })
+    };
+    let collecting = {
+        let store = renew_race_store.clone();
+        let barrier = renew_barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .delete_expired_temp_mailbox(renew_race_addr, now)
+                .await
+                .unwrap()
+        })
+    };
+    renew_barrier.wait().await;
+    let renewed = renewing.await.unwrap();
+    let collected = collecting.await.unwrap();
+    assert!(
+        (renewed.is_some() && !collected) || (renewed.is_none() && collected),
+        "renew and GC must serialize to one coherent winner"
+    );
+    match renewed {
+        Some(mailbox) => {
+            assert_eq!(mailbox.expires_at, now + 7200);
+            assert_eq!(
+                renew_race_store
+                    .get_mailbox(renew_race_addr)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expires_at,
+                now + 7200
+            );
+        }
+        None => assert!(renew_race_store
+            .get_mailbox(renew_race_addr)
+            .await
+            .unwrap()
+            .is_none()),
+    }
+
+    // Owner-scoped temp message reads/list/delete all revalidate a live temp mailbox under the
+    // same transaction lock. Inbox listing excludes other folders and preserves keyset ordering.
+    let message_owner = "temp:message-owner";
+    let message_other_owner = "temp:message-other-owner";
+    let message_addr = "messages@temp.example";
+    let message_other_addr = "messages-other@temp.example";
+    let message_expired_addr = "messages-expired@temp.example";
+    for mailbox in [
+        Mailbox {
+            addr: message_addr.into(),
+            owner_sub: message_owner.into(),
+            expires_at: now + 7200,
+        },
+        Mailbox {
+            addr: message_other_addr.into(),
+            owner_sub: message_other_owner.into(),
+            expires_at: now + 7200,
+        },
+        Mailbox {
+            addr: message_expired_addr.into(),
+            owner_sub: message_owner.into(),
+            expires_at: now,
+        },
+    ] {
+        pg.upsert_mailbox(&mailbox).await.unwrap();
+    }
+    let temp_test_message = |id: &str, mailbox: &str, received_at: i64, folder: &str| Message {
+        id: id.into(),
+        mailbox: mailbox.into(),
+        received_at,
+        folder: folder.into(),
+        ..temp_message.clone()
+    };
+    let message_old = temp_test_message("owned-temp-old", message_addr, now + 1, "INBOX");
+    let message_new = temp_test_message("owned-temp-new", message_addr, now + 2, "INBOX");
+    let message_archived =
+        temp_test_message("owned-temp-archived", message_addr, now + 3, "Archive");
+    let message_other = temp_test_message("owned-temp-other", message_other_addr, now + 4, "INBOX");
+    let message_expired =
+        temp_test_message("owned-temp-expired", message_expired_addr, now + 5, "INBOX");
+    for message in [
+        &message_old,
+        &message_new,
+        &message_archived,
+        &message_other,
+        &message_expired,
+    ] {
+        pg.store_message(message).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO labels (id, mailbox, name) \
+         VALUES ('owned-temp-delete-label', $1, 'Delete')",
+    )
+    .bind(message_addr)
+    .execute(&inspect)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO message_labels (mailbox, message_id, label_id) \
+         VALUES ($1, $2, 'owned-temp-delete-label')",
+    )
+    .bind(message_addr)
+    .bind(&message_old.id)
+    .execute(&inspect)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO spam_annotations (message_id, mailbox, score, reason) \
+         VALUES ($1, $2, 1, 'test')",
+    )
+    .bind(&message_old.id)
+    .bind(message_addr)
+    .execute(&inspect)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        pg.get_owned_temp_message(message_addr, message_owner, &message_old.id, now)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        message_old.id
+    );
+    assert!(pg
+        .get_owned_temp_message(message_addr, message_other_owner, &message_old.id, now)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(pg
+        .get_owned_temp_message(message_addr, message_owner, &message_other.id, now)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(pg
+        .get_owned_temp_message(
+            message_expired_addr,
+            message_owner,
+            &message_expired.id,
+            now,
+        )
+        .await
+        .unwrap()
+        .is_none());
+
+    let first_page = pg
+        .list_owned_temp_messages(message_addr, message_owner, now, None, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, message_new.id);
+    let second_page = pg
+        .list_owned_temp_messages(
+            message_addr,
+            message_owner,
+            now,
+            Some((first_page[0].received_at, first_page[0].id.clone())),
+            10,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        [message_old.id.as_str()]
+    );
+    assert!(pg
+        .list_owned_temp_messages(message_addr, message_other_owner, now, None, 10)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(pg
+        .list_owned_temp_messages(message_expired_addr, message_owner, now, None, 10)
+        .await
+        .unwrap()
+        .is_none());
+
+    assert!(!pg
+        .delete_owned_temp_message(message_addr, message_owner, &message_other.id, now)
+        .await
+        .unwrap());
+    assert!(!pg
+        .delete_owned_temp_message(
+            message_expired_addr,
+            message_owner,
+            &message_expired.id,
+            now,
+        )
+        .await
+        .unwrap());
+    assert!(!pg
+        .delete_owned_temp_message(message_addr, message_other_owner, &message_old.id, now)
+        .await
+        .unwrap());
+    assert!(pg
+        .delete_owned_temp_message(message_addr, message_owner, &message_old.id, now)
+        .await
+        .unwrap());
+    assert!(!pg
+        .delete_owned_temp_message(message_addr, message_owner, &message_old.id, now)
+        .await
+        .unwrap());
+    assert!(pg.get_message(&message_other.id).await.unwrap().is_some());
+    for table in ["message_labels", "spam_annotations"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE mailbox = $1 AND message_id = $2"
+        ))
+        .bind(message_addr)
+        .bind(&message_old.id)
+        .fetch_one(&inspect)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "{table} retained deleted temp message data");
+    }
 
     // Delivery and deletion lock the same mailbox row. Irrespective of who wins, the completed
     // delete leaves neither the mailbox nor a post-delete orphan message.

@@ -7,6 +7,7 @@
 
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::sync::OnceLock;
 
 use crate::model::Mailbox;
 use crate::store::StoreError;
@@ -57,16 +58,35 @@ pub(crate) enum ProvisionError {
     Storage,
 }
 
+/// Why an owned temporary mailbox could not be renewed.
+pub(crate) enum RenewError {
+    /// No exact owner-bound temporary mailbox exists at this address.
+    NotFound,
+    /// Restoring an expired mailbox would exceed the caller's active-mailbox quota.
+    QuotaExceeded,
+    /// A storage failure occurred.
+    Storage,
+}
+
+/// Corvid runs as one production process. Serialize mailbox creation and expired-mailbox renewal
+/// so their count-then-mutate quota checks cannot race within that process. Store operations still
+/// provide the database row locks needed to serialize with delivery, deletion and GC.
+fn quota_mutation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Provision a fresh temporary address for `user_sub`.
 ///
 /// Security: enforces the per-user quota BEFORE creating anything, picks a random allowlisted
 /// domain and a 96-bit random local-part (collision-checked against existing mailboxes), and
 /// stores the mailbox with a hard TTL. The address is receive-only — it is never granted
 /// submission credentials, so it can never send outbound mail.
-pub(crate) async fn provision(state: &AppState, user_sub: &str) -> Result<String, ProvisionError> {
+pub(crate) async fn provision(state: &AppState, user_sub: &str) -> Result<Mailbox, ProvisionError> {
     if !state.config.temp_mail_enabled() {
         return Err(ProvisionError::Disabled);
     }
+    let _quota_guard = quota_mutation_lock().lock().await;
     let owner = temporary_mailbox_owner(user_sub);
     let limit = state.config.temp_mail_max_per_user;
     let now = now_secs();
@@ -106,7 +126,44 @@ pub(crate) async fn provision(state: &AppState, user_sub: &str) -> Result<String
         .upsert_mailbox(&mailbox)
         .await
         .map_err(|_| ProvisionError::Storage)?;
-    Ok(address)
+    Ok(mailbox)
+}
+
+/// Reset an exact owner-bound temporary mailbox to one full TTL. Renewing an already-live mailbox
+/// never consumes another quota slot; restoring an expired/legacy-zero row is refused when the
+/// caller already has the configured number of active mailboxes.
+pub(crate) async fn renew(
+    state: &AppState,
+    user_sub: &str,
+    address: &str,
+) -> Result<Mailbox, RenewError> {
+    let _quota_guard = quota_mutation_lock().lock().await;
+    let owner = temporary_mailbox_owner(user_sub);
+    let now = now_secs();
+    let mailboxes = state
+        .store
+        .list_temp_mailboxes(&owner)
+        .await
+        .map_err(|_| RenewError::Storage)?;
+    let Some(target) = mailboxes.iter().find(|mailbox| mailbox.addr == address) else {
+        return Err(RenewError::NotFound);
+    };
+    if !is_live(target, now)
+        && mailboxes
+            .iter()
+            .filter(|mailbox| is_live(mailbox, now))
+            .count()
+            >= state.config.temp_mail_max_per_user
+    {
+        return Err(RenewError::QuotaExceeded);
+    }
+    let expires_at = now.saturating_add(state.config.temp_mail_ttl_secs);
+    state
+        .store
+        .renew_owned_temp_mailbox(address, &owner, expires_at)
+        .await
+        .map_err(|_| RenewError::Storage)?
+        .ok_or(RenewError::NotFound)
 }
 
 /// Delete a temporary mailbox and its messages, but only if `user_sub` owns it. Returns whether
@@ -185,7 +242,9 @@ mod tests {
         let b = random_local_part();
         assert_eq!(a.len(), 25);
         assert!(a.starts_with('g'));
-        assert!(a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_ne!(a, b);
     }
 }
