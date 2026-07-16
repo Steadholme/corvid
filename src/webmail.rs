@@ -23,10 +23,11 @@
 //! - `POST /settings/rules|undo-send|preferences|signature|autoreply` settings mutations
 //!   (CSRF-guarded)
 
-use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Form, Json, Router};
 
 use crate::rfc822::Attachment;
@@ -825,6 +826,10 @@ pub fn app(state: AppState) -> Router {
         .route("/temp", get(temp_index))
         .route("/temp/new", post(temp_new))
         .route("/temp/delete", post(temp_delete))
+        .route(
+            "/api/v1/temp-mailboxes",
+            delete(api_temp_mailbox_delete).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/temp/box/{addr}", get(temp_box))
         .route("/temp/box/{addr}/msg/{id}", get(temp_read))
         .route("/compose", get(compose_form))
@@ -886,7 +891,8 @@ async fn require_gateway_sig(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if gateway_identity_ok(req.headers()) {
+    let temp_delete_api = req.uri().path() == "/api/v1/temp-mailboxes";
+    let mut response = if gateway_identity_ok(req.headers()) {
         next.run(req).await
     } else {
         (
@@ -894,7 +900,18 @@ async fn require_gateway_sig(
             "invalid or missing gateway identity signature",
         )
             .into_response()
+    };
+    if temp_delete_api {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        // Append instead of replacing a handler's existing cache negotiation dimensions.
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("Authorization"));
     }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -8811,6 +8828,18 @@ struct TempDeleteForm {
     address: String,
 }
 
+/// The sole OAuth scope accepted by the temporary-mailbox deletion API. Scope matching is an
+/// exact token comparison against Sluice's injected `X-Auth-Scope`; Corvid never parses a bearer
+/// token or accepts identity/ownership fields from the request body.
+pub const TEMP_MAIL_DELETE_SCOPE: &str = "corvid:temp-mail:delete";
+const HEADER_SCOPE: &str = "x-auth-scope";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TempMailboxDeleteRequest {
+    address: String,
+}
+
 fn temp_forbidden() -> Response {
     error_page(
         StatusCode::UNAUTHORIZED,
@@ -8829,6 +8858,117 @@ fn temp_csrf_error() -> Response {
         "Request blocked",
         "CSRF token missing or mismatched.",
     )
+}
+
+/// Conservative dot-atom validation for the API input. It is intentionally syntax-only: deletion
+/// must also work for an old temporary domain that is no longer in the current runtime allowlist.
+fn canonical_delete_address(raw: &str) -> Option<String> {
+    let address = raw.trim();
+    if address.is_empty() || address.len() > 320 || !address.is_ascii() {
+        return None;
+    }
+    let mut parts = address.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || !local.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                )
+        })
+        || domain.is_empty()
+        || domain.len() > 255
+    {
+        return None;
+    }
+    for label in domain.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return None;
+        }
+    }
+    Some(address.to_ascii_lowercase())
+}
+
+/// `DELETE /api/v1/temp-mailboxes` — Sluice-authenticated, scope-gated, owner-scoped deletion.
+/// All not-found/foreign/permanent/repeated cases deliberately collapse to 204 to avoid an address
+/// ownership oracle. `require_gateway_sig` attaches the non-cacheable response headers uniformly,
+/// including extractor errors and wrong-method responses on this fixed path.
+async fn api_temp_mailbox_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TempMailboxDeleteRequest>, JsonRejection>,
+) -> Response {
+    let Some(subject) = identity_subject(&headers) else {
+        return json_status(StatusCode::UNAUTHORIZED, "gateway identity required");
+    };
+    let has_scope = header_value(&headers, HEADER_SCOPE).is_some_and(|scope| {
+        scope
+            .split_ascii_whitespace()
+            .any(|s| s == TEMP_MAIL_DELETE_SCOPE)
+    });
+    if !has_scope {
+        return json_status(StatusCode::FORBIDDEN, "required scope missing");
+    }
+    let Ok(Json(payload)) = payload else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid JSON body");
+    };
+    let Some(address) = canonical_delete_address(&payload.address) else {
+        return json_status(StatusCode::BAD_REQUEST, "invalid address");
+    };
+
+    match crate::temp_mail::release(&state, &subject, &address).await {
+        Ok(removed) => {
+            tracing::info!(
+                target: "corvid::audit",
+                actor = %subject,
+                removed,
+                "temporary mailbox delete API completed"
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => {
+            tracing::warn!(actor = %subject, "temporary mailbox delete API storage failure");
+            json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure")
+        }
+    }
 }
 
 /// Compact "1d 3h" / "12m" for a positive second count.
@@ -8865,7 +9005,10 @@ async fn temp_page(state: &AppState, headers: &HeaderMap, title: &str, main: &st
 /// temporary mailbox owned by `sub`.
 async fn temp_owned_mailbox(state: &AppState, sub: &str, addr: &str) -> Option<Mailbox> {
     let mb = state.store.get_mailbox(addr).await.ok().flatten()?;
-    (crate::temp_mail::is_temporary_mailbox(&mb) && crate::temp_mail::owned_by(&mb, sub)).then_some(mb)
+    (crate::temp_mail::is_temporary_mailbox(&mb)
+        && crate::temp_mail::owned_by(&mb, sub)
+        && crate::temp_mail::is_live(&mb, crate::now_secs()))
+    .then_some(mb)
 }
 
 /// `GET /temp` — the signed-in user's temporary addresses + a generate control.
@@ -8956,8 +9099,17 @@ async fn temp_delete(
     let Some(sub) = identity_subject(&headers) else {
         return temp_forbidden();
     };
-    let _ = crate::temp_mail::release(&state, &sub, &form.address).await;
-    Redirect::to("/temp").into_response()
+    match crate::temp_mail::release(&state, &sub, &form.address).await {
+        Ok(_) => Redirect::to("/temp").into_response(),
+        Err(_) => {
+            tracing::warn!(actor = %sub, "temporary mailbox form delete storage failure");
+            error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Storage error",
+                "Could not delete the temporary address.",
+            )
+        }
+    }
 }
 
 /// `GET /temp/box/{addr}` — messages received by one of the user's temporary addresses.

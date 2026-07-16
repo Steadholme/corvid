@@ -10,6 +10,8 @@
 //! docker rm -f corvid-testpg
 //! ```
 
+use std::sync::Arc;
+
 use corvid::model::{
     parse_search_query, Contact, ContactGroup, FilterRule, Mailbox, Message, OutboundItem,
     Signature, Template,
@@ -39,6 +41,8 @@ async fn pg_store_full_integration() {
         "contact_group_members",
         "contact_groups",
         "contacts",
+        "sender_lists",
+        "spam_annotations",
         "labels",
         "message_labels",
         "signatures",
@@ -834,6 +838,202 @@ async fn pg_store_full_integration() {
     pg.delete_template("w33d@w33d.xyz", "tpl1").await.unwrap();
     assert!(pg.list_templates("w33d@w33d.xyz").await.unwrap().is_empty());
 
+    // --- temporary mailbox atomic deletion + complete cleanup ---------------
+    let inspect = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .unwrap();
+    let temp_addr = "cleanup@temp.example";
+    let temp_owner = "temp:temp-owner";
+    pg.upsert_mailbox(&Mailbox {
+        addr: temp_addr.into(),
+        owner_sub: temp_owner.into(),
+        expires_at: now + 3600,
+    })
+    .await
+    .unwrap();
+    let temp_message = Message {
+        id: "temp-cleanup-message".into(),
+        mailbox: temp_addr.into(),
+        msg_from: "sender@example.com".into(),
+        msg_to: temp_addr.into(),
+        subject: "cleanup".into(),
+        raw_rfc822: "From: sender@example.com\r\nSubject: cleanup\r\n\r\nbody".into(),
+        body_text: "body".into(),
+        body_html: String::new(),
+        received_at: now,
+        seen: false,
+        folder: "INBOX".into(),
+        starred: false,
+        snooze_until: 0,
+        muted: false,
+        thread_id: String::new(),
+        message_id: String::new(),
+    };
+    pg.store_message(&temp_message).await.unwrap();
+    for statement in [
+        "INSERT INTO aliases (local_part, mailbox) VALUES ('temp-cleanup-alias', $1)",
+        "INSERT INTO outbound_queue (id, mailbox, raw, to_domain) VALUES ('temp-cleanup-outbound', $1, 'raw', 'example.com')",
+        "INSERT INTO filter_rules (id, mailbox, field, op, action) VALUES ('temp-cleanup-rule', $1, 'from', 'contains', 'star')",
+        "INSERT INTO auto_reply_log (mailbox, sender, sent_at) VALUES ($1, 'sender@example.com', 1)",
+        "INSERT INTO send_identities (id, mailbox, from_addr) VALUES ('temp-cleanup-identity', $1, 'alias@example.com')",
+        "INSERT INTO contacts (mailbox, addr) VALUES ($1, 'friend@example.com')",
+        "INSERT INTO contact_groups (id, \"user\", name) VALUES ('temp-cleanup-group', $1, 'Friends')",
+        "INSERT INTO sender_lists (id, \"user\", address_or_domain, kind) VALUES ('temp-cleanup-sender', $1, 'blocked.example', 'blocked')",
+        "INSERT INTO signatures (id, \"user\", name) VALUES ('temp-cleanup-signature', $1, 'Default')",
+        "INSERT INTO templates (id, \"user\", name) VALUES ('temp-cleanup-template', $1, 'Template')",
+        "INSERT INTO spam_annotations (message_id, mailbox) VALUES ('temp-cleanup-message', $1)",
+        "INSERT INTO labels (id, mailbox, name) VALUES ('temp-cleanup-label', $1, 'Label')",
+        "INSERT INTO message_labels (mailbox, message_id, label_id) VALUES ($1, 'temp-cleanup-message', 'temp-cleanup-label')",
+    ] {
+        sqlx::query(statement)
+            .bind(temp_addr)
+            .execute(&inspect)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO contact_group_members (group_id, contact_id) \
+         VALUES ('temp-cleanup-group', 'friend@example.com')",
+    )
+    .execute(&inspect)
+    .await
+    .unwrap();
+
+    assert!(!pg
+        .delete_owned_temp_mailbox(temp_addr, "temp:foreign-owner")
+        .await
+        .unwrap());
+    assert!(pg.get_mailbox(temp_addr).await.unwrap().is_some());
+    assert!(pg
+        .delete_owned_temp_mailbox(temp_addr, temp_owner)
+        .await
+        .unwrap());
+    for (table, column) in [
+        ("mailboxes", "addr"),
+        ("messages", "mailbox"),
+        ("aliases", "mailbox"),
+        ("outbound_queue", "mailbox"),
+        ("filter_rules", "mailbox"),
+        ("auto_reply_log", "mailbox"),
+        ("send_identities", "mailbox"),
+        ("contacts", "mailbox"),
+        ("contact_groups", "\"user\""),
+        ("sender_lists", "\"user\""),
+        ("signatures", "\"user\""),
+        ("templates", "\"user\""),
+        ("spam_annotations", "mailbox"),
+        ("labels", "mailbox"),
+        ("message_labels", "mailbox"),
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {column} = $1"))
+                .bind(temp_addr)
+                .fetch_one(&inspect)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "{table} retained temporary mailbox data");
+    }
+    let member_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contact_group_members WHERE group_id = 'temp-cleanup-group'",
+    )
+    .fetch_one(&inspect)
+    .await
+    .unwrap();
+    assert_eq!(member_count, 0);
+
+    // Historical temp rows with a zero TTL are no longer readable/deliverable, but their owner
+    // must still be able to clean them up through the API-backed Store mutation.
+    let legacy = "legacy-zero@temp.example";
+    pg.upsert_mailbox(&Mailbox {
+        addr: legacy.into(),
+        owner_sub: temp_owner.into(),
+        expires_at: 0,
+    })
+    .await
+    .unwrap();
+    assert!(pg
+        .delete_owned_temp_mailbox(legacy, temp_owner)
+        .await
+        .unwrap());
+
+    // GC operates on a scan, but the transaction revalidates both the marker and expiry. Changing
+    // ownership after the scan must preserve the row.
+    let stale_gc = "stale-gc@temp.example";
+    pg.upsert_mailbox(&Mailbox {
+        addr: stale_gc.into(),
+        owner_sub: temp_owner.into(),
+        expires_at: now - 1,
+    })
+    .await
+    .unwrap();
+    assert!(pg
+        .expired_temp_mailboxes(now)
+        .await
+        .unwrap()
+        .iter()
+        .any(|addr| addr == stale_gc));
+    sqlx::query("UPDATE mailboxes SET owner_sub = 'permanent-owner' WHERE addr = $1")
+        .bind(stale_gc)
+        .execute(&inspect)
+        .await
+        .unwrap();
+    assert!(!pg.delete_expired_temp_mailbox(stale_gc, now).await.unwrap());
+    assert!(pg.get_mailbox(stale_gc).await.unwrap().is_some());
+
+    // Delivery and deletion lock the same mailbox row. Irrespective of who wins, the completed
+    // delete leaves neither the mailbox nor a post-delete orphan message.
+    let race_store = Arc::new(PgStore::connect(&url).await.unwrap());
+    let race_addr = "race@temp.example";
+    let race_owner = "temp:race-owner";
+    race_store
+        .upsert_mailbox(&Mailbox {
+            addr: race_addr.into(),
+            owner_sub: race_owner.into(),
+            expires_at: now + 3600,
+        })
+        .await
+        .unwrap();
+    let race_message = Message {
+        id: "temp-race-message".into(),
+        mailbox: race_addr.into(),
+        ..temp_message.clone()
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let deleting = {
+        let store = race_store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .delete_owned_temp_mailbox(race_addr, race_owner)
+                .await
+                .unwrap()
+        })
+    };
+    let delivering = {
+        let store = race_store.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .store_temp_message_if_live(&race_message, now)
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+    assert!(deleting.await.unwrap());
+    let _ = delivering.await.unwrap();
+    assert!(race_store.get_mailbox(race_addr).await.unwrap().is_none());
+    assert!(race_store
+        .get_message("temp-race-message")
+        .await
+        .unwrap()
+        .is_none());
+    inspect.close().await;
+
     for tbl in [
         "messages",
         "outbound_queue",
@@ -844,6 +1044,8 @@ async fn pg_store_full_integration() {
         "contact_group_members",
         "contact_groups",
         "contacts",
+        "sender_lists",
+        "spam_annotations",
         "labels",
         "message_labels",
         "templates",

@@ -400,8 +400,8 @@ impl Session {
                             Reply::say("250 2.1.5 Ok\r\n")
                         }
                         Ok(_) => Reply::say("550 5.1.1 No such user here\r\n"),
-                        Err(error) => {
-                            tracing::warn!(%error, %mailbox, "temporary recipient lookup failed");
+                        Err(_) => {
+                            tracing::warn!("temporary recipient lookup failed");
                             Reply::say("451 4.3.0 Temporary recipient lookup failure\r\n")
                         }
                     };
@@ -497,6 +497,7 @@ impl Session {
         };
 
         for mb in &self.rcpt_local {
+            let received_at = now_secs();
             let msg = Message {
                 id: new_id("m"),
                 mailbox: mb.clone(),
@@ -506,7 +507,7 @@ impl Session {
                 raw_rfc822: raw.clone(),
                 body_text: parsed.body_text.clone(),
                 body_html: parsed.body_html.clone(),
-                received_at: now_secs(),
+                received_at,
                 seen: false,
                 folder: "INBOX".to_string(),
                 starred: false,
@@ -516,6 +517,30 @@ impl Session {
                 thread_id: String::new(),
                 message_id: String::new(),
             };
+            // Disposable inbox delivery is intentionally minimal: the atomic store method locks
+            // and revalidates the temp mailbox at DATA time, and bypasses all permanent-mailbox
+            // rules, spam/contact enrichment, labels, threading, and auto-replies.
+            if domain_of(mb)
+                .as_deref()
+                .is_some_and(|domain| self.ctx.config.is_temp_mail_domain(domain))
+            {
+                match self
+                    .ctx
+                    .store
+                    .store_temp_message_if_live(&msg, received_at)
+                    .await
+                {
+                    Ok(true) => continue,
+                    // The disposable recipient was deleted/expired after RCPT. Accept and drop it
+                    // rather than failing the whole multi-recipient DATA transaction: a 5xx here
+                    // would make senders retry recipients already stored in permanent mailboxes.
+                    Ok(false) => continue,
+                    Err(_) => {
+                        tracing::error!("temporary inbound store failed");
+                        return Reply::say("451 4.3.0 Temporary storage failure\r\n");
+                    }
+                }
+            }
             // Delivery-time pipeline (filter rules + auto-reply), then storage — one call keeps
             // this path surgical. `from` is the envelope return-path the responder guards on.
             if let Err(e) = crate::delivery::process_inbound(

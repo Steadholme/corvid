@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use corvid::config::Config;
-use corvid::model::Mailbox;
+use corvid::model::{FilterRule, Mailbox};
 use corvid::smtp::{Action, Session, SmtpContext, SmtpRole};
 use corvid::store::{InMemoryStore, Store};
 
@@ -102,7 +102,7 @@ async fn temporary_domains_accept_only_provisioned_full_addresses() {
         .upsert_mailbox(&Mailbox {
             addr: provisioned.to_string(),
             owner_sub: format!("temp:{provisioned}"),
-            expires_at: 0,
+            expires_at: corvid::now_secs() + 3600,
         })
         .await
         .unwrap();
@@ -143,6 +143,144 @@ async fn temporary_domains_accept_only_provisioned_full_addresses() {
         .handle_line(&format!("RCPT TO:<{}>", provisioned.to_ascii_uppercase()))
         .await;
     assert!(known.text.starts_with("250"), "got: {}", known.text);
+}
+
+#[tokio::test]
+async fn temporary_data_revalidates_liveness_and_bypasses_permanent_delivery_hooks() {
+    let mut config = Config::dev();
+    config.temp_mail_domains = vec!["mx.w33d.xyz".to_string()];
+    let store = Arc::new(InMemoryStore::new());
+    let address = "ghooks@mx.w33d.xyz";
+    store
+        .upsert_mailbox(&Mailbox {
+            addr: address.into(),
+            owner_sub: "temp:user-hooks".into(),
+            expires_at: corvid::now_secs() + 3600,
+        })
+        .await
+        .unwrap();
+    // A permanent mailbox would discard this message and harvest/auto-reply to its sender. A temp
+    // mailbox must bypass the whole generic delivery pipeline and only persist the inbox row.
+    store
+        .add_rule(&FilterRule {
+            id: "discard-all".into(),
+            mailbox: address.into(),
+            position: 0,
+            field: "from".into(),
+            op: "contains".into(),
+            needle: "example.com".into(),
+            action: "discard".into(),
+            target_folder: None,
+            target_label: None,
+            enabled: true,
+            created_at: corvid::now_secs(),
+        })
+        .await
+        .unwrap();
+    store
+        .set_auto_reply(address, true, "Away", "Temporary mailbox must not reply", 0)
+        .await
+        .unwrap();
+    let ctx = Arc::new(SmtpContext {
+        config: Arc::new(config),
+        store: store.clone(),
+        signer: None,
+        tls_acceptor: None,
+    });
+    let mut session = Session::new(ctx, SmtpRole::Mta, false, None);
+    session.handle_line("EHLO sender.example").await;
+    session.handle_line("MAIL FROM:<alice@example.com>").await;
+    assert!(session
+        .handle_line(&format!("RCPT TO:<{address}>"))
+        .await
+        .text
+        .starts_with("250"));
+    session.handle_line("DATA").await;
+    for line in [
+        "From: Alice <alice@example.com>",
+        &format!("To: {address}"),
+        "Subject: hooks must be bypassed",
+        "",
+        "body",
+    ] {
+        session.handle_line(line).await;
+    }
+    let done = session.handle_line(".").await;
+    assert!(done.text.starts_with("250"), "got: {}", done.text);
+
+    let messages = store.list_messages(address, 10).await.unwrap();
+    assert_eq!(messages.len(), 1, "discard rule must not run for temp mail");
+    assert_eq!(messages[0].folder, "INBOX");
+    assert!(store.list_contacts(address, 10).await.unwrap().is_empty());
+    assert!(store
+        .spam_annotation(address, &messages[0].id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .due_outbound(corvid::now_secs() + 60, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn deleted_temp_recipient_does_not_fail_or_duplicate_mixed_permanent_delivery() {
+    let mut config = Config::dev();
+    config.temp_mail_domains = vec!["mx.w33d.xyz".to_string()];
+    let store = Arc::new(InMemoryStore::new());
+    let address = "grace@mx.w33d.xyz";
+    store
+        .upsert_mailbox(&Mailbox {
+            addr: "w33d@w33d.xyz".into(),
+            owner_sub: "w33d".into(),
+            expires_at: 0,
+        })
+        .await
+        .unwrap();
+    store
+        .upsert_mailbox(&Mailbox {
+            addr: address.into(),
+            owner_sub: "temp:user-race".into(),
+            expires_at: corvid::now_secs() + 3600,
+        })
+        .await
+        .unwrap();
+    let ctx = Arc::new(SmtpContext {
+        config: Arc::new(config),
+        store: store.clone(),
+        signer: None,
+        tls_acceptor: None,
+    });
+    let mut session = Session::new(ctx, SmtpRole::Mta, false, None);
+    session.handle_line("EHLO sender.example").await;
+    session.handle_line("MAIL FROM:<alice@example.com>").await;
+    assert!(session
+        .handle_line("RCPT TO:<w33d@w33d.xyz>")
+        .await
+        .text
+        .starts_with("250"));
+    assert!(session
+        .handle_line(&format!("RCPT TO:<{address}>"))
+        .await
+        .text
+        .starts_with("250"));
+    assert!(store
+        .delete_owned_temp_mailbox(address, "temp:user-race")
+        .await
+        .unwrap());
+    session.handle_line("DATA").await;
+    for line in ["From: alice@example.com", "Subject: raced", "", "body"] {
+        session.handle_line(line).await;
+    }
+    let done = session.handle_line(".").await;
+    assert!(done.text.starts_with("250"), "got: {}", done.text);
+    assert_eq!(
+        store.message_count("w33d@w33d.xyz").await.unwrap(),
+        1,
+        "the accepted permanent recipient must be stored exactly once"
+    );
+    assert_eq!(store.message_count(address).await.unwrap(), 0);
 }
 
 #[tokio::test]

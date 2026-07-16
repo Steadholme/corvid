@@ -9,6 +9,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 
 use crate::model::Mailbox;
+use crate::store::StoreError;
 use crate::{now_secs, AppState};
 
 /// Synthetic `owner_sub` marking a mailbox temporary AND binding it to its SSO creator. Using a
@@ -35,7 +36,7 @@ pub(crate) fn owned_by(mb: &Mailbox, user_sub: &str) -> bool {
 
 /// Whether a temporary mailbox is still live at `now` (not past its TTL).
 pub(crate) fn is_live(mb: &Mailbox, now: i64) -> bool {
-    mb.expires_at == 0 || mb.expires_at > now
+    mb.expires_at > now
 }
 
 /// A 96-bit CSPRNG local-part, lowercase ASCII only for compatibility with strict registration
@@ -110,20 +111,14 @@ pub(crate) async fn provision(state: &AppState, user_sub: &str) -> Result<String
 
 /// Delete a temporary mailbox and its messages, but only if `user_sub` owns it. Returns whether
 /// a mailbox was actually removed (`false` when it does not exist or belongs to someone else).
-pub(crate) async fn release(state: &AppState, user_sub: &str, address: &str) -> Result<bool, ()> {
+pub(crate) async fn release(
+    state: &AppState,
+    user_sub: &str,
+    address: &str,
+) -> Result<bool, StoreError> {
     let addr = address.to_ascii_lowercase();
-    match state.store.get_mailbox(&addr).await {
-        Ok(Some(mb)) if is_temporary_mailbox(&mb) && owned_by(&mb, user_sub) => {
-            state
-                .store
-                .delete_mailbox_cascade(&addr)
-                .await
-                .map_err(|_| ())?;
-            Ok(true)
-        }
-        Ok(_) => Ok(false),
-        Err(_) => Err(()),
-    }
+    let owner = temporary_mailbox_owner(user_sub);
+    state.store.delete_owned_temp_mailbox(&addr, &owner).await
 }
 
 /// Garbage-collect every temporary mailbox whose TTL elapsed. Returns the number removed.
@@ -131,16 +126,17 @@ pub(crate) async fn gc_expired(state: &AppState) -> usize {
     let now = now_secs();
     let expired = match state.store.expired_temp_mailboxes(now).await {
         Ok(v) => v,
-        Err(error) => {
-            tracing::warn!(%error, "temporary-mail GC scan failed");
+        Err(_) => {
+            tracing::warn!("temporary-mail GC scan failed");
             return 0;
         }
     };
     let mut removed = 0;
     for addr in expired {
-        match state.store.delete_mailbox_cascade(&addr).await {
-            Ok(()) => removed += 1,
-            Err(error) => tracing::warn!(%error, %addr, "temporary-mail GC delete failed"),
+        match state.store.delete_expired_temp_mailbox(&addr, now).await {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(_) => tracing::warn!("temporary-mail GC delete failed"),
         }
     }
     removed

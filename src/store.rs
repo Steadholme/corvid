@@ -89,8 +89,16 @@ pub trait Store: Send + Sync {
     /// Temporary mailboxes owned by the synthetic `owner_sub` (`temp:{user}`), newest expiry
     /// first. Backs the per-user "my temporary addresses" listing and the quota check.
     async fn list_temp_mailboxes(&self, owner_sub: &str) -> Result<Vec<Mailbox>, StoreError>;
-    /// Delete a mailbox and every message it holds (temporary-mailbox release and TTL GC).
-    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError>;
+    /// Atomically delete a temporary mailbox and all mailbox-scoped data, but only when its
+    /// synthetic owner exactly matches `owner_sub`. Returns whether anything was removed.
+    async fn delete_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+    ) -> Result<bool, StoreError>;
+    /// Atomically delete an expired temporary mailbox after revalidating its marker and TTL under
+    /// the same lock/transaction used for deletion. Returns whether anything was removed.
+    async fn delete_expired_temp_mailbox(&self, addr: &str, now: i64) -> Result<bool, StoreError>;
     /// Addresses of temporary mailboxes whose TTL elapsed at/before `now` (GC candidates).
     async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError>;
 
@@ -101,6 +109,10 @@ pub trait Store: Send + Sync {
 
     /// Persist a received/delivered message.
     async fn store_message(&self, msg: &Message) -> Result<(), StoreError>;
+    /// Persist a message only if its target is still a live temporary mailbox. The liveness check
+    /// and insert serialize with temporary-mailbox deletion, preventing post-delete orphan rows.
+    async fn store_temp_message_if_live(&self, msg: &Message, now: i64)
+        -> Result<bool, StoreError>;
     /// Insert or replace an editable Drafts message by id, scoped to its owning mailbox.
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError>;
     /// Delete a Drafts message by id, scoped to its owning mailbox. Returns whether a row changed.
@@ -509,6 +521,88 @@ impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Remove every row keyed by a mailbox. Callers must hold `mailboxes` for the whole operation;
+    /// that lock is the in-memory equivalent of the PostgreSQL mailbox-row transaction lock.
+    fn purge_mailbox_data(&self, addr: &str) {
+        // Joins/dependants first, then their parents. Each guard is intentionally short-lived, but
+        // the caller's mailbox coordinator guard keeps the overall mutation indivisible to temp
+        // delivery and to every other temp deletion.
+        self.message_labels
+            .lock()
+            .expect("message_labels lock poisoned")
+            .retain(|(mailbox, _, _)| mailbox != addr);
+        self.spam_annotations
+            .lock()
+            .expect("spam_annotations lock poisoned")
+            .retain(|annotation| annotation.mailbox != addr);
+
+        let group_ids: Vec<String> = self
+            .contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .iter()
+            .filter(|group| group.user == addr)
+            .map(|group| group.id.clone())
+            .collect();
+        self.contact_group_members
+            .lock()
+            .expect("contact_group_members lock poisoned")
+            .retain(|(group_id, _)| !group_ids.iter().any(|id| id == group_id));
+
+        self.aliases
+            .lock()
+            .expect("aliases lock poisoned")
+            .retain(|alias| alias.mailbox != addr);
+        self.outbound
+            .lock()
+            .expect("outbound lock poisoned")
+            .retain(|item| item.mailbox != addr);
+        self.rules
+            .lock()
+            .expect("rules lock poisoned")
+            .retain(|rule| rule.mailbox != addr);
+        self.settings
+            .lock()
+            .expect("settings lock poisoned")
+            .retain(|settings| settings.mailbox != addr);
+        self.auto_replies
+            .lock()
+            .expect("auto_replies lock poisoned")
+            .retain(|(mailbox, _, _)| mailbox != addr);
+        self.send_identities
+            .lock()
+            .expect("send_identities lock poisoned")
+            .retain(|identity| identity.mailbox != addr);
+        self.contacts
+            .lock()
+            .expect("contacts lock poisoned")
+            .retain(|(mailbox, _)| mailbox != addr);
+        self.contact_groups
+            .lock()
+            .expect("contact_groups lock poisoned")
+            .retain(|group| group.user != addr);
+        self.sender_lists
+            .lock()
+            .expect("sender_lists lock poisoned")
+            .retain(|entry| entry.user != addr);
+        self.signatures
+            .lock()
+            .expect("signatures lock poisoned")
+            .retain(|signature| signature.user != addr);
+        self.templates
+            .lock()
+            .expect("templates lock poisoned")
+            .retain(|template| template.user != addr);
+        self.labels
+            .lock()
+            .expect("labels lock poisoned")
+            .retain(|label| label.mailbox != addr);
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .retain(|message| message.mailbox != addr);
+    }
 }
 
 /// Keyset filter for the in-memory listings: keep only rows strictly older than the cursor
@@ -852,16 +946,40 @@ impl Store for InMemoryStore {
         Ok(v)
     }
 
-    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError> {
-        self.messages
-            .lock()
-            .expect("messages lock poisoned")
-            .retain(|m| m.mailbox != addr);
-        self.mailboxes
-            .lock()
-            .expect("mailboxes lock poisoned")
-            .retain(|m| m.addr != addr);
-        Ok(())
+    async fn delete_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+    ) -> Result<bool, StoreError> {
+        // `mailboxes` is the coordinator lock for every temporary-mailbox mutation. Keep it until
+        // all dependent state is gone; `store_temp_message_if_live` takes the same locks in the
+        // same order, so DATA can never insert after a successful deletion.
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let removable = mailboxes.iter().any(|m| {
+            m.addr == addr && m.owner_sub == owner_sub && m.owner_sub.starts_with("temp:")
+        });
+        if !removable {
+            return Ok(false);
+        }
+        self.purge_mailbox_data(addr);
+        mailboxes.retain(|m| m.addr != addr);
+        Ok(true)
+    }
+
+    async fn delete_expired_temp_mailbox(&self, addr: &str, now: i64) -> Result<bool, StoreError> {
+        let mut mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let removable = mailboxes.iter().any(|m| {
+            m.addr == addr
+                && m.owner_sub.starts_with("temp:")
+                && m.expires_at > 0
+                && m.expires_at <= now
+        });
+        if !removable {
+            return Ok(false);
+        }
+        self.purge_mailbox_data(addr);
+        mailboxes.retain(|m| m.addr != addr);
+        Ok(true)
     }
 
     async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError> {
@@ -870,7 +988,7 @@ impl Store for InMemoryStore {
             .lock()
             .expect("mailboxes lock poisoned")
             .iter()
-            .filter(|m| m.expires_at > 0 && m.expires_at <= now)
+            .filter(|m| m.owner_sub.starts_with("temp:") && m.expires_at > 0 && m.expires_at <= now)
             .map(|m| m.addr.clone())
             .collect())
     }
@@ -907,6 +1025,26 @@ impl Store for InMemoryStore {
             .expect("messages lock poisoned")
             .push(msg.clone());
         Ok(())
+    }
+
+    async fn store_temp_message_if_live(
+        &self,
+        msg: &Message,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mailboxes = self.mailboxes.lock().expect("mailboxes lock poisoned");
+        let live = mailboxes.iter().any(|m| {
+            m.addr == msg.mailbox && m.owner_sub.starts_with("temp:") && m.expires_at > now
+        });
+        if !live {
+            return Ok(false);
+        }
+        self.messages
+            .lock()
+            .expect("messages lock poisoned")
+            .push(msg.clone());
+        drop(mailboxes);
+        Ok(true)
     }
 
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
@@ -3215,6 +3353,43 @@ impl PgStore {
             reason: row.try_get("reason")?,
         })
     }
+
+    /// Delete all mailbox/user-scoped rows inside an already-open transaction. The mailbox row is
+    /// deliberately deleted last; callers first lock and authorize that row with `FOR UPDATE`.
+    async fn purge_mailbox_data(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        addr: &str,
+    ) -> Result<(), sqlx::Error> {
+        // Join tables first, followed by every mailbox/user side table and finally messages. The
+        // schema intentionally has no database FKs, so this explicit list is the cascade contract.
+        for statement in [
+            "DELETE FROM message_labels WHERE mailbox = $1",
+            "DELETE FROM spam_annotations WHERE mailbox = $1",
+            "DELETE FROM contact_group_members WHERE group_id IN (SELECT id FROM contact_groups WHERE \"user\" = $1)",
+            "DELETE FROM aliases WHERE mailbox = $1",
+            "DELETE FROM outbound_queue WHERE mailbox = $1",
+            "DELETE FROM filter_rules WHERE mailbox = $1",
+            "DELETE FROM auto_reply_log WHERE mailbox = $1",
+            "DELETE FROM send_identities WHERE mailbox = $1",
+            "DELETE FROM contacts WHERE mailbox = $1",
+            "DELETE FROM contact_groups WHERE \"user\" = $1",
+            "DELETE FROM sender_lists WHERE \"user\" = $1",
+            "DELETE FROM signatures WHERE \"user\" = $1",
+            "DELETE FROM templates WHERE \"user\" = $1",
+            "DELETE FROM labels WHERE mailbox = $1",
+            "DELETE FROM messages WHERE mailbox = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(addr)
+                .execute(&mut **tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM mailboxes WHERE addr = $1")
+            .bind(addr)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3294,28 +3469,68 @@ impl Store for PgStore {
             .map_err(backend)
     }
 
-    async fn delete_mailbox_cascade(&self, addr: &str) -> Result<(), StoreError> {
-        // Messages first so a crash never orphans a message under a removed mailbox.
-        sqlx::query("DELETE FROM messages WHERE mailbox = $1")
-            .bind(addr)
-            .execute(&self.pool)
+    async fn delete_owned_temp_mailbox(
+        &self,
+        addr: &str,
+        owner_sub: &str,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let removable = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub = $2 AND owner_sub LIKE 'temp:%' \
+             FOR UPDATE",
+        )
+        .bind(addr)
+        .bind(owner_sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !removable {
+            tx.commit().await.map_err(backend)?;
+            return Ok(false);
+        }
+        Self::purge_mailbox_data(&mut tx, addr)
             .await
             .map_err(backend)?;
-        sqlx::query("DELETE FROM mailboxes WHERE addr = $1")
-            .bind(addr)
-            .execute(&self.pool)
+        tx.commit().await.map_err(backend)?;
+        Ok(true)
+    }
+
+    async fn delete_expired_temp_mailbox(&self, addr: &str, now: i64) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let removable = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub LIKE 'temp:%' \
+               AND expires_at > 0 AND expires_at <= $2 \
+             FOR UPDATE",
+        )
+        .bind(addr)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !removable {
+            tx.commit().await.map_err(backend)?;
+            return Ok(false);
+        }
+        Self::purge_mailbox_data(&mut tx, addr)
             .await
             .map_err(backend)?;
-        Ok(())
+        tx.commit().await.map_err(backend)?;
+        Ok(true)
     }
 
     async fn expired_temp_mailboxes(&self, now: i64) -> Result<Vec<String>, StoreError> {
-        let rows =
-            sqlx::query("SELECT addr FROM mailboxes WHERE expires_at > 0 AND expires_at <= $1")
-                .bind(now)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(backend)?;
+        let rows = sqlx::query(
+            "SELECT addr FROM mailboxes \
+                 WHERE owner_sub LIKE 'temp:%' AND expires_at > 0 AND expires_at <= $1",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
         rows.iter()
             .map(|r| r.try_get::<String, _>("addr"))
             .collect::<Result<Vec<_>, sqlx::Error>>()
@@ -3374,6 +3589,60 @@ impl Store for PgStore {
         .await
         .map_err(backend)?;
         Ok(())
+    }
+
+    async fn store_temp_message_if_live(
+        &self,
+        msg: &Message,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        // `FOR KEY SHARE` conflicts with the deleter's `FOR UPDATE` while still allowing multiple
+        // simultaneous deliveries. Whichever transaction wins, a successful DELETE cannot be
+        // followed by a late orphan INSERT.
+        let live = sqlx::query(
+            "SELECT addr FROM mailboxes \
+             WHERE addr = $1 AND owner_sub LIKE 'temp:%' AND expires_at > $2 \
+             FOR KEY SHARE",
+        )
+        .bind(&msg.mailbox)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?
+        .is_some();
+        if !live {
+            tx.commit().await.map_err(backend)?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO messages \
+                 (id, mailbox, msg_from, msg_to, subject, raw_rfc822, body_text, body_html, \
+                  received_at, seen, folder, starred, snooze_until, muted, thread_id, message_id, has_attachment) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+        )
+        .bind(&msg.id)
+        .bind(&msg.mailbox)
+        .bind(&msg.msg_from)
+        .bind(&msg.msg_to)
+        .bind(&msg.subject)
+        .bind(&msg.raw_rfc822)
+        .bind(&msg.body_text)
+        .bind(&msg.body_html)
+        .bind(msg.received_at)
+        .bind(msg.seen)
+        .bind(&msg.folder)
+        .bind(msg.starred)
+        .bind(msg.snooze_until)
+        .bind(msg.muted)
+        .bind(&msg.thread_id)
+        .bind(&msg.message_id)
+        .bind(has_attachment_flag(&msg.raw_rfc822))
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(true)
     }
 
     async fn upsert_draft(&self, msg: &Message) -> Result<(), StoreError> {
