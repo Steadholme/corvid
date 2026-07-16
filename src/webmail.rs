@@ -9418,7 +9418,7 @@ async fn api_temp_message_get(
             to: message.msg_to,
             subject: message.subject,
             body_text: message.body_text,
-            body_html: crate::sanitize::sanitize_html(&message.body_html),
+            body_html: crate::sanitize::sanitize_html_without_images(&message.body_html),
             received_at: message.received_at,
             seen: message.seen,
             attachments,

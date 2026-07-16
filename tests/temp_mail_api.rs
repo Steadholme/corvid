@@ -128,7 +128,12 @@ fn multipart_message(id: &str, mailbox: &str, received_at: i64) -> Message {
         )
         .into(),
         body_text: "safe text".into(),
-        body_html: r#"<p onclick="evil()">safe</p><script>bad()</script>"#.into(),
+        body_html: concat!(
+            r#"<p onclick="evil()">safe</p><script>bad()</script>"#,
+            r#"<img src="https://tracker.example/pixel" alt="tracker">"#,
+            r#"<img src="cid:inline-logo" alt="inline">"#,
+        )
+        .into(),
         received_at,
         seen: false,
         folder: "INBOX".into(),
@@ -624,6 +629,11 @@ async fn message_api_paginates_sanitizes_downloads_and_deletes_with_owner_scope(
     assert!(!detail.to_string().contains("TOP_SECRET_RAW"));
     assert!(!detail["body_html"].as_str().unwrap().contains("onclick"));
     assert!(!detail["body_html"].as_str().unwrap().contains("script"));
+    assert!(!detail["body_html"].as_str().unwrap().contains("<img"));
+    assert!(!detail["body_html"]
+        .as_str()
+        .unwrap()
+        .contains("tracker.example"));
     assert_eq!(detail["attachments"].as_array().unwrap().len(), 1);
     assert_eq!(detail["attachments"][0]["index"], 0);
 

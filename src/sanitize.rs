@@ -62,6 +62,18 @@ const DROP_BLOCKS: &[&str] = &[
 
 /// Sanitise `html`, returning a string safe to embed directly inside page markup.
 pub fn sanitize_html(html: &str) -> String {
+    sanitize_html_with_policy(html, true)
+}
+
+/// Sanitise received mail for API consumers without retaining image elements.
+///
+/// API clients do not have the webmail's explicit remote-content controls, so even an otherwise
+/// safe `http(s)` image can act as a tracking pixel when a caller renders the returned HTML.
+pub fn sanitize_html_without_images(html: &str) -> String {
+    sanitize_html_with_policy(html, false)
+}
+
+fn sanitize_html_with_policy(html: &str, allow_images: bool) -> String {
     let bytes = html.as_bytes();
     let mut out = String::with_capacity(html.len());
     let mut i = 0;
@@ -124,6 +136,10 @@ pub fn sanitize_html(html: &str) -> String {
 
         if !ALLOWED_TAGS.contains(&name.as_str()) {
             // Unknown tag: drop the delimiters, keep surrounding text.
+            continue;
+        }
+
+        if name == "img" && !allow_images {
             continue;
         }
 
@@ -545,6 +561,16 @@ mod tests {
         assert!(!out.contains("onerror"));
         // src "x" is a relative URL -> kept.
         assert!(out.contains("<img src=\"x\" />"));
+    }
+
+    #[test]
+    fn api_policy_removes_remote_and_inline_images_but_keeps_links() {
+        let out = sanitize_html_without_images(
+            r#"<p>hello<img src="https://tracker.example/pixel"><img src="cid:logo"></p><a href="https://example.com">open</a>"#,
+        );
+        assert_eq!(out, r#"<p>hello</p><a href="https://example.com">open</a>"#);
+        assert!(!out.contains("<img"));
+        assert!(!out.contains("tracker.example"));
     }
 
     #[test]
