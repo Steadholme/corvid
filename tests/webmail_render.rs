@@ -2,7 +2,7 @@
 //! against the in-memory store (no sockets, no database).
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, Method, Request, StatusCode};
 use tower::ServiceExt;
 
 use corvid::model::{parse_search_query, FilterRule, Label, Mailbox, Message};
@@ -52,6 +52,182 @@ async fn body_string(resp: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+async fn render_as_w33d(state: &AppState, uri: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .uri(uri)
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-email", "w33d@steadholme.local")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+#[tokio::test]
+async fn shell_exposes_skip_target_and_ink_then_action_tagline() {
+    let state = build_dev_state().await;
+    let (status, html) = render_as_w33d(&state, "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r##"<a class="skip-link" href="#main-content">Skip to mail</a>"##),
+        "shell should expose a keyboard skip link"
+    );
+    assert!(
+        html.contains(r#"<main id="main-content" class="wrap wrap--mail" tabindex="-1">"#),
+        "skip link should target the focusable mail main"
+    );
+    assert!(
+        html.contains(
+            r#"<span class="appbar__name"><b>Corvid</b><span>Ink, then action.</span></span>"#
+        ),
+        "shell should carry the Corvid product tagline"
+    );
+}
+
+#[tokio::test]
+async fn settings_renders_section_index_and_matching_anchor_targets() {
+    let state = build_dev_state().await;
+    let (status, html) = render_as_w33d(&state, "/settings").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"<nav class="settings-index" aria-label="Settings sections">"#),
+        "settings should provide an accessible section index"
+    );
+    for anchor in [
+        "filter-rules",
+        "templates",
+        "senders",
+        "labels",
+        "identities",
+        "contacts",
+        "signatures",
+        "undo-send",
+        "display",
+        "auto-reply",
+    ] {
+        assert!(
+            html.contains(&format!(r##"href="#{anchor}""##)),
+            "settings index is missing #{anchor}"
+        );
+        assert!(
+            html.contains(&format!(r#"id="{anchor}""#)),
+            "settings section target #{anchor} is missing"
+        );
+    }
+    assert!(
+        !html.contains(r#"href="/admin">Administration</a>"#),
+        "ordinary users should not be offered the gated admin panel"
+    );
+}
+
+#[tokio::test]
+async fn admin_settings_link_is_visible_only_to_administrators() {
+    let state = build_dev_state().await;
+    let req = Request::builder()
+        .uri("/settings")
+        .header("x-auth-subject", "w33d")
+        .header("x-auth-groups", "readers, admins")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+
+    assert!(
+        html.contains(r#"<a class="settings-index__admin" href="/admin">Administration</a>"#),
+        "administrators should discover the gated panel from Settings"
+    );
+}
+
+#[tokio::test]
+async fn settings_display_save_query_renders_success_banner() {
+    let state = build_dev_state().await;
+    let (status, html) = render_as_w33d(&state, "/settings?saved=display").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(r#"<div class="status-banner status-banner--success" role="status">"#),
+        "saved settings should render a live success banner"
+    );
+    assert!(html.contains("<b>Saved</b>"));
+    assert!(html.contains("Display preferences saved."));
+}
+
+#[tokio::test]
+async fn webmail_pages_do_not_expose_temporary_mail_ui() {
+    let state = build_dev_state().await;
+
+    for uri in ["/", "/settings"] {
+        let (status, html) = render_as_w33d(&state, uri).await;
+        assert_eq!(status, StatusCode::OK, "failed to render {uri}");
+        for forbidden in [r#"href="/temp"#, r#"action="/temp"#, "Temporary Mail"] {
+            assert!(
+                !html.contains(forbidden),
+                "{uri} still exposes temporary-mail UI via {forbidden}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_temporary_mail_ui_routes_stay_unmounted() {
+    let state = build_dev_state().await;
+    for (method, uri) in [
+        (Method::GET, "/temp"),
+        (Method::POST, "/temp/new"),
+        (Method::POST, "/temp/delete"),
+        (Method::GET, "/temp/box/old@temp.example"),
+        (Method::GET, "/temp/box/old@temp.example/msg/old-message"),
+    ] {
+        let req = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header("x-auth-subject", "w33d")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must not remount the retired Temporary Mail UI"
+        );
+    }
+}
+
+#[tokio::test]
+async fn personalized_pages_are_non_cacheable_and_frame_ancestors_are_blocked() {
+    let state = build_dev_state().await;
+    let req = Request::builder()
+        .uri("/")
+        .header("x-auth-subject", "w33d")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(csp.contains("form-action 'self'"));
+    assert_eq!(
+        resp.headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+}
+
 #[tokio::test]
 async fn inbox_lists_messages_and_read_marks_seen() {
     let state: AppState = build_dev_state().await;
@@ -77,6 +253,19 @@ async fn inbox_lists_messages_and_read_marks_seen() {
     assert!(html.contains("Alice"));
     assert!(html.contains("mail-shell"));
     assert!(html.contains("mail-side__compose"));
+    assert!(
+        html.contains(r#"type="datetime-local" data-snooze-local"#),
+        "snooze should expose a local date/time control"
+    );
+    assert!(
+        html.contains(r#"data-snooze-local data-min-epoch=""#)
+            && html.contains(r#"aria-label="Custom snooze date and time" hidden"#),
+        "custom snooze should stay hidden until its conversion script is active"
+    );
+    assert!(
+        !html.contains("Custom snooze epoch"),
+        "raw epoch controls should not leak into the UI"
+    );
     assert!(html.contains(r#"<span class="star-slot">"#));
     assert!(html.contains(r#"<span class="snip">Hello body</span>"#));
     assert!(html.contains("1 unread"));
@@ -231,6 +420,18 @@ async fn no_mailbox_for_unknown_subject() {
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
     assert!(html.contains("No mailbox provisioned"));
+
+    // Presentation email metadata must never become an ownership fallback.
+    let req = Request::builder()
+        .uri("/")
+        .header("x-auth-subject", "stranger")
+        .header("x-auth-email", "w33d@w33d.xyz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(build_dev_state().await).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    assert!(html.contains("No mailbox provisioned"));
 }
 
 #[tokio::test]
@@ -257,6 +458,28 @@ async fn compose_then_send_enqueues_outbound() {
         .and_then(|kv| kv.split_once('='))
         .map(|(_, v)| v.to_string())
         .unwrap();
+    let html = body_string(resp).await;
+    assert!(
+        html.contains(r#"type="datetime-local" data-schedule-local"#),
+        "scheduled send should expose a local date/time control"
+    );
+    assert!(
+        html.contains(r#"aria-label="Custom schedule date and time" hidden"#),
+        "custom schedule should stay hidden until its conversion script is active"
+    );
+    assert!(
+        html.contains(r#"<input class="schedule-custom" type="hidden""#),
+        "the local date/time should retain the existing epoch-backed API contract"
+    );
+    assert!(
+        !html.contains("Custom schedule epoch"),
+        "raw epoch controls should not leak into the UI"
+    );
+    assert!(
+        html.contains(r#"name="action" value="send" formnovalidate"#)
+            && html.contains(r#"name="action" value="draft" formnovalidate"#),
+        "an unrelated custom schedule constraint must not block send or draft"
+    );
 
     // POST /send with the matching cookie + token.
     let form =
@@ -405,6 +628,11 @@ async fn schedule_send_lists_reschedules_prefills_and_cancels() {
         html.contains("btn-cancel-scheduled"),
         "cancel hook rendered"
     );
+    assert!(
+        html.contains(r#"value="draft" formnovalidate"#)
+            && html.contains(r#"value="cancel" formnovalidate"#),
+        "an expired custom reschedule value must not block draft or cancel"
+    );
     assert!(html.contains("Later"), "scheduled subject listed");
 
     let req = Request::builder()
@@ -513,10 +741,10 @@ async fn reply_prefills_and_sets_thread_headers() {
         "Original body line",
     );
     // Give the stored source a Message-ID so the reply can chain In-Reply-To/References.
-    msg.raw_rfc822 = format!(
+    msg.raw_rfc822 =
         "From: Alice <alice@example.com>\r\nTo: w33d@w33d.xyz\r\nSubject: Project update\r\n\
          Message-ID: <orig-123@example.com>\r\n\r\nOriginal body line\r\n"
-    );
+            .to_string();
     state.store.store_message(&msg).await.unwrap();
 
     // The reply compose form prefills To/Subject/quote + carries the thread headers.
@@ -714,6 +942,10 @@ async fn admin_panel_allowed_for_admin() {
     assert!(html.contains("Mailbox provisioning"));
     assert!(html.contains("w33d@w33d.xyz"), "seeded mailbox listed");
     assert!(html.contains("Create mailbox"));
+    assert!(
+        html.contains(r#"<a class="appnav is-active" href="/admin">"#),
+        "the gated admin page should identify its active app-bar destination"
+    );
 }
 
 /// Mint a CSRF cookie+token from an admin `GET /admin`, returning `(token, cookie_header_value)`.
@@ -760,6 +992,12 @@ async fn admin_creates_mailbox() {
         resp.status(),
         StatusCode::SEE_OTHER,
         "create redirects on success"
+    );
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/admin?created=mailbox")
     );
 
     let mb = state
@@ -830,6 +1068,12 @@ async fn admin_adds_alias() {
         .unwrap();
     let resp = app(state.clone()).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        resp.headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/admin?created=alias")
+    );
 
     let aliases = state.store.list_aliases().await.unwrap();
     assert_eq!(aliases.len(), 1);
@@ -859,7 +1103,9 @@ async fn admin_alias_rejects_unknown_mailbox() {
 
 /// Encode a `multipart/form-data` body from `(name, filename?, content_type?, value)` parts.
 /// A `None` filename makes a plain text field; `Some(..)` makes a file part.
-fn multipart_body(boundary: &str, parts: &[(&str, Option<&str>, Option<&str>, &[u8])]) -> Vec<u8> {
+type MultipartPart<'a> = (&'a str, Option<&'a str>, Option<&'a str>, &'a [u8]);
+
+fn multipart_body(boundary: &str, parts: &[MultipartPart<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     for (name, filename, ctype, value) in parts {
         out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -1000,7 +1246,8 @@ async fn attachment_download_denied_across_mailboxes() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-            expires_at: 0,        })
+            expires_at: 0,
+        })
         .await
         .unwrap();
     let mut msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");
@@ -1645,7 +1892,7 @@ async fn settings_rule_run_applies_owned_rule_and_renders_banner() {
         resp.headers()
             .get(header::LOCATION)
             .and_then(|v| v.to_str().ok()),
-        Some("/settings?ran=fr_run&matched=1&changed=1")
+        Some("/settings?saved=rules&ran=fr_run&matched=1&changed=1#filter-rules")
     );
     assert!(
         state
@@ -1658,7 +1905,7 @@ async fn settings_rule_run_applies_owned_rule_and_renders_banner() {
     );
 
     let req = Request::builder()
-        .uri("/settings?ran=fr_run&matched=1&changed=1")
+        .uri("/settings?saved=rules&ran=fr_run&matched=1&changed=1")
         .header("x-auth-subject", "w33d")
         .body(Body::empty())
         .unwrap();
@@ -1695,7 +1942,8 @@ async fn settings_rule_run_denies_other_mailbox_rule_id() {
         .upsert_mailbox(&Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-            expires_at: 0,        })
+            expires_at: 0,
+        })
         .await
         .unwrap();
     let rule = filter_rule("fr_alice", "alice@w33d.xyz", "star", "Secret");
@@ -1753,7 +2001,8 @@ async fn message_action_denied_across_mailboxes() {
         .upsert_mailbox(&corvid::model::Mailbox {
             addr: "alice@w33d.xyz".to_string(),
             owner_sub: "alice".to_string(),
-            expires_at: 0,        })
+            expires_at: 0,
+        })
         .await
         .unwrap();
     let msg = seed_message("alice@w33d.xyz", "Secret", "bob@example.com", "body");

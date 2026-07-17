@@ -116,8 +116,21 @@ async fn assets_js_served() {
             .unwrap()
             .to_string();
         assert!(ct.contains("javascript"), "{path} ct={ct}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=0, must-revalidate"),
+            "{path} must not leave updated markup paired with a stale interaction bundle"
+        );
         let js = body_string(resp).await;
         assert!(js.contains("__corvidToast"), "{path} carries toast helper");
+        if path == "/assets/compose.js" {
+            assert!(
+                js.contains("data-schedule-local"),
+                "compose bundle should translate the local schedule control"
+            );
+        }
     }
 }
 

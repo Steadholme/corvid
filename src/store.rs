@@ -877,8 +877,8 @@ fn message_matches_predicate(
         SearchPredicateKind::InFolder(value) => m.folder.eq_ignore_ascii_case(value),
         SearchPredicateKind::Before(ts) => m.received_at < *ts,
         SearchPredicateKind::After(ts) => m.received_at >= *ts,
-        SearchPredicateKind::Larger(bytes) => (m.raw_rfc822.as_bytes().len() as i64) > *bytes,
-        SearchPredicateKind::Smaller(bytes) => (m.raw_rfc822.as_bytes().len() as i64) < *bytes,
+        SearchPredicateKind::Larger(bytes) => (m.raw_rfc822.len() as i64) > *bytes,
+        SearchPredicateKind::Smaller(bytes) => (m.raw_rfc822.len() as i64) < *bytes,
     }
 }
 
@@ -1344,7 +1344,7 @@ impl Store for InMemoryStore {
             .iter()
             .filter(|m| {
                 m.mailbox == mailbox
-                    && folder.map_or(true, |f| {
+                    && folder.is_none_or(|f| {
                         m.folder == f
                             && (!f.eq_ignore_ascii_case("INBOX") || !is_snoozed_at(m, now))
                     })
@@ -1926,7 +1926,7 @@ impl Store for InMemoryStore {
                 o.mailbox == mailbox
                     && o.status == "scheduled"
                     && o.send_at > now
-                    && before.as_ref().map_or(true, |(ts, batch_id)| {
+                    && before.as_ref().is_none_or(|(ts, batch_id)| {
                         o.send_at > *ts
                             || (o.send_at == *ts && o.batch_id.as_str() > batch_id.as_str())
                     })

@@ -1,9 +1,9 @@
 //! Temporary-mail core: SSO-owned disposable addresses.
 //!
-//! Only an SSO-authenticated webmail user can provision a temporary address. The HTTP handlers
-//! live in [`crate::webmail`] so they inherit the gateway-verified identity, CSRF protection and
-//! the sanitized message-render pipeline. This module owns the security-relevant logic:
-//! ownership model, quota, unguessable address generation and TTL garbage collection.
+//! Only an SSO-authenticated bearer with the exact management scope can provision a temporary
+//! address. The JSON handlers live in [`crate::webmail`] so they inherit gateway-verified identity
+//! and scope context. This module owns the security-relevant logic: ownership, quota, unguessable
+//! address generation and TTL garbage collection.
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -21,6 +21,7 @@ pub(crate) fn temporary_mailbox_owner(user_sub: &str) -> String {
 }
 
 /// The SSO sub that owns a temporary mailbox, or `None` for a permanent mailbox.
+#[cfg(test)]
 pub(crate) fn temp_owner_user(mb: &Mailbox) -> Option<&str> {
     mb.owner_sub.strip_prefix("temp:")
 }
@@ -31,6 +32,7 @@ pub(crate) fn is_temporary_mailbox(mb: &Mailbox) -> bool {
 }
 
 /// Whether `user_sub` owns temporary mailbox `mb` (authorization for read/delete).
+#[cfg(test)]
 pub(crate) fn owned_by(mb: &Mailbox, user_sub: &str) -> bool {
     temp_owner_user(mb) == Some(user_sub)
 }

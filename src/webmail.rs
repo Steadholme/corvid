@@ -9,14 +9,14 @@
 //! Views:
 //! - `GET /healthz`  liveness (container HEALTHCHECK)
 //! - `GET /`         folder list (`?folder=INBOX|Sent|Drafts|Spam`, newest first: from / subject / date)
-//!                   or `?q=` full-text search (subject/from/to/body, optional `?folder=` scope);
-//!                   both keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
+//!   or `?q=` full-text search (subject/from/to/body, optional `?folder=` scope); both
+//!   keyset-paginated via `?before=<received_at>_<id>` + `?limit=` (≤200)
 //! - `GET /search/advanced` Gmail-style advanced search form; submits to the existing `?q=` search
 //! - `GET /m/{id}`   read a message (rendered sanitised body), marks it seen; reply/forward actions
 //! - `GET /compose`  compose form (mints a CSRF token); `?reply|replyall|forward=<id>` prefills it
 //! - `POST /compose/autosave` upsert the current compose into Drafts as a JSON progressive enhancement
 //! - `POST /send`    `action=send`: build RFC822, DKIM-sign, enqueue behind the undo-send window;
-//!                   `action=draft`: persist/upsert into the Drafts folder without sending
+//!   `action=draft`: persist/upsert into the Drafts folder without sending
 //! - `POST /send/undo` move a still-held send back to Drafts
 //! - `GET /settings` mailbox settings: filter rules / undo send / display / signature / auto-reply
 //!   sections
@@ -252,7 +252,108 @@ const WEBMAIL_JS: &str = r#"
   }
   function apiUrl(form) { try { return '/api' + new URL(form.action, location.origin).pathname; } catch (e) { return null; } }
   function field(form, name) { var el = form.querySelector('[name=' + name + ']'); return el ? el.value : ''; }
-  function snoozeFields(root) { return { snooze_until: field(root, 'snooze_until'), snooze_custom: field(root, 'snooze_custom') }; }
+  function localDateTime(epoch) {
+    var date = new Date(epoch * 1000);
+    if (!Number.isFinite(date.getTime())) return '';
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+  function syncLocalEpoch(local, hidden) {
+    if (!local || !hidden) return true;
+    local.setCustomValidity('');
+    if (!local.value) {
+      hidden.value = '';
+      return true;
+    }
+    var original = local.getAttribute('data-original-local') || '';
+    if (original && local.value === original && hidden.value) return true;
+    var millis = Date.parse(local.value);
+    var epoch = Number.isFinite(millis) ? Math.floor(millis / 1000) : 0;
+    if (!epoch || localDateTime(epoch) !== local.value) {
+      hidden.value = '';
+      local.setCustomValidity('Choose a valid local date and time.');
+      return false;
+    }
+    var ambiguous = [-7200000, -5400000, -3600000, -1800000, 1800000, 3600000, 5400000, 7200000]
+      .some(function (shift) { return localDateTime(Math.floor((millis + shift) / 1000)) === local.value; });
+    if (ambiguous) {
+      hidden.value = '';
+      local.setCustomValidity('This local time occurs twice. Choose a time outside the daylight-saving change.');
+      return false;
+    }
+    hidden.value = String(epoch);
+    return true;
+  }
+  function snoozeFields(root) {
+    var local = root.querySelector('[data-snooze-local]');
+    var hidden = root.querySelector('[name=snooze_custom]');
+    var valid = syncLocalEpoch(local, hidden);
+    return {
+      snooze_until: field(root, 'snooze_until'),
+      snooze_custom: field(root, 'snooze_custom'),
+      invalid: !valid
+    };
+  }
+  function syncSchedule(root) {
+    var local = root.querySelector('[data-schedule-local]');
+    var hidden = root.querySelector('[name=schedule_custom]');
+    return syncLocalEpoch(local, hidden);
+  }
+  document.querySelectorAll('[data-snooze-local]').forEach(function (local) {
+    var root = local.closest('form') || document;
+    var menu = root.querySelector('[name=snooze_until]');
+    var hidden = root.querySelector('[name=snooze_custom]');
+    var customOption = root.querySelector('[data-snooze-custom-option]');
+    var minimum = parseInt(local.getAttribute('data-min-epoch') || '0', 10);
+    local.hidden = false;
+    if (customOption) customOption.hidden = false;
+    if (minimum > 0) local.min = localDateTime(minimum);
+    local.addEventListener('input', function () {
+      if (menu) menu.value = '';
+      local.setCustomValidity('');
+    });
+    if (menu) menu.addEventListener('change', function () {
+      local.value = '';
+      local.setCustomValidity('');
+      if (hidden) hidden.value = '';
+    });
+  });
+  document.querySelectorAll('[data-schedule-local]').forEach(function (local) {
+    var root = local.closest('form') || document;
+    var hidden = root.querySelector('[name=schedule_custom]');
+    var menu = root.querySelector('[name=schedule_at]');
+    var customOption = root.querySelector('[data-schedule-custom-option]');
+    var minimum = parseInt(local.getAttribute('data-min-epoch') || '0', 10);
+    local.hidden = false;
+    if (customOption) customOption.hidden = false;
+    if (minimum > 0) local.min = localDateTime(minimum);
+    if (hidden && hidden.value) {
+      local.value = localDateTime(parseInt(hidden.value, 10));
+      local.setAttribute('data-original-local', local.value);
+    }
+    local.addEventListener('input', function () {
+      if (menu) menu.value = '';
+      local.setCustomValidity('');
+    });
+    if (menu) menu.addEventListener('change', function () {
+      if (menu.value) {
+        local.value = '';
+        local.removeAttribute('data-original-local');
+        local.setCustomValidity('');
+        if (hidden) hidden.value = '';
+      }
+    });
+  });
+  document.addEventListener('submit', function (e) {
+    var action = e.submitter ? e.submitter.value : '';
+    var submitsSchedule = action === 'schedule' || action === 'reschedule';
+    if (submitsSchedule && e.target && e.target.querySelector && e.target.querySelector('[data-schedule-local]')) {
+      if (!syncSchedule(e.target)) {
+        e.preventDefault();
+        var local = e.target.querySelector('[data-schedule-local]');
+        if (local) local.reportValidity();
+      }
+    }
+  }, true);
   function post(url, params) {
     var body = new URLSearchParams();
     Object.keys(params).forEach(function (k) { body.append(k, params[k]); });
@@ -329,6 +430,12 @@ const WEBMAIL_JS: &str = r#"
         var folder = op === 'move' ? field(form, 'folder') : '';
         if (op === 'move' && !folder) { e.preventDefault(); toast('Choose a folder to move to', 'err'); return; }
         var snooze = snoozeFields(form);
+        if (op === 'snooze' && snooze.invalid) {
+          e.preventDefault();
+          var invalidSnooze = form.querySelector('[data-snooze-local]');
+          if (invalidSnooze) invalidSnooze.reportValidity();
+          return;
+        }
         if (op === 'snooze' && !snooze.snooze_until && !snooze.snooze_custom) { e.preventDefault(); toast('Choose a snooze time', 'err'); return; }
         if (inList && row) {
           e.preventDefault();
@@ -398,6 +505,11 @@ const WEBMAIL_JS: &str = r#"
         var folder = '';
         if (op === 'move') { var sel = bar.querySelector('[data-bulk-folder]'); folder = sel ? sel.value : ''; if (!folder) { toast('Choose a folder to move to', 'err'); return; } }
         var snooze = snoozeFields(bar);
+        if (op === 'snooze' && snooze.invalid) {
+          var invalidBulkSnooze = bar.querySelector('[data-snooze-local]');
+          if (invalidBulkSnooze) invalidBulkSnooze.reportValidity();
+          return;
+        }
         if (op === 'snooze' && !snooze.snooze_until && !snooze.snooze_custom) { toast('Choose a snooze time', 'err'); return; }
         var det = rows.map(function (r) { return { row: r, parent: r.parentNode, next: r.nextSibling }; });
         det.forEach(function (d) { d.row.remove(); });
@@ -477,6 +589,69 @@ const COMPOSE_UX_JS: &str = r#"
 (function () {
   var toast = window.__corvidToast || function () {};
   var form = document.querySelector('form[action="/send"]'); if (!form) return;
+
+  function localDateTime(epoch) {
+    var date = new Date(epoch * 1000);
+    if (!Number.isFinite(date.getTime())) return '';
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+  function syncLocalEpoch(local, hidden) {
+    if (!local || !hidden) return true;
+    local.setCustomValidity('');
+    if (!local.value) {
+      hidden.value = '';
+      return true;
+    }
+    var original = local.getAttribute('data-original-local') || '';
+    if (original && local.value === original && hidden.value) return true;
+    var millis = Date.parse(local.value);
+    var epoch = Number.isFinite(millis) ? Math.floor(millis / 1000) : 0;
+    if (!epoch || localDateTime(epoch) !== local.value) {
+      hidden.value = '';
+      local.setCustomValidity('Choose a valid local date and time.');
+      return false;
+    }
+    var ambiguous = [-7200000, -5400000, -3600000, -1800000, 1800000, 3600000, 5400000, 7200000]
+      .some(function (shift) { return localDateTime(Math.floor((millis + shift) / 1000)) === local.value; });
+    if (ambiguous) {
+      hidden.value = '';
+      local.setCustomValidity('This local time occurs twice. Choose a time outside the daylight-saving change.');
+      return false;
+    }
+    hidden.value = String(epoch);
+    return true;
+  }
+  var scheduleLocal = form.querySelector('[data-schedule-local]');
+  var scheduleHidden = form.querySelector('[name="schedule_custom"]');
+  var scheduleMenu = form.querySelector('[name="schedule_at"]');
+  var scheduleCustomOption = form.querySelector('[data-schedule-custom-option]');
+  if (scheduleLocal) {
+    var scheduleMinimum = parseInt(scheduleLocal.getAttribute('data-min-epoch') || '0', 10);
+    scheduleLocal.hidden = false;
+    if (scheduleCustomOption) scheduleCustomOption.hidden = false;
+    if (scheduleMinimum > 0) scheduleLocal.min = localDateTime(scheduleMinimum);
+    if (scheduleHidden && scheduleHidden.value) {
+      scheduleLocal.value = localDateTime(parseInt(scheduleHidden.value, 10));
+      scheduleLocal.setAttribute('data-original-local', scheduleLocal.value);
+    }
+  }
+  if (scheduleMenu && scheduleLocal) {
+    scheduleLocal.addEventListener('input', function () {
+      scheduleMenu.value = '';
+      scheduleLocal.setCustomValidity('');
+    });
+    scheduleMenu.addEventListener('change', function () {
+      if (scheduleMenu.value) {
+        scheduleLocal.value = '';
+        scheduleLocal.removeAttribute('data-original-local');
+        scheduleLocal.setCustomValidity('');
+        if (scheduleHidden) scheduleHidden.value = '';
+      }
+    });
+  }
+  function syncSchedule() {
+    return syncLocalEpoch(scheduleLocal, scheduleHidden);
+  }
 
   var body = form.querySelector('#body');
   var rich = form.querySelector('#body-rich');
@@ -764,6 +939,19 @@ const COMPOSE_UX_JS: &str = r#"
   form.addEventListener('submit', function (e) {
     syncRich();
     var btn = e.submitter, action = btn ? btn.value : 'send';
+    if (action === 'schedule') {
+      if (!syncSchedule()) {
+        e.preventDefault();
+        if (scheduleLocal) scheduleLocal.reportValidity();
+        return;
+      }
+      if ((!scheduleMenu || !scheduleMenu.value) && (!scheduleHidden || !scheduleHidden.value)) {
+        e.preventDefault();
+        toast('Choose a schedule time', 'err');
+        if (scheduleLocal) scheduleLocal.focus();
+        return;
+      }
+    }
     if (action === 'send') {
       var to = form.querySelector('#to');
       if (to && !to.value.trim()) { e.preventDefault(); toast('Add at least one recipient', 'err'); to.focus(); return; }
@@ -823,9 +1011,6 @@ pub fn app(state: AppState) -> Router {
         .route("/api/m/bulk", post(api_bulk_action))
         .route("/m/{id}/labels", post(message_labels_post))
         .route("/m/{id}/attachments/{idx}", get(download_attachment))
-        .route("/temp", get(temp_index))
-        .route("/temp/new", post(temp_new))
-        .route("/temp/delete", post(temp_delete))
         .route(
             "/api/v1/temp-mailboxes",
             get(api_temp_mailboxes_list)
@@ -853,8 +1038,6 @@ pub fn app(state: AppState) -> Router {
             "/api/v1/temp-mailboxes/messages/attachments/get",
             post(api_temp_attachment_get).layer(DefaultBodyLimit::max(4096)),
         )
-        .route("/temp/box/{addr}", get(temp_box))
-        .route("/temp/box/{addr}/msg/{id}", get(temp_read))
         .route("/compose", get(compose_form))
         .route("/compose/autosave", post(compose_autosave))
         .route("/send", post(send))
@@ -862,7 +1045,7 @@ pub fn app(state: AppState) -> Router {
         .route("/scheduled/{batch_id}/action", post(scheduled_action))
         .route("/api/send", post(api_send))
         .route("/contacts/suggest", get(contacts_suggest))
-        // Progressive-enhancement JS, served as cacheable static assets (never inlined).
+        // Progressive-enhancement JS, served as revalidated static assets (never inlined).
         .route("/assets/webmail.js", get(asset_webmail_js))
         .route("/assets/compose.js", get(asset_compose_js))
         .route("/settings", get(settings_page))
@@ -917,6 +1100,7 @@ async fn require_gateway_sig(
     let path = req.uri().path();
     let temp_mail_api =
         path == "/api/v1/temp-mailboxes" || path.starts_with("/api/v1/temp-mailboxes/");
+    let public_resource = path == "/healthz" || path.starts_with("/assets/");
     let gateway_auth_ok = gateway_identity_ok(req.headers())
         && (!temp_mail_api || temp_api_scope_signature_ok(req.headers()));
     let mut response = if gateway_auth_ok {
@@ -928,16 +1112,42 @@ async fn require_gateway_sig(
         )
             .into_response()
     };
-    if temp_mail_api {
+    if !public_resource {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );
+    }
+    if temp_mail_api {
         // Append instead of replacing a handler's existing cache negotiation dimensions.
         response
             .headers_mut()
             .append(header::VARY, HeaderValue::from_static("Authorization"));
     }
+    response.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; \
+             object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'",
+        ),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
     response
 }
 
@@ -951,7 +1161,8 @@ async fn healthz() -> impl IntoResponse {
 
 /// `GET /assets/webmail.js` — the inbox/read/conversation progressive-enhancement bundle (toast +
 /// optimistic actions + multi-select bulk toolbar + keyboard nav + conversation collapse). Served
-/// as a cacheable static asset (not inlined) so the pages carry no inline `<script>`.
+/// as a revalidated static asset (not inlined) so the pages carry no inline `<script>` and never
+/// pair newly rendered markup with a stale interaction bundle after a deploy.
 async fn asset_webmail_js() -> Response {
     js_asset(&format!("{TOAST_JS}\n{WEBMAIL_JS}\n{}", odyssey::MOTION_JS))
 }
@@ -962,7 +1173,8 @@ async fn asset_compose_js() -> Response {
     js_asset(&format!("{COMPOSE_JS}\n{TOAST_JS}\n{COMPOSE_UX_JS}"))
 }
 
-/// Wrap a JS body in a cacheable `application/javascript` response.
+/// Wrap a JS body in a revalidated `application/javascript` response. These bundles are small and
+/// currently use stable URLs, so forcing revalidation avoids an hour-long markup/JS version skew.
 fn js_asset(body: &str) -> Response {
     (
         [
@@ -970,7 +1182,7 @@ fn js_asset(body: &str) -> Response {
                 header::CONTENT_TYPE,
                 "application/javascript; charset=utf-8",
             ),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
+            (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
         ],
         body.to_string(),
     )
@@ -1784,8 +1996,8 @@ fn render_scheduled_row(item: &ScheduledOutbound, token: &str, prefs: PagePrefs)
   {controls}
   <button class="btn btn-ghost btn-sm btn-reschedule-scheduled" type="submit" name="op" value="reschedule">Reschedule</button>
   <a class="btn btn-ghost btn-sm btn-edit-scheduled" href="/compose?scheduled={scheduled}">Edit</a>
-  <button class="btn btn-ghost btn-sm btn-draft-scheduled" type="submit" name="op" value="draft">Move to Drafts</button>
-  <button class="btn btn-danger btn-sm btn-cancel-scheduled" type="submit" name="op" value="cancel">Cancel</button>
+  <button class="btn btn-ghost btn-sm btn-draft-scheduled" type="submit" name="op" value="draft" formnovalidate>Move to Drafts</button>
+  <button class="btn btn-danger btn-sm btn-cancel-scheduled" type="submit" name="op" value="cancel" formnovalidate>Cancel</button>
 </form><span class="sr-only">From {from}</span></li>"#,
         id = esc(&item.batch_id),
         density = esc(prefs.density),
@@ -1888,19 +2100,23 @@ fn folder_class(folder: &str) -> String {
 
 fn snooze_controls(now: i64) -> String {
     let presets = [
-        (now + 3 * 60 * 60, "Later"),
-        (now + 6 * 60 * 60, "Tonight"),
-        (now + 24 * 60 * 60, "Tomorrow"),
-        (now + 7 * 24 * 60 * 60, "Next week"),
+        (now + 3 * 60 * 60, "In 3 hours"),
+        (now + 6 * 60 * 60, "In 6 hours"),
+        (now + 24 * 60 * 60, "In 24 hours"),
+        (now + 7 * 24 * 60 * 60, "In one week"),
     ];
     let mut opts = String::new();
     for (until, label) in presets {
         opts.push_str(&format!(r#"<option value="{until}">{label}</option>"#));
     }
+    opts.push_str(
+        r#"<option value="" data-snooze-custom-option hidden>Custom date and time…</option>"#,
+    );
     format!(
         r#"<select class="snooze-menu" name="snooze_until" aria-label="Snooze until">{opts}</select>
-  <input class="snooze-custom" type="number" name="snooze_custom" min="{min}" placeholder="Epoch" aria-label="Custom snooze epoch">"#,
-        min = now + 1,
+  <input class="snooze-custom" type="hidden" name="snooze_custom">
+  <input class="snooze-custom-local" type="datetime-local" data-snooze-local data-min-epoch="{min}" aria-label="Custom snooze date and time" hidden>"#,
+        min = (now.div_euclid(60) + 1) * 60,
     )
 }
 
@@ -1919,15 +2135,22 @@ fn schedule_controls_for(now: i64, selected: i64) -> String {
             r#"<option value="{send_at}"{sel}>{label}</option>"#
         ));
     }
-    let custom_value = if selected > now && !matched {
-        format!(r#" value="{selected}""#)
+    let (custom_option, custom_value) = if selected > now && !matched {
+        (
+            r#"<option value="" data-schedule-custom-option selected hidden>Custom date and time…</option>"#,
+            format!(r#" value="{selected}""#),
+        )
     } else {
-        String::new()
+        (
+            r#"<option value="" data-schedule-custom-option hidden>Custom date and time…</option>"#,
+            String::new(),
+        )
     };
     format!(
-        r#"<select class="schedule-menu" name="schedule_at" aria-label="Schedule send time">{opts}</select>
-  <input class="schedule-custom" type="number" name="schedule_custom" min="{min}" placeholder="Epoch" aria-label="Custom schedule epoch"{custom_value}>"#,
-        min = now + 1,
+        r#"<select class="schedule-menu" name="schedule_at" aria-label="Schedule send time">{opts}{custom_option}</select>
+  <input class="schedule-custom" type="hidden" name="schedule_custom"{custom_value}>
+  <input class="schedule-custom-local" type="datetime-local" data-schedule-local data-min-epoch="{min}" aria-label="Custom schedule date and time" hidden>"#,
+        min = (now.div_euclid(60) + 1) * 60,
     )
 }
 
@@ -2004,36 +2227,19 @@ fn theme_label(value: &str) -> String {
 }
 
 fn schedule_presets(now: i64) -> [(i64, &'static str); 3] {
-    let day = now.div_euclid(86_400) * 86_400;
-    let tonight = future_utc_time(day + 20 * 60 * 60, now);
-    let tomorrow_morning = future_utc_time(day + 86_400 + 9 * 60 * 60, now);
-    let days_since_epoch = day.div_euclid(86_400);
-    // 1970-01-01 was Thursday; with Monday=0 this is 3.
-    let weekday = (days_since_epoch + 3).rem_euclid(7);
-    let mut days_until_monday = (7 - weekday).rem_euclid(7);
-    if days_until_monday == 0 {
-        days_until_monday = 7;
-    }
-    let next_monday_morning = day + days_until_monday * 86_400 + 9 * 60 * 60;
     [
-        (tonight, "Tonight"),
-        (tomorrow_morning, "Tomorrow morning"),
-        (next_monday_morning, "Next Monday morning"),
+        (now + 3 * 60 * 60, "In 3 hours"),
+        (now + 24 * 60 * 60, "In 24 hours"),
+        (now + 7 * 24 * 60 * 60, "In one week"),
     ]
-}
-
-fn future_utc_time(candidate: i64, now: i64) -> i64 {
-    if candidate > now {
-        candidate
-    } else {
-        candidate + 86_400
-    }
 }
 
 /// The per-message action form (shared by inbox rows and the read view). Double-submit CSRF; every
 /// button submits the same form with a distinct `op`. The read/unread button reflects the current
 /// `seen` state (so a read row offers "Unread" and an unread row offers "Read" — the optimistic
 /// mark-read affordance). No-JS users still POST this form; the enhancement layer intercepts it.
+// These orthogonal message-state values keep the renderer call sites explicit and readable.
+#[allow(clippy::too_many_arguments)]
 fn row_actions(
     id: &str,
     starred: bool,
@@ -2082,14 +2288,29 @@ fn row_actions(
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{star_op}" title="{star_label}">{star_glyph}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="{seen_op}" title="Mark {seen_label_lc}">{seen_label}</button>
   <button class="btn btn-ghost btn-sm" type="submit" name="op" value="archive" title="Archive">Archive</button>
-  <button class="btn btn-ghost btn-sm btn-mute" type="submit" name="op" value="{mute_op}" title="{mute_label} thread">{mute_label}</button>
-  {snooze_controls}
-  <button class="btn btn-ghost btn-sm btn-snooze" type="submit" name="op" value="snooze" title="Snooze">Snooze</button>
-  {unsnooze_button}
-  {spam_button}
-  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
-  <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Move…</option>{opts}</select>
-  <button class="btn btn-ghost btn-sm" type="submit" name="op" value="move">Move</button>
+  <button class="btn btn-ghost btn-sm row-delete-core" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
+  <details class="row-actions__more">
+    <summary class="btn btn-ghost btn-sm">More</summary>
+    <div class="row-actions__more-panel">
+      <div class="row-actions__group">
+        <span class="row-actions__label">Conversation</span>
+        <button class="btn btn-ghost btn-sm btn-mute" type="submit" name="op" value="{mute_op}" title="{mute_label} thread">{mute_label}</button>
+        {unsnooze_button}
+        {spam_button}
+        <button class="btn btn-ghost btn-sm row-delete-more" type="submit" name="op" value="delete" title="Move to Trash">Delete</button>
+      </div>
+      <div class="row-actions__group">
+        <span class="row-actions__label">Snooze until</span>
+        {snooze_controls}
+        <button class="btn btn-ghost btn-sm btn-snooze" type="submit" name="op" value="snooze" title="Snooze">Snooze</button>
+      </div>
+      <div class="row-actions__group">
+        <span class="row-actions__label">Move to</span>
+        <select class="move-select" name="folder" aria-label="Move to folder"><option value="" selected disabled>Choose folder…</option>{opts}</select>
+        <button class="btn btn-ghost btn-sm" type="submit" name="op" value="move">Move</button>
+      </div>
+    </div>
+  </details>
 </form>"#,
         id = esc(id),
         token = esc(token),
@@ -2231,13 +2452,16 @@ fn render_plain_message_body(text: &str) -> String {
         let mut html = String::new();
         let visible = visible.trim_end_matches(['\r', '\n']);
         if !visible.trim().is_empty() {
-            html.push_str(&format!(r#"<pre>{}</pre>"#, esc(visible)));
+            html.push_str(&format!(r#"<pre class="msg-plain">{}</pre>"#, esc(visible)));
         }
         let quoted = quoted.trim_start_matches(['\r', '\n']);
-        html.push_str(&quote_details(&format!(r#"<pre>{}</pre>"#, esc(quoted))));
+        html.push_str(&quote_details(&format!(
+            r#"<pre class="msg-plain">{}</pre>"#,
+            esc(quoted)
+        )));
         html
     } else {
-        format!(r#"<pre>{}</pre>"#, esc(text))
+        format!(r#"<pre class="msg-plain">{}</pre>"#, esc(text))
     };
     format!(r#"<div class="msg-body">{inner}</div>"#)
 }
@@ -2705,15 +2929,6 @@ fn mail_sidebar(
     secondary.push_str(&sidebar_item(
         active,
         active_label,
-        "temp",
-        "/temp",
-        ICO_CLOCK,
-        "Temporary",
-        String::new(),
-    ));
-    secondary.push_str(&sidebar_item(
-        active,
-        active_label,
         crate::delivery::SPAM_FOLDER,
         "/?folder=Spam",
         ICO_SPAM,
@@ -2987,7 +3202,7 @@ async fn read_message(
     <h1 class="msg-subject">{subject}</h1>
     {sender}
     <div class="form-actions msg-actions">
-      <a class="btn btn-primary btn-sm" href="/compose?reply={id}">Reply</a>
+      <a class="btn btn-primary btn-sm btn-communication" href="/compose?reply={id}">Reply</a>
       <a class="btn btn-ghost btn-sm" href="/compose?replyall={id}">Reply all</a>
       <a class="btn btn-ghost btn-sm" href="/compose?forward={id}">Forward</a>
       {convo}
@@ -3166,7 +3381,7 @@ async fn conversation(
 
     let main = format!(
         r#"<nav class="crumbs"><a href="/">← Inbox</a></nav>
-<div class="page-head"><h1>{subject} <span class="pill thread-count">{count}</span></h1><a class="btn btn-primary btn-sm" href="/compose?replyall={latest}">Reply all</a></div>
+<div class="page-head"><h1>{subject} <span class="pill thread-count">{count}</span></h1><a class="btn btn-primary btn-sm btn-communication" href="/compose?replyall={latest}">Reply all</a></div>
 {blocks}
 <script src="/assets/webmail.js"></script>"#,
         count = msgs.len(),
@@ -3558,8 +3773,10 @@ fn parse_future_epoch(
     custom: &str,
     label: &str,
 ) -> Result<i64, (StatusCode, String)> {
-    let raw = custom.trim();
-    let raw = if raw.is_empty() { preset.trim() } else { raw };
+    // A visible preset wins when both fields are present. Custom date/time enhancement clears the
+    // select; this order also lets a no-JS user replace an existing custom scheduled time safely.
+    let raw = preset.trim();
+    let raw = if raw.is_empty() { custom.trim() } else { raw };
     let until = raw
         .parse::<i64>()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {label} time")))?;
@@ -4373,10 +4590,10 @@ async fn compose_form(
     <div class="form-actions">
       <span class="autosave-status" data-autosave-status aria-live="polite"></span>
       <div class="send-split">
-        <button class="btn btn-primary" type="submit" name="action" value="send">Send</button>
+        <button class="btn btn-primary btn-communication" type="submit" name="action" value="send" formnovalidate>Send</button>
         <details class="co-schedule"><summary aria-label="Schedule send"></summary><div class="co-schedule__panel">{schedule_controls}<button class="btn btn-ghost btn-schedule-send" type="submit" name="action" value="schedule">Schedule send</button></div></details>
       </div>
-      <button class="btn btn-ghost" type="submit" name="action" value="draft">Save draft</button>
+      <button class="btn btn-ghost" type="submit" name="action" value="draft" formnovalidate>Save draft</button>
       <a class="btn btn-ghost btn-sm" href="/">Cancel</a>
     </div>
   </form>
@@ -5088,10 +5305,7 @@ fn push_unique_addr(out: &mut Vec<String>, addr: String) {
 
 fn recipient_rcpts(to: &str, cc: &str) -> Vec<String> {
     let mut rcpts = Vec::new();
-    for token in recipient_tokens(to)
-        .into_iter()
-        .chain(recipient_tokens(cc).into_iter())
-    {
+    for token in recipient_tokens(to).into_iter().chain(recipient_tokens(cc)) {
         let addr = extract_addr(&token).to_lowercase();
         if is_valid_recipient_addr(&addr) {
             push_unique_addr(&mut rcpts, addr);
@@ -5672,9 +5886,19 @@ fn base64_wrapped(data: &[u8]) -> String {
 /// Soft per-mailbox message quota, shown alongside the live count in the admin view.
 const MAILBOX_QUOTA: i64 = 10_000;
 
+#[derive(Deserialize, Default)]
+struct AdminQuery {
+    #[serde(default)]
+    created: String,
+}
+
 /// `GET /admin` — list every provisioned mailbox with its owner + message-count/quota, plus the
 /// forms to create a mailbox and add an alias. Mints a CSRF token for the two POST forms.
-async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn admin_index(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> Response {
     let email = email_display(&headers);
     let (token, set_cookie) = ensure_csrf(&headers);
 
@@ -5726,8 +5950,18 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
         ));
     }
 
+    let created_banner = match query.created.as_str() {
+        "mailbox" => {
+            r#"<div class="status-banner status-banner--success" role="status"><b>Mailbox created</b><span>The new address is ready to receive mail.</span></div>"#
+        }
+        "alias" => {
+            r#"<div class="status-banner status-banner--success" role="status"><b>Alias added</b><span>New mail will now deliver to its target mailbox.</span></div>"#
+        }
+        _ => "",
+    };
     let content = format!(
-        r#"<div class="page-head"><h1>Mailbox provisioning</h1></div>
+        r#"<div class="page-head page-head--admin"><div><p class="eyebrow">Corvid administration</p><h1>Mailbox provisioning</h1><p class="page-head__lede">Create addresses and route aliases without leaving the desk.</p></div></div>
+{created_banner}
 <section class="card pad">
   <h2>Mailboxes</h2>
   <table class="data admin-table">
@@ -5755,7 +5989,7 @@ async fn admin_index(State(state): State<AppState>, headers: HeaderMap) -> Respo
   </form>
 </section>"#,
     );
-    let html = render_page("Admin", &email, &content, "");
+    let html = render_page("Admin", &email, &content, "admin");
     match set_cookie {
         Some(c) => ([(header::SET_COOKIE, c)], Html(html)).into_response(),
         None => Html(html).into_response(),
@@ -5838,7 +6072,7 @@ async fn admin_create_mailbox(
         owner_sub = %owner_sub,
         "admin created mailbox"
     );
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin?created=mailbox").into_response()
 }
 
 /// Add-alias form (`POST /admin/aliases`).
@@ -5909,7 +6143,7 @@ async fn admin_add_alias(
         mailbox = %mailbox,
         "admin added alias"
     );
-    Redirect::to("/admin").into_response()
+    Redirect::to("/admin?created=alias").into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -6071,9 +6305,9 @@ async fn settings_page(
     } else {
         "filter-rule-form"
     };
-    let field_opts = select_options_selected(&RULE_FIELDS, rule_field, |f| field_label(f));
+    let field_opts = select_options_selected(&RULE_FIELDS, rule_field, field_label);
     let op_opts = select_options_selected(&RULE_OPS, rule_op, |o| o.to_string());
-    let action_opts = select_options(&RULE_ACTIONS, |a| action_label(a));
+    let action_opts = select_options(&RULE_ACTIONS, action_label);
     let mut folder_opts = String::new();
     for f in FOLDERS {
         folder_opts.push_str(&format!(r#"<option value="{f}">{f}</option>"#));
@@ -6095,8 +6329,32 @@ async fn settings_page(
     };
     let undo_window_opts = undo_send_window_options(settings.undo_send_window_secs);
     let (density_opts, reading_pane_opts, theme_opts) = display_preference_options(&settings);
+    let saved_banner = render_settings_saved_banner(&q.saved);
+    let admin_index_link = if is_admin(&headers) {
+        r#"<a class="settings-index__admin" href="/admin">Administration</a>"#
+    } else {
+        ""
+    };
     let content = format!(
-        r#"<div class="page-head"><h1>Settings</h1></div>
+        r##"<div class="page-head page-head--settings">
+  <div><p class="eyebrow">Your workspace</p><h1>Settings</h1><p class="page-head__lede">Shape how Corvid sorts, writes, and presents your mail.</p></div>
+</div>
+<div class="settings-shell">
+<nav class="settings-index" aria-label="Settings sections">
+  <a href="#filter-rules">Filter rules</a>
+  <a href="#templates">Templates</a>
+  <a href="#senders">Safe &amp; blocked</a>
+  <a href="#labels">Labels</a>
+  <a href="#identities">Send identities</a>
+  <a href="#contacts">Contacts</a>
+  <a href="#signatures">Signatures</a>
+  <a href="#undo-send">Undo send</a>
+  <a href="#display">Display</a>
+  <a href="#auto-reply">Auto-reply</a>
+  {admin_index_link}
+</nav>
+<div class="settings-content">
+{saved_banner}
 <section id="filter-rules" class="card pad filter-rules">
   <h2>Filter rules</h2>
   <p class="muted">Applied to incoming mail at delivery, top to bottom — the first matching rule wins.</p>
@@ -6122,7 +6380,7 @@ async fn settings_page(
 {identities_section}
 {contacts_section}
 {signatures_section}
-<section class="card pad undo-send-settings">
+<section id="undo-send" class="card pad undo-send-settings">
   <h2>Undo send</h2>
   <form method="post" action="/settings/undo-send">
     <input type="hidden" name="csrf" value="{token}">
@@ -6130,7 +6388,7 @@ async fn settings_page(
     <div class="form-actions"><button class="btn btn-primary" type="submit">Save undo send</button></div>
   </form>
 </section>
-<section class="card pad display-settings">
+<section id="display" class="card pad display-settings">
   <h2>Display</h2>
   <form method="post" action="/settings/preferences">
     <input type="hidden" name="csrf" value="{token}">
@@ -6140,8 +6398,8 @@ async fn settings_page(
     <div class="form-actions"><button class="btn btn-primary" type="submit">Save display</button></div>
   </form>
 </section>
-<section class="card pad">
-  <h2>Auto-reply (vacation)</h2>
+<section id="auto-reply" class="card pad auto-reply-settings">
+  <h2>Auto-reply</h2>
   <form method="post" action="/settings/autoreply">
     <input type="hidden" name="csrf" value="{token}">
     <div class="field"><label><input type="checkbox" name="enabled" value="on"{ar_checked}> Enable auto-reply</label></div>
@@ -6150,9 +6408,13 @@ async fn settings_page(
     <div class="field"><label for="ar_until">Until (UTC)</label><input id="ar_until" name="until" type="date" value="{ar_until}"><p class="hint">Leave empty for no end date. Each sender receives at most one auto-reply per 24 hours.</p></div>
     <div class="form-actions"><button class="btn btn-primary" type="submit">Save auto-reply</button></div>
   </form>
-</section>"#,
+</section>
+</div>
+</div>"##,
         token = esc(&token),
         rule_run_banner = rule_run_banner,
+        saved_banner = saved_banner,
+        admin_index_link = admin_index_link,
         rule_needle = esc(rule_needle),
         ar_subject = esc(&settings.auto_reply_subject),
         ar_body = esc(&settings.auto_reply_body),
@@ -6198,6 +6460,28 @@ struct SettingsQuery {
     matched: i64,
     #[serde(default)]
     changed: i64,
+    #[serde(default)]
+    saved: String,
+}
+
+fn render_settings_saved_banner(saved: &str) -> String {
+    let message = match saved {
+        "rules" => "Filter rules updated.",
+        "signature" => "Signatures updated.",
+        "undo-send" => "Undo send preference saved.",
+        "display" => "Display preferences saved.",
+        "auto-reply" => "Auto-reply preference saved.",
+        "templates" => "Templates updated.",
+        "senders" => "Sender lists updated.",
+        "labels" => "Labels updated.",
+        "identities" => "Send identities updated.",
+        "contacts" => "Contacts updated.",
+        _ => return String::new(),
+    };
+    format!(
+        r#"<div class="status-banner status-banner--success" role="status"><b>Saved</b><span>{}</span></div>"#,
+        esc(message)
+    )
 }
 
 /// One filter-rule table row: the match/action summary plus its inline control form
@@ -6444,7 +6728,7 @@ async fn settings_rules_post(
             "filter rule change",
         );
         return Redirect::to(&format!(
-            "/settings?ran={}&matched={}&changed={}",
+            "/settings?saved=rules&ran={}&matched={}&changed={}#filter-rules",
             url_encode(&form.id),
             rep.matched,
             rep.changed
@@ -6459,7 +6743,7 @@ async fn settings_rules_post(
         rule = %form.id,
         "filter rule change",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=rules#filter-rules").into_response()
 }
 
 async fn run_rule_now(
@@ -6623,7 +6907,7 @@ async fn settings_signature(
         cleared = %form.signature.trim().is_empty(),
         "signature updated",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=signature#signatures").into_response()
 }
 
 /// `GET /settings/signatures` — signatures are managed on the main settings page.
@@ -6819,7 +7103,7 @@ async fn settings_signatures_post(
         signature = %form.id,
         "signature change",
     );
-    Redirect::to("/settings#signatures").into_response()
+    Redirect::to("/settings?saved=signature#signatures").into_response()
 }
 
 async fn create_signature_from_form(
@@ -6981,7 +7265,7 @@ async fn settings_undo_send(
         secs,
         "undo-send window updated",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=undo-send#undo-send").into_response()
 }
 
 /// Form body for `POST /settings/preferences`.
@@ -7046,7 +7330,7 @@ async fn settings_preferences(
         theme,
         "display preferences updated",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=display#display").into_response()
 }
 
 /// Form body for `POST /settings/autoreply`. `enabled` is a checkbox (absent = off); `until` is
@@ -7108,7 +7392,7 @@ async fn settings_autoreply(
         until,
         "auto-reply updated",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=auto-reply#auto-reply").into_response()
 }
 
 /// Parse the auto-reply end date: empty = `Some(0)` (no expiry), `YYYY-MM-DD` = that day's
@@ -7259,7 +7543,7 @@ async fn settings_templates_post(
         template = %form.id,
         "template change",
     );
-    Redirect::to("/settings#templates").into_response()
+    Redirect::to("/settings?saved=templates#templates").into_response()
 }
 
 async fn create_template_from_form(
@@ -7376,7 +7660,7 @@ fn render_sender_lists_section(entries: &[SenderListEntry], token: &str) -> Stri
         ));
     }
     format!(
-        r#"<section class="card pad sender-lists">
+        r#"<section id="senders" class="card pad sender-lists">
   <h2>Safe and blocked senders</h2>
   <table class="data admin-table">
     <thead><tr><th>Address or domain</th><th>List</th><th></th></tr></thead>
@@ -7483,7 +7767,7 @@ async fn settings_senders_post(
         cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
         "sender list change",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=senders#senders").into_response()
 }
 
 /// The Labels settings card: existing labels (with delete) + an add form.
@@ -7506,7 +7790,7 @@ fn render_labels_section(labels: &[Label], token: &str) -> String {
         ));
     }
     format!(
-        r#"<section class="card pad">
+        r#"<section id="labels" class="card pad">
   <h2>Labels</h2>
   <p class="muted">Arbitrary tags you can apply to messages (independent of folders). Filter by a label from the tab strip, or add one automatically with an "Add label" filter rule.</p>
   <table class="data admin-table">
@@ -7558,7 +7842,7 @@ fn render_identities_section(
         ));
     }
     format!(
-        r#"<section class="card pad">
+        r#"<section id="identities" class="card pad">
   <h2>Send identities</h2>
   <p class="muted">Extra "From" addresses you may send as (must be at this mail domain so outgoing mail stays signed). Pick one in the compose "From" selector.</p>
   <table class="data admin-table">
@@ -7836,7 +8120,7 @@ async fn settings_labels_post(
         cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
         "label change",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=labels#labels").into_response()
 }
 
 /// Form body for `POST /settings/identities`: CSRF, `cmd` (`add`|`delete`), the `id` (delete), and
@@ -7917,7 +8201,7 @@ async fn settings_identities_post(
         cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
         "send identity change",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=identities#identities").into_response()
 }
 
 /// Form body for `POST /settings/contacts`: CSRF, `cmd` (`add`|`delete`), the `addr`, and `name`.
@@ -7996,7 +8280,7 @@ async fn settings_contacts_post(
         cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
         "contact change",
     );
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?saved=contacts#contacts").into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -8085,7 +8369,7 @@ async fn settings_contact_groups_post(
         cmd = %if form.cmd.is_empty() { "add" } else { form.cmd.as_str() },
         "contact group change",
     );
-    Redirect::to("/settings#contacts").into_response()
+    Redirect::to("/settings?saved=contacts#contacts").into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -8223,7 +8507,7 @@ async fn settings_contacts_import(
         skipped = parsed.skipped,
         "contacts import",
     );
-    Redirect::to("/settings#contacts").into_response()
+    Redirect::to("/settings?saved=contacts#contacts").into_response()
 }
 
 async fn parse_contact_import(
@@ -8608,12 +8892,12 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// The signed-in user's subject (gateway `X-Auth-Subject`).
 fn identity_subject(headers: &HeaderMap) -> Option<String> {
-    header_value(headers, "x-auth-subject")
+    header_value(headers, HEADER_SUBJECT)
 }
 
 /// The signed-in user's email (gateway `X-Auth-Email`).
 fn identity_email(headers: &HeaderMap) -> Option<String> {
-    header_value(headers, "x-auth-email")
+    header_value(headers, HEADER_EMAIL)
 }
 
 /// Group names that authorize the admin panel. Membership in ANY of these unlocks `/admin`.
@@ -8640,12 +8924,14 @@ pub fn has_group(headers: &HeaderMap, group: &str) -> bool {
 
 /// Whether the authenticated user is in ANY [`ADMIN_GROUPS`] entry.
 fn is_admin(headers: &HeaderMap) -> bool {
-    ADMIN_GROUPS.iter().any(|g| has_group(headers, g))
+    identity_subject(headers).is_some() && ADMIN_GROUPS.iter().any(|g| has_group(headers, g))
 }
 
 /// Require admin group membership for the `/admin` subtree. On success returns `Ok(())`; when the
 /// user carries no admin group, returns a rendered `403` page as the `Err` — closes the hole where
 /// ANY signed-in user could reach mailbox provisioning.
+// Axum's rendered error response is intentionally returned directly to the middleware.
+#[allow(clippy::result_large_err)]
 pub fn require_admin(headers: &HeaderMap) -> Result<(), Response> {
     if is_admin(headers) {
         Ok(())
@@ -8658,17 +8944,12 @@ pub fn require_admin(headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
-/// Resolve the mailbox for the signed-in user: by `owner_sub`, else (defence in depth) by an
-/// email whose local-part owns a mailbox.
+/// Resolve the mailbox exclusively from the signed gateway subject. `X-Auth-Email` is presentation
+/// metadata and is deliberately never an authorization fallback because the legacy identity HMAC
+/// wire format does not bind it.
 async fn resolve_mailbox(state: &AppState, headers: &HeaderMap) -> Option<Mailbox> {
     if let Some(sub) = identity_subject(headers) {
         if let Ok(Some(mb)) = state.store.mailbox_for_owner(&sub).await {
-            return Some(mb);
-        }
-    }
-    // Fallback: an injected email that matches a mailbox address directly.
-    if let Some(em) = identity_email(headers) {
-        if let Ok(Some(mb)) = state.store.get_mailbox(&em).await {
             return Some(mb);
         }
     }
@@ -8730,6 +9011,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 use std::sync::OnceLock;
 
 pub const HEADER_SUBJECT: &str = "x-auth-subject";
+pub const HEADER_EMAIL: &str = "x-auth-email";
 pub const HEADER_GROUPS: &str = "x-auth-groups";
 /// HMAC binding the injected identity to a 1-minute window (set by Sluice when GATEWAY_HMAC_KEY
 /// is configured). See [`gateway_identity_ok`].
@@ -8746,28 +9028,38 @@ fn gateway_key() -> &'static str {
         .as_str()
 }
 
-/// Verify the gateway-injected identity is authentic. When `GATEWAY_HMAC_KEY` is set AND an
-/// identity (`X-Auth-Subject`) is present, a valid `X-Auth-Sig` — HMAC-SHA256 over
+/// Verify the gateway-injected identity is authentic. When `GATEWAY_HMAC_KEY` is set and any
+/// identity-context header is present, `X-Auth-Subject` plus a valid `X-Auth-Sig` — HMAC-SHA256 over
 /// `subject "\n" groups "\n" minute` for the current OR previous minute — is REQUIRED; a rogue
-/// peer that POSTs `X-Auth-Subject` directly (bypassing Sluice) cannot forge it. Returns:
-/// - `true` when the key is unset (verification off), or no identity header is present
-///   (healthz/dev path), or the signature is valid;
-/// - `false` when an identity is present but the signature is missing or invalid (=> 401).
+/// peer that injects `X-Auth-Email`/`X-Auth-Groups` without a subject cannot bypass verification.
+/// Requests with no identity context at all remain available to health checks and separately
+/// token-guarded service endpoints.
 pub fn gateway_identity_ok(headers: &HeaderMap) -> bool {
-    let key = gateway_key();
+    gateway_identity_ok_at(headers, gateway_key(), now_unix() / 60)
+}
+
+fn gateway_identity_ok_at(headers: &HeaderMap, key: &str, window: i64) -> bool {
     if key.is_empty() {
         return true;
     }
     let Some(subject) = identity_subject(headers) else {
-        return true; // no injected identity to verify (healthz / local dev)
+        let has_auth_context = [
+            HEADER_EMAIL,
+            HEADER_GROUPS,
+            HEADER_SIG,
+            HEADER_SCOPE,
+            HEADER_SCOPE_SIG,
+        ]
+        .iter()
+        .any(|name| headers.contains_key(*name));
+        return !has_auth_context;
     };
     let groups = header_value(headers, HEADER_GROUPS).unwrap_or_default();
     let Some(sig) = header_value(headers, HEADER_SIG) else {
         return false; // identity present but unsigned — reject
     };
-    let win = now_unix() / 60;
     // Accept the current and previous minute (clock skew + minute-boundary tolerance).
-    [win, win - 1].iter().any(|&w| {
+    [window, window.saturating_sub(1)].iter().any(|&w| {
         ct_eq(
             sig.as_bytes(),
             sign_identity(key, &subject, &groups, w).as_bytes(),
@@ -8886,25 +9178,10 @@ fn render_page_with_prefs(
     render_shell(title, email_display, content, nav_active, prefs, "")
 }
 
-// ============================ Temporary mail (SSO-owned) ============================
-// Disposable addresses provisioned by the signed-in user from the webmail. The global
-// `require_gateway_sig` layer rejects any forged/unsigned gateway identity, so every handler
-// below runs only for a genuine SSO session. Reads and deletes additionally verify per-user
-// ownership (`temp:{sub}`), so one user can never reach another user's temporary mail.
-// Provisioning and deletion are CSRF-guarded. Received mail is untrusted and is always rendered
-// through the shared HTML sanitizer.
-
-#[derive(Deserialize, Default)]
-struct TempCsrfForm {
-    csrf: String,
-}
-
-#[derive(Deserialize, Default)]
-struct TempDeleteForm {
-    csrf: String,
-    #[serde(default)]
-    address: String,
-}
+// ============================ Temporary mail API (SSO-owned) ============================
+// Disposable addresses are managed only through the Sluice-authenticated receive-only API.
+// The global `require_gateway_sig` layer rejects forged gateway identity and scope context;
+// every handler below also enforces exact per-user ownership (`temp:{sub}`).
 
 /// The sole OAuth scope accepted by the receive-only temporary-mail API. Scope matching is an
 /// exact token comparison against Sluice's injected `X-Auth-Scope`; Corvid never parses a bearer
@@ -9086,30 +9363,6 @@ fn invalid_temp_api_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T
             }
         }
     })
-}
-
-fn temp_forbidden() -> Response {
-    error_page(
-        StatusCode::UNAUTHORIZED,
-        "Sign in required",
-        "Temporary mail needs a signed-in session.",
-    )
-}
-
-fn temp_not_found() -> Response {
-    error_page(
-        StatusCode::NOT_FOUND,
-        "Not found",
-        "No such temporary address.",
-    )
-}
-
-fn temp_csrf_error() -> Response {
-    error_page(
-        StatusCode::FORBIDDEN,
-        "Request blocked",
-        "CSRF token missing or mismatched.",
-    )
 }
 
 /// Conservative dot-atom validation for API input. It is intentionally syntax-only: management
@@ -9392,7 +9645,7 @@ async fn api_temp_message_get(
         return json_status(StatusCode::BAD_REQUEST, "invalid message id");
     };
     let owner = crate::temp_mail::temporary_mailbox_owner(&subject);
-    let message = match state
+    let mut message = match state
         .store
         .get_owned_temp_message(&address, &owner, &message_id, crate::now_secs())
         .await
@@ -9401,6 +9654,12 @@ async fn api_temp_message_get(
         Ok(None) => return json_status(StatusCode::NOT_FOUND, "message not found"),
         Err(_) => return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure"),
     };
+    if !message.seen {
+        if state.store.mark_seen(&message.id).await.is_err() {
+            return json_status(StatusCode::SERVICE_UNAVAILABLE, "temporary storage failure");
+        }
+        message.seen = true;
+    }
     let attachments = crate::rfc822::list_attachments(&message.raw_rfc822)
         .into_iter()
         .map(|attachment| TempAttachmentMetaResponse {
@@ -9553,239 +9812,6 @@ async fn api_temp_mailbox_delete(
     }
 }
 
-/// Compact "1d 3h" / "12m" for a positive second count.
-fn fmt_short_duration(secs: i64) -> String {
-    if secs <= 0 {
-        return "moments".to_string();
-    }
-    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
-    if d > 0 {
-        format!("{d}d {h}h")
-    } else if h > 0 {
-        format!("{h}h {m}m")
-    } else {
-        format!("{m}m")
-    }
-}
-
-/// Wrap temp-mail content in the standard mail shell + page chrome.
-async fn temp_page(state: &AppState, headers: &HeaderMap, title: &str, main: &str) -> String {
-    let email = email_display(headers);
-    let settings = match resolve_mailbox(state, headers).await {
-        Some(mb) => settings_for_page(state, &mb.addr).await,
-        None => settings_for_page(state, "").await,
-    };
-    let prefs = page_prefs(&settings, estate_theme(headers));
-    let content = mail_shell(
-        mail_sidebar("temp", "", &[], &FolderCounts::default()),
-        main.to_string(),
-    );
-    render_mail_page(title, &email, &content, prefs)
-}
-
-/// Owner-checked lookup shared by the box + read views: returns the mailbox iff it is a
-/// temporary mailbox owned by `sub`.
-async fn temp_owned_mailbox(state: &AppState, sub: &str, addr: &str) -> Option<Mailbox> {
-    let mb = state.store.get_mailbox(addr).await.ok().flatten()?;
-    (crate::temp_mail::is_temporary_mailbox(&mb)
-        && crate::temp_mail::owned_by(&mb, sub)
-        && crate::temp_mail::is_live(&mb, crate::now_secs()))
-    .then_some(mb)
-}
-
-/// `GET /temp` — the signed-in user's temporary addresses + a generate control.
-async fn temp_index(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(sub) = identity_subject(&headers) else {
-        return temp_forbidden();
-    };
-    let (token, set_cookie) = ensure_csrf(&headers);
-    let enabled = state.config.temp_mail_enabled();
-    let limit = state.config.temp_mail_max_per_user;
-    let now = crate::now_secs();
-    let owner = crate::temp_mail::temporary_mailbox_owner(&sub);
-    let mut boxes = state
-        .store
-        .list_temp_mailboxes(&owner)
-        .await
-        .unwrap_or_default();
-    boxes.retain(|mb| crate::temp_mail::is_live(mb, now));
-
-    let mut list = String::new();
-    if boxes.is_empty() {
-        list.push_str(r#"<p class="tm-empty">You have no temporary addresses yet.</p>"#);
-    } else {
-        for mb in &boxes {
-            let count = state.store.message_count(&mb.addr).await.unwrap_or(0);
-            let rem = fmt_short_duration(mb.expires_at - now);
-            list.push_str(&format!(
-                r#"<div class="tm-row"><a class="tm-addr" href="/temp/box/{href}">{addr}</a><span class="tm-meta">{count} mail · expires in {rem}</span><form method="post" action="/temp/delete" class="tm-del"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="address" value="{addr}"><button type="submit" class="tm-btn tm-btn--danger">Delete</button></form></div>"#,
-                href = url_encode(&mb.addr),
-                addr = esc(&mb.addr),
-                rem = esc(&rem),
-                csrf = esc(&token),
-            ));
-        }
-    }
-
-    let control = if !enabled {
-        r#"<p class="tm-note">Temporary mail is not configured on this server.</p>"#.to_string()
-    } else if boxes.len() >= limit {
-        format!(
-            r#"<p class="tm-note">You are at your limit of {limit} temporary addresses. Delete one to create another.</p>"#
-        )
-    } else {
-        format!(
-            r#"<form method="post" action="/temp/new" class="tm-gen"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="tm-btn tm-btn--primary">Generate a temporary address</button></form>"#,
-            csrf = esc(&token),
-        )
-    };
-
-    let main = format!(
-        r#"<div class="tm-wrap"><header class="tm-head"><h1>Temporary addresses</h1><p class="tm-sub">Disposable inboxes for sign-ups you don't want in your real mail. Up to {limit} active at a time; each self-destructs when it expires. Receive-only — they cannot send.</p></header>{control}<section class="tm-list">{list}</section></div>"#,
-    );
-
-    let page = temp_page(&state, &headers, "Temporary addresses", &main).await;
-    match set_cookie {
-        Some(c) => ([(header::SET_COOKIE, c)], Html(page)).into_response(),
-        None => Html(page).into_response(),
-    }
-}
-
-/// `POST /temp/new` — provision a fresh address (CSRF + quota enforced in `provision`).
-async fn temp_new(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<TempCsrfForm>,
-) -> Response {
-    if !verify_csrf(&headers, &form.csrf) {
-        return temp_csrf_error();
-    }
-    let Some(sub) = identity_subject(&headers) else {
-        return temp_forbidden();
-    };
-    match crate::temp_mail::provision(&state, &sub).await {
-        Ok(_)
-        | Err(crate::temp_mail::ProvisionError::QuotaExceeded)
-        | Err(crate::temp_mail::ProvisionError::Disabled) => Redirect::to("/temp").into_response(),
-        Err(crate::temp_mail::ProvisionError::Storage) => error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Storage error",
-            "Could not create the temporary address.",
-        ),
-    }
-}
-
-/// `POST /temp/delete` — release an address (CSRF + owner check inside `release`).
-async fn temp_delete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<TempDeleteForm>,
-) -> Response {
-    if !verify_csrf(&headers, &form.csrf) {
-        return temp_csrf_error();
-    }
-    let Some(sub) = identity_subject(&headers) else {
-        return temp_forbidden();
-    };
-    match crate::temp_mail::release(&state, &sub, &form.address).await {
-        Ok(_) => Redirect::to("/temp").into_response(),
-        Err(_) => {
-            tracing::warn!(actor = %sub, "temporary mailbox form delete storage failure");
-            error_page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Storage error",
-                "Could not delete the temporary address.",
-            )
-        }
-    }
-}
-
-/// `GET /temp/box/{addr}` — messages received by one of the user's temporary addresses.
-async fn temp_box(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(addr): Path<String>,
-) -> Response {
-    let Some(sub) = identity_subject(&headers) else {
-        return temp_forbidden();
-    };
-    let addr = addr.to_ascii_lowercase();
-    if temp_owned_mailbox(&state, &sub, &addr).await.is_none() {
-        return temp_not_found();
-    }
-    let msgs = state
-        .store
-        .list_messages(&addr, 100)
-        .await
-        .unwrap_or_default();
-    let now = crate::now_secs();
-    let mut rows = String::new();
-    if msgs.is_empty() {
-        rows.push_str(
-            r#"<p class="tm-empty">No mail yet. Anything sent to this address lands here.</p>"#,
-        );
-    } else {
-        for m in &msgs {
-            let ago = fmt_short_duration(now - m.received_at);
-            let subj = if m.subject.is_empty() {
-                "(no subject)"
-            } else {
-                &m.subject
-            };
-            rows.push_str(&format!(
-                r#"<a class="tm-msg" href="/temp/box/{bx}/msg/{id}"><span class="tm-from">{from}</span><span class="tm-subj">{subj}</span><span class="tm-ago">{ago} ago</span></a>"#,
-                bx = url_encode(&addr),
-                id = url_encode(&m.id),
-                from = esc(&m.msg_from),
-                subj = esc(subj),
-                ago = esc(&ago),
-            ));
-        }
-    }
-    let main = format!(
-        r#"<div class="tm-wrap"><header class="tm-head"><a class="tm-back" href="/temp">← Temporary addresses</a><h1 class="tm-addr-title">{addr}</h1></header><section class="tm-msgs">{rows}</section></div>"#,
-        addr = esc(&addr),
-    );
-    Html(temp_page(&state, &headers, &addr, &main).await).into_response()
-}
-
-/// `GET /temp/box/{addr}/msg/{id}` — read one message (owner-checked, sanitized render).
-async fn temp_read(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((addr, id)): Path<(String, String)>,
-) -> Response {
-    let Some(sub) = identity_subject(&headers) else {
-        return temp_forbidden();
-    };
-    let addr = addr.to_ascii_lowercase();
-    if temp_owned_mailbox(&state, &sub, &addr).await.is_none() {
-        return temp_not_found();
-    }
-    let msg = match state.store.get_message(&id).await {
-        Ok(Some(m)) if m.mailbox == addr => m,
-        _ => return temp_not_found(),
-    };
-    let body = if !msg.body_html.trim().is_empty() {
-        crate::sanitize::sanitize_html(&msg.body_html)
-    } else {
-        format!("<pre class=\"tm-text\">{}</pre>", esc(&msg.body_text))
-    };
-    let subj = if msg.subject.is_empty() {
-        "(no subject)"
-    } else {
-        &msg.subject
-    };
-    let main = format!(
-        r#"<div class="tm-wrap"><header class="tm-head"><a class="tm-back" href="/temp/box/{bx}">← {addr}</a><h1 class="tm-subj-title">{subj}</h1><p class="tm-from-line">From {from}</p></header><article class="tm-body">{body}</article></div>"#,
-        bx = url_encode(&addr),
-        addr = esc(&addr),
-        subj = esc(subj),
-        from = esc(&msg.msg_from),
-    );
-    Html(temp_page(&state, &headers, subj, &main).await).into_response()
-}
-
 fn render_mail_page(title: &str, email_display: &str, content: &str, prefs: PagePrefs) -> String {
     render_shell(title, email_display, content, "inbox", prefs, " wrap--mail")
 }
@@ -9810,8 +9836,8 @@ fn render_shell(
         .replace("{{CONTENT}}", content)
 }
 
-/// The app-bar navigation — the existing Inbox (`/`) and Compose (`/compose`) destinations as v2
-/// `.appnav` links, marking `active` (`"inbox"`/`"compose"`) with `.is-active`.
+/// The app-bar navigation. Admin appears only while rendering the already-gated admin subtree;
+/// administrators discover it from Settings without exposing a dead-end tab to other users.
 fn nav_bar(active: &str) -> String {
     let link = |key: &str, href: &str, label: &str, icon: &str| {
         let cls = if key == active {
@@ -9821,11 +9847,17 @@ fn nav_bar(active: &str) -> String {
         };
         format!(r#"<a class="{cls}" href="{href}">{icon}{label}</a>"#)
     };
+    let admin = if active == "admin" {
+        link("admin", "/admin", "Admin", ICO_USER)
+    } else {
+        String::new()
+    };
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         link("inbox", "/", "Inbox", ICO_INBOX),
         link("compose", "/compose", "Compose", ICO_COMPOSE),
         link("settings", "/settings", "Settings", ICO_SETTINGS),
+        admin,
     )
 }
 
@@ -9885,13 +9917,27 @@ fn email_display(headers: &HeaderMap) -> String {
 }
 
 fn no_mailbox_page(email: &str) -> Response {
-    let content = r#"<section class="card empty-card"><h1 class="empty-title">No mailbox provisioned</h1><p class="muted">Your Steadholme identity has no Corvid mailbox yet. Ask an administrator to provision one.</p></section>"#;
-    Html(render_page("No mailbox", email, content, "")).into_response()
+    let content = format!(
+        r#"<section class="card empty-card empty-card--mailbox" data-state="no-mailbox">
+  <div class="empty__ico">{}</div>
+  <p class="eyebrow">Identity connected</p>
+  <h1 class="empty-title">No mailbox provisioned</h1>
+  <p class="muted">Your Steadholme identity is signed in, but it does not have a Corvid address yet. Ask an administrator to provision one.</p>
+  <p><a class="btn btn-primary btn-sm" href="https://account.w33d.xyz">Check account</a></p>
+</section>"#,
+        ICO_INBOX,
+    );
+    Html(render_page("No mailbox", email, &content, "")).into_response()
 }
 
 fn error_page(status: StatusCode, heading: &str, message: &str) -> Response {
     let content = format!(
-        r#"<section class="card empty-card"><h1 class="empty-title">{}</h1><p class="muted">{}</p><p><a class="btn btn-primary btn-sm" href="/">Back to inbox</a></p></section>"#,
+        r#"<section class="card empty-card empty-card--error" role="alert" data-state="error">
+  <p class="eyebrow">Corvid could not finish that action</p>
+  <h1 class="empty-title">{}</h1>
+  <p class="muted">{}</p>
+  <p><a class="btn btn-primary btn-sm" href="/">Back to inbox</a></p>
+</section>"#,
         esc(heading),
         esc(message),
     );
@@ -9962,9 +10008,9 @@ fn clean_snippet(snippet: &str) -> String {
         .lines()
         .map(str::trim)
         .filter(|line| {
-            !line.starts_with('>')
-                && !(line.starts_with("On ") && line.contains("wrote:"))
-                && !line.is_empty()
+            !(line.starts_with('>')
+                || line.is_empty()
+                || line.starts_with("On ") && line.contains("wrote:"))
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -10166,6 +10212,7 @@ mod tests {
 
         // Comma-separated groups, with whitespace, parse and match by exact name.
         let mut admins = HeaderMap::new();
+        admins.insert(HEADER_SUBJECT, HeaderValue::from_static("u_admin"));
         admins.insert(
             HEADER_GROUPS,
             HeaderValue::from_static("dev, infra-admins ,x"),
@@ -10175,6 +10222,13 @@ mod tests {
         assert!(!has_group(&admins, "admins"));
         assert!(is_admin(&admins), "infra-admins authorizes the admin panel");
         assert!(require_admin(&admins).is_ok());
+
+        // Groups without an authenticated subject are never an admin identity.
+        let mut forged_groups = HeaderMap::new();
+        forged_groups.insert(HEADER_GROUPS, HeaderValue::from_static("admins"));
+        assert!(has_group(&forged_groups, "admins"));
+        assert!(!is_admin(&forged_groups));
+        assert!(require_admin(&forged_groups).is_err());
 
         // A non-admin group alone does not authorize.
         let mut other = HeaderMap::new();
@@ -10189,6 +10243,42 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(HEADER_SUBJECT, HeaderValue::from_static("user-42"));
         assert!(gateway_identity_ok(&h));
+    }
+
+    #[test]
+    fn gateway_rejects_partial_or_unsigned_identity_context() {
+        const KEY: &str = "gateway-test-key";
+        const WINDOW: i64 = 30_000_000;
+
+        assert!(gateway_identity_ok_at(&HeaderMap::new(), KEY, WINDOW));
+
+        for (name, value) in [
+            (HEADER_EMAIL, "victim@w33d.xyz"),
+            (HEADER_GROUPS, "admins"),
+            (HEADER_SIG, "forged"),
+            (HEADER_SCOPE, TEMP_MAIL_MANAGE_SCOPE),
+            (HEADER_SCOPE_SIG, "forged"),
+        ] {
+            let mut partial = HeaderMap::new();
+            partial.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+            assert!(
+                !gateway_identity_ok_at(&partial, KEY, WINDOW),
+                "{name} without a signed subject must be rejected"
+            );
+        }
+
+        let mut signed = HeaderMap::new();
+        signed.insert(HEADER_SUBJECT, HeaderValue::from_static("u_admin"));
+        signed.insert(HEADER_GROUPS, HeaderValue::from_static("admins"));
+        assert!(!gateway_identity_ok_at(&signed, KEY, WINDOW));
+        signed.insert(
+            HEADER_SIG,
+            HeaderValue::try_from(sign_identity(KEY, "u_admin", "admins", WINDOW)).unwrap(),
+        );
+        assert!(gateway_identity_ok_at(&signed, KEY, WINDOW));
     }
 
     #[test]
@@ -10856,6 +10946,26 @@ mod tests {
         assert_eq!(parse_until("2026-13-01"), None, "no month 13");
         assert_eq!(parse_until("soon"), None);
         assert_eq!(parse_until("2026-07-15-99"), None);
+    }
+
+    #[test]
+    fn future_time_presets_are_relative_and_override_stale_custom_values() {
+        let now = now_secs();
+        let preset = now + 3_600;
+        let stale_custom = now + 7_200;
+        assert_eq!(
+            parse_schedule_epoch(&preset.to_string(), &stale_custom.to_string()).unwrap(),
+            preset
+        );
+        assert_eq!(
+            parse_schedule_epoch("", &stale_custom.to_string()).unwrap(),
+            stale_custom
+        );
+
+        let presets = schedule_presets(now);
+        assert_eq!(presets[0], (now + 3 * 60 * 60, "In 3 hours"));
+        assert_eq!(presets[1], (now + 24 * 60 * 60, "In 24 hours"));
+        assert_eq!(presets[2], (now + 7 * 24 * 60 * 60, "In one week"));
     }
 
     #[test]

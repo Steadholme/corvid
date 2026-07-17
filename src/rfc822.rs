@@ -10,7 +10,7 @@
 //!
 //! Anything it cannot decode degrades to the raw text rather than failing.
 
-use crate::sanitize::sanitize_html;
+use crate::sanitize::{html_to_text, sanitize_html};
 
 /// The fields the webmail renders from a raw message.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,7 +94,8 @@ fn extract_body(content_type: &str, cte: &str, body: &str) -> (String, String) {
 
     let decoded = decode_cte(body, cte);
     if ct_lower.starts_with("text/html") {
-        (html_to_text(&decoded), sanitize_html(&decoded))
+        let clean_html = sanitize_html(&decoded);
+        (html_to_text(&clean_html), clean_html)
     } else {
         // text/plain or unknown -> treat as text.
         (decoded, String::new())
@@ -141,7 +142,7 @@ fn extract_multipart(boundary: &str, body: &str) -> (String, String) {
         if pct_lower.starts_with("text/html") && html.is_empty() {
             html = sanitize_html(&decoded);
             if text.is_empty() {
-                text = html_to_text(&decoded);
+                text = html_to_text(&html);
             }
         } else if pct_lower.starts_with("text/plain") && text.is_empty() {
             text = decoded;
@@ -257,21 +258,6 @@ pub fn decode_words(value: &str) -> String {
 /// Decode an RFC 2047 "Q" word (`_` -> space, `=XX` octets).
 fn decode_q(s: &str) -> String {
     decode_quoted_printable(&s.replace('_', " "))
-}
-
-/// Strip tags from HTML to derive a rough plain-text fallback.
-fn html_to_text(html: &str) -> String {
-    let mut out = String::new();
-    let mut in_tag = false;
-    for c in html.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +552,19 @@ mod tests {
         let p = parse(raw);
         assert!(p.body_html.contains("<p>hi</p>"));
         assert!(!p.body_html.contains("<script"));
+        assert_eq!(p.body_text, "hi");
+    }
+
+    #[test]
+    fn html_only_body_keeps_block_boundaries_in_plain_text() {
+        let raw = "Content-Type: text/html\r\n\r\n\
+                   <h2>Friday field notes</h2><p>Small signals worth keeping.</p>\
+                   <p>The studio is open until sunset.</p>";
+        let p = parse(raw);
+        assert_eq!(
+            p.body_text,
+            "Friday field notes\nSmall signals worth keeping.\nThe studio is open until sunset."
+        );
     }
 
     #[test]
@@ -631,11 +630,9 @@ mod tests {
 
         let parsed = parse(raw);
         assert!(parsed.body_text.contains("plain body"));
-        assert!(
-            parsed
-                .body_html
-                .contains("<img src=\"cid:logo@example\" />")
-        );
+        assert!(parsed
+            .body_html
+            .contains("<img src=\"cid:logo@example\" />"));
 
         let inline = list_inline_attachments(raw);
         assert_eq!(inline.len(), 1);

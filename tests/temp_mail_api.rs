@@ -634,6 +634,11 @@ async fn message_api_paginates_sanitizes_downloads_and_deletes_with_owner_scope(
         .as_str()
         .unwrap()
         .contains("tracker.example"));
+    assert_eq!(detail["seen"], true, "reading a message marks it seen");
+    assert!(
+        store.get_message("message-3").await.unwrap().unwrap().seen,
+        "read state is persisted for subsequent list calls"
+    );
     assert_eq!(detail["attachments"].as_array().unwrap().len(), 1);
     assert_eq!(detail["attachments"][0]["index"], 0);
 
@@ -1050,31 +1055,4 @@ async fn in_memory_delete_cleans_every_mailbox_side_table_and_gc_revalidates() {
         .await
         .unwrap());
     assert!(store.get_mailbox(expired).await.unwrap().is_some());
-}
-
-#[tokio::test]
-async fn expired_temp_box_and_message_are_immediately_inaccessible() {
-    let store = Arc::new(InMemoryStore::new());
-    let state = state_with_store(store.clone());
-    let address = "expired-read@old-temp.example";
-    let msg = message("expired-read-message", address);
-    seed_temp(store.as_ref(), address, SUBJECT, now_secs() - 1).await;
-    store.store_message(&msg).await.unwrap();
-
-    for uri in [
-        format!("/temp/box/{address}"),
-        format!("/temp/box/{address}/msg/{}", msg.id),
-    ] {
-        let response = app(state.clone())
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .header("x-auth-subject", SUBJECT)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
 }

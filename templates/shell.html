@@ -2,27 +2,34 @@
 <html lang="en" data-theme="{{THEME}}" data-density="{{DENSITY}}" data-pane="{{PANE}}">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
   <meta name="robots" content="noindex">
   <title>{{TITLE}} · Steadholme Corvid</title>
   <style>{{STYLE}}</style>
 </head>
 <body>
-  <header class="appbar">
-    <a class="appbar__brand" href="/" aria-label="Corvid home">
+  <a class="skip-link" href="#main-content">Skip to mail</a>
+  <header class="appbar" aria-label="Corvid application header">
+    <a class="appbar__brand" href="/" aria-label="Corvid inbox">
       <span class="app-tile" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg></span>
-      <span class="appbar__name"><b>Corvid</b><span>mail.w33d.xyz</span></span>
+      <span class="appbar__name"><b>Corvid</b><span>Ink, then action.</span></span>
     </a>
-    <nav class="appbar__nav">{{NAV}}</nav>
+    <nav class="appbar__nav" aria-label="Primary navigation">{{NAV}}</nav>
     <span class="appbar__spacer"></span>
     <div class="appbar__right">{{USERBOX}}</div>
   </header>
 
-  <main class="wrap{{WRAP}}">
+  <main id="main-content" class="wrap{{WRAP}}" tabindex="-1">
     {{CONTENT}}
   </main>
 
-  <footer class="mail-foot">Steadholme Corvid · sovereign mail · identity by Keystone SSO</footer>
+  <footer class="mail-foot" aria-label="Corvid product information">
+    <span><strong>Corvid</strong> by Steadholme</span>
+    <span aria-hidden="true"> · </span>
+    <span>Mail that stays yours</span>
+    <span aria-hidden="true"> · </span>
+    <span>Identity protected by Keystone SSO</span>
+  </footer>
 </body>
 </html>

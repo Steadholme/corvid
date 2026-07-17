@@ -80,6 +80,10 @@ pub async fn build_dev_state() -> AppState {
 /// from `DKIM_KEY_PATH` when readable (a missing/unreadable key disables outbound signing rather
 /// than failing startup). The primary mailbox is always provisioned (idempotent upsert).
 pub async fn build_state_from_env() -> Result<AppState, String> {
+    validate_gateway_security(
+        &std::env::var("STEADHOLME_PROFILE").unwrap_or_default(),
+        &std::env::var("GATEWAY_HMAC_KEY").unwrap_or_default(),
+    )?;
     let config = Config::from_env();
 
     let store_kind = std::env::var("CORVID_STORE").unwrap_or_else(|_| "memory".to_string());
@@ -145,6 +149,19 @@ fn require_persistence() -> bool {
     profile_prod || env_truthy("REQUIRE_PERSISTENCE")
 }
 
+/// Production webmail trusts gateway-injected identity headers, so the shared HMAC key is a
+/// startup requirement rather than an optional hardening switch in that profile.
+fn validate_gateway_security(profile: &str, gateway_hmac_key: &str) -> Result<(), String> {
+    if profile.trim().eq_ignore_ascii_case("prod") && gateway_hmac_key.trim().is_empty() {
+        return Err(
+            "STEADHOLME_PROFILE=prod requires GATEWAY_HMAC_KEY so Corvid can authenticate \
+             every gateway-injected identity"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// A truthy env flag (`1`/`true`/`yes`/`on`, case-insensitive). Mirrors `config::env_flag`.
 fn env_truthy(key: &str) -> bool {
     matches!(
@@ -193,8 +210,8 @@ pub async fn run() -> Result<(), String> {
     let state = build_state_from_env().await?;
     let config = state.config.clone();
 
-    // Temporary mail no longer uses a separate anonymous listener — provisioning is SSO-gated
-    // inside the webmail (see `temp_mail` + the /temp routes).
+    // Temporary mail has no anonymous listener: provisioning is SSO-gated behind the scoped
+    // `/api/v1/temp-mailboxes` service (see `temp_mail` + `webmail`).
 
     let tls_acceptor = build_tls_acceptor(&config).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "TLS disabled (STARTTLS unavailable)");
@@ -237,8 +254,8 @@ pub async fn run() -> Result<(), String> {
             relay::run_worker(store, hostname, try_tls).await;
         });
     }
-    // Temporary-mail TTL garbage collector. SSO users provision disposable addresses from the
-    // webmail itself (no separate listener); this background task reaps expired mailboxes hourly.
+    // Temporary-mail TTL garbage collector. SSO users provision disposable addresses through the
+    // scoped API (no separate listener); this background task reaps expired mailboxes hourly.
     if config.temp_mail_enabled() {
         let state = state.clone();
         tokio::spawn(async move {
@@ -265,4 +282,18 @@ pub async fn run() -> Result<(), String> {
     axum::serve(listener, app(state))
         .await
         .map_err(|e| format!("webmail server error: {e}"))
+}
+
+#[cfg(test)]
+mod runtime_security_tests {
+    use super::validate_gateway_security;
+
+    #[test]
+    fn production_requires_gateway_identity_signing_key() {
+        assert!(validate_gateway_security("prod", "").is_err());
+        assert!(validate_gateway_security(" PROD ", "  ").is_err());
+        assert!(validate_gateway_security("prod", "shared-secret").is_ok());
+        assert!(validate_gateway_security("dev", "").is_ok());
+        assert!(validate_gateway_security("", "").is_ok());
+    }
 }
