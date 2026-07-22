@@ -3,11 +3,12 @@
 //! binds to. The original form routes + markup are covered by `webmail_render.rs`; these tests lock
 //! in that the no-reload siblings share the same CSRF + owner-authorisation guarantees.
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use corvid::model::Message;
-use corvid::{AppState, app, build_dev_state, new_id, now_secs};
+use corvid::{app, build_dev_state, new_id, now_secs, AppState};
 
 fn seed(mailbox: &str, subject: &str) -> Message {
     Message {
@@ -101,6 +102,17 @@ async fn inbox_markup_has_enhancement_hooks() {
 async fn assets_js_served() {
     let state = build_dev_state().await;
     for path in ["/assets/webmail.js", "/assets/compose.js"] {
+        let (expected_len, expected_sha256) = match path {
+            "/assets/webmail.js" => (
+                25_677,
+                "b977c6788948ace7b29c5f5f17106f42f0e3a7cf4d2aba4cc66b817396ef7386",
+            ),
+            "/assets/compose.js" => (
+                19_807,
+                "0181cd799839f2b3444c0d316ddb377a829591cc3d42c3406e66272f8367243e",
+            ),
+            _ => unreachable!("asset path is frozen by this test"),
+        };
         let req = Request::builder()
             .uri(path)
             .header("x-auth-subject", "w33d")
@@ -123,7 +135,65 @@ async fn assets_js_served() {
             Some("public, max-age=0, must-revalidate"),
             "{path} must not leave updated markup paired with a stale interaction bundle"
         );
+        assert_eq!(
+            resp.headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'"
+            ),
+            "{path} CSP"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY"),
+            "{path} frame policy"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff"),
+            "{path} MIME sniffing policy"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer"),
+            "{path} referrer policy"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("permissions-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("camera=(), microphone=(), geolocation=()"),
+            "{path} permissions policy"
+        );
+        assert_ne!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("private, no-store"),
+            "{path} remains a public revalidated asset"
+        );
+        assert!(
+            resp.headers()
+                .get_all(header::VARY)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .all(|value| !value.split(',').any(|part| part.trim() == "Authorization")),
+            "{path} must not vary on Authorization"
+        );
         let js = body_string(resp).await;
+        assert_eq!(js.len(), expected_len, "{path} byte length drift");
+        assert_eq!(
+            hex::encode(Sha256::digest(js.as_bytes())),
+            expected_sha256,
+            "{path} SHA-256 drift"
+        );
         assert!(js.contains("__corvidToast"), "{path} carries toast helper");
         if path == "/assets/compose.js" {
             assert!(
